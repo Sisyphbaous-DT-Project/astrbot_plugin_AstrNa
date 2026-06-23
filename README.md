@@ -2,6 +2,10 @@
 
 AstrNa是一款AstrBot优化插件。
 
+仓库地址：[Sisyphbaous-DT-Project/astrbot_plugin_AstrNa](https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_AstrNa)
+
+作者主页：[Sisyphbaous-DT-Project](https://github.com/Sisyphbaous-DT-Project)
+
 ## 框架
 
 AstrNa 采用模块化结构。每个优化功能作为一个独立模块维护，并在配置里对应一个开关，默认关闭。

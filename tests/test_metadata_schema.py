@@ -16,6 +16,10 @@ def test_metadata_has_required_fields():
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
     assert metadata["version"] == "0.0.2"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
+    assert (
+        metadata["repo"]
+        == "https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_AstrNa"
+    )
     for required_key in ("name", "desc", "version", "author"):
         assert metadata[required_key]
 
