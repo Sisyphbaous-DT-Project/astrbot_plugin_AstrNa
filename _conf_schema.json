@@ -1,0 +1,35 @@
+{
+  "fix_deepseek_v4_400": {
+    "type": "bool",
+    "description": "修复 DeepSeek v4 400 报错",
+    "hint": "开启后，AstrNa 会在 LLM 请求发送前清理会触发 DeepSeek v4 接口 400 的异常 assistant 历史，包括空 assistant、只有 reasoning_content 的 assistant、以及只有 think 内容块的 assistant；带有效 tool_calls、普通文本和正常多模态内容会保留。默认关闭。",
+    "default": false
+  },
+  "optimize_identity_metadata": {
+    "type": "bool",
+    "description": "优化身份元数据",
+    "hint": "开启后，AstrNa 会把 AstrBot 自带身份识别注入的用户信息优化成 JSON 格式，并继续作为临时内容发送，不会写入会话历史。只有打开 AstrBot 自带的“用户识别/身份识别”按钮后，这个功能才会启用，不然开了也没用。默认关闭。",
+    "default": false
+  },
+  "account_nickname_display": {
+    "type": "bool",
+    "description": "追加真实昵称",
+    "hint": "开启后，AstrNa 会在支持的平台上额外注入账号真实昵称；取不到真实昵称、清洗后为空、或与群昵称相同时会自动跳过。只有打开 AstrBot 自带的“用户识别/身份识别”按钮后，这个功能才会启用，不然开了也没用。默认关闭。",
+    "default": false,
+    "collapsed": true,
+    "condition": {
+      "optimize_identity_metadata": true
+    }
+  },
+  "account_nickname_only": {
+    "type": "bool",
+    "description": "仅使用真实昵称",
+    "hint": "开启后，AstrNa 会优先把身份元数据里的 nickname 替换为账号真实昵称，不再同时提供群昵称；取不到真实昵称时回退到原群昵称。只有打开 AstrBot 自带的“用户识别/身份识别”按钮后，这个功能才会启用，不然开了也没用。默认关闭。",
+    "default": false,
+    "collapsed": true,
+    "condition": {
+      "optimize_identity_metadata": true,
+      "account_nickname_display": true
+    }
+  }
+}
