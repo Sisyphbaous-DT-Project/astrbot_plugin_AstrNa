@@ -3,6 +3,11 @@ from __future__ import annotations
 from typing import Any
 
 from .modules.deepseek_v4_400 import DeepSeekV4400Module
+from .modules.forward_nodes import (
+    FORWARD_NODE_HARD_LIMIT_DEFAULT,
+    FORWARD_NODE_MAX_LENGTH_DEFAULT,
+    ForwardNodesModule,
+)
 from .modules.identity_metadata import IdentityMetadataModule
 
 
@@ -11,6 +16,9 @@ DEFAULT_CONFIG = {
     "optimize_identity_metadata": False,
     "account_nickname_display": False,
     "account_nickname_only": False,
+    "optimize_forward_nodes": False,
+    "forward_node_max_length": FORWARD_NODE_MAX_LENGTH_DEFAULT,
+    "forward_node_hard_limit": FORWARD_NODE_HARD_LIMIT_DEFAULT,
 }
 
 
@@ -23,6 +31,13 @@ class AstrNaRuntime:
         self.logger = logger
         self.deepseek_v4_400 = DeepSeekV4400Module(logger=logger)
         self.identity_metadata = IdentityMetadataModule(logger=logger)
+        self.forward_nodes = ForwardNodesModule(
+            logger=logger,
+            target_length=self.config["forward_node_max_length"],
+            hard_limit=self.config["forward_node_hard_limit"],
+        )
+        if self.config.get("optimize_forward_nodes", False):
+            self.forward_nodes.install()
 
     async def sanitize_request(self, event: Any, req: Any) -> None:
         if self.config.get("fix_deepseek_v4_400", False):
@@ -43,6 +58,9 @@ class AstrNaRuntime:
                 ),
             )
 
+    async def terminate(self) -> None:
+        self.forward_nodes.terminate()
+
 
 def merge_config(config: dict | None) -> dict[str, Any]:
     merged = dict(DEFAULT_CONFIG)
@@ -52,8 +70,12 @@ def merge_config(config: dict | None) -> dict[str, Any]:
     if "optimize_identity_metadata" not in config and "identity_metadata" in config:
         merged["optimize_identity_metadata"] = bool(config["identity_metadata"])
 
-    for key in merged:
-        if key in config:
+    for key, default_value in merged.items():
+        if key not in config:
+            continue
+        if isinstance(default_value, bool):
             merged[key] = bool(config[key])
+        else:
+            merged[key] = config[key]
 
     return merged

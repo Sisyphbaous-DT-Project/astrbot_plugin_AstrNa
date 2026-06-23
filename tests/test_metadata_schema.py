@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "0.0.2"
+    assert metadata["version"] == "0.0.3"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -32,6 +32,9 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "optimize_identity_metadata",
         "account_nickname_display",
         "account_nickname_only",
+        "optimize_forward_nodes",
+        "forward_node_max_length",
+        "forward_node_hard_limit",
     ]
     assert schema["fix_deepseek_v4_400"]["type"] == "bool"
     assert schema["fix_deepseek_v4_400"]["default"] is False
@@ -50,3 +53,25 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "optimize_identity_metadata": True,
         "account_nickname_display": True,
     }
+    assert schema["optimize_forward_nodes"]["type"] == "bool"
+    assert schema["optimize_forward_nodes"]["default"] is False
+    assert schema["forward_node_max_length"]["type"] == "int"
+    assert schema["forward_node_max_length"]["default"] == 1000
+    assert schema["forward_node_max_length"]["collapsed"] is True
+    assert schema["forward_node_max_length"]["condition"] == {
+        "optimize_forward_nodes": True,
+    }
+    assert schema["forward_node_hard_limit"]["type"] == "int"
+    assert schema["forward_node_hard_limit"]["default"] == 1200
+    assert schema["forward_node_hard_limit"]["collapsed"] is True
+    assert schema["forward_node_hard_limit"]["condition"] == {
+        "optimize_forward_nodes": True,
+    }
+
+
+def test_changelog_contains_release_notes():
+    changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+
+    assert "## 0.0.1" in changelog
+    assert "## 0.0.2" in changelog
+    assert "## 0.0.3" in changelog

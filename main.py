@@ -22,4 +22,5 @@ class AstrNa(Star):
         await self.runtime.sanitize_request(event, req)
 
     async def terminate(self) -> None:
-        """插件停用时调用。当前版本无需释放额外资源。"""
+        """插件停用时调用。"""
+        await self.runtime.terminate()
