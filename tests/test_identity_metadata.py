@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from astrna.modules.identity_metadata import (
     FallbackTextPart,
@@ -315,14 +318,32 @@ def test_remove_builtin_identity_lines_keeps_other_system_reminders():
     assert cleaned.removed_group_name is True
 
 
-def test_identity_metadata_real_text_part_is_marked_no_save():
+def load_real_astrbot_message_module():
+    try:
+        return importlib.import_module("astrbot.core.agent.message")
+    except ModuleNotFoundError:
+        pass
+
+    astrbot_source = os.environ.get("ASTRBOT_SOURCE_PATH")
+    if astrbot_source:
+        source_path = Path(astrbot_source)
+        if source_path.exists() and str(source_path) not in sys.path:
+            sys.path.insert(0, str(source_path))
+        try:
+            return importlib.import_module("astrbot.core.agent.message")
+        except ModuleNotFoundError:
+            pass
+
+    pytest.skip(
+        "需要安装 astrbot 包，或设置 ASTRBOT_SOURCE_PATH 指向 AstrBot 源码目录",
+    )
+
+
+def test_identity_metadata_real_text_part_is_marked_no_save(monkeypatch):
     import astrna.modules.identity_metadata as identity_metadata
 
-    astrbot_source = Path("/root/projects/tmp/AstrBot")
-    if str(astrbot_source) not in sys.path:
-        sys.path.insert(0, str(astrbot_source))
-    message_module = importlib.import_module("astrbot.core.agent.message")
-    identity_metadata.TextPart = message_module.TextPart
+    message_module = load_real_astrbot_message_module()
+    monkeypatch.setattr(identity_metadata, "TextPart", message_module.TextPart)
 
     part = create_text_part("hello")
 
@@ -331,14 +352,11 @@ def test_identity_metadata_real_text_part_is_marked_no_save():
     assert dumped == {"type": "text", "text": "hello", "_no_save": True}
 
 
-def test_identity_metadata_no_save_part_is_filtered_from_saved_history():
+def test_identity_metadata_no_save_part_is_filtered_from_saved_history(monkeypatch):
     import astrna.modules.identity_metadata as identity_metadata
 
-    astrbot_source = Path("/root/projects/tmp/AstrBot")
-    if str(astrbot_source) not in sys.path:
-        sys.path.insert(0, str(astrbot_source))
-    message_module = importlib.import_module("astrbot.core.agent.message")
-    identity_metadata.TextPart = message_module.TextPart
+    message_module = load_real_astrbot_message_module()
+    monkeypatch.setattr(identity_metadata, "TextPart", message_module.TextPart)
     message = message_module.Message(
         role="user",
         content=[{"type": "text", "text": "hello"}, create_text_part("runtime only")],
