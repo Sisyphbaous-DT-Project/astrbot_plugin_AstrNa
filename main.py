@@ -11,7 +11,12 @@ class AstrNa(Star):
 
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
-        self.runtime = AstrNaRuntime(context=context, config=config, logger=logger)
+        self.runtime = AstrNaRuntime(
+            context=context,
+            config=config,
+            logger=logger,
+            kv_store=self,
+        )
 
     @filter.on_llm_request(priority=1000)
     async def sanitize_llm_context(

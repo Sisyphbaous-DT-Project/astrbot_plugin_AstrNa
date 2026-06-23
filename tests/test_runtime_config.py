@@ -14,6 +14,7 @@ def test_merge_config_keeps_defaults_for_missing_values():
         "optimize_forward_nodes": False,
         "forward_node_max_length": 1000,
         "forward_node_hard_limit": 1200,
+        "optimize_dynamic_system_prompt": False,
     }
 
 
@@ -27,6 +28,7 @@ def test_merge_config_can_enable_modules():
             "optimize_forward_nodes": True,
             "forward_node_max_length": 800,
             "forward_node_hard_limit": 900,
+            "optimize_dynamic_system_prompt": True,
         }
     )
 
@@ -38,6 +40,7 @@ def test_merge_config_can_enable_modules():
         "optimize_forward_nodes": True,
         "forward_node_max_length": 800,
         "forward_node_hard_limit": 900,
+        "optimize_dynamic_system_prompt": True,
     }
 
 

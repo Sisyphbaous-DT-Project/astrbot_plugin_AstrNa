@@ -13,12 +13,33 @@ class DummyLogger:
     def __init__(self):
         self.infos = []
         self.warnings = []
+        self.debugs = []
 
     def info(self, *args):
         self.infos.append(args)
 
     def warning(self, *args):
         self.warnings.append(args)
+
+    def debug(self, *args):
+        self.debugs.append(args)
+
+
+class DummyKVStore:
+    def __init__(self, initial=None, *, fail_get=False, fail_put=False):
+        self.data = dict(initial or {})
+        self.fail_get = fail_get
+        self.fail_put = fail_put
+
+    async def get_kv_data(self, key, default):
+        if self.fail_get:
+            raise RuntimeError("get failed")
+        return self.data.get(key, default)
+
+    async def put_kv_data(self, key, value):
+        if self.fail_put:
+            raise RuntimeError("put failed")
+        self.data[key] = value
 
 
 @dataclass
@@ -59,6 +80,7 @@ class DummyRequest:
         self.contexts = contexts
         self.conversation = conversation
         self.session_id = "session-1"
+        self.system_prompt = ""
         self.extra_user_content_parts = []
 
 
@@ -93,11 +115,12 @@ class DummyEvent:
     message_obj = DummyMessageObj()
 
 
-def build_runtime(config=None, provider_settings=None):
+def build_runtime(config=None, provider_settings=None, kv_store=None):
     return AstrNaRuntime(
         context=DummyContext(provider_settings=provider_settings),
         config=config,
         logger=DummyLogger(),
+        kv_store=kv_store,
     )
 
 
@@ -119,6 +142,7 @@ def add_builtin_identity_part(request, *, with_group=True):
 def fakes():
     return SimpleNamespace(
         Logger=DummyLogger,
+        KVStore=DummyKVStore,
         Conversation=DummyConversation,
         Request=DummyRequest,
         Sender=DummySender,

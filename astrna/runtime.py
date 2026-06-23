@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .modules.deepseek_v4_400 import DeepSeekV4400Module
+from .modules.dynamic_system_prompt import DynamicSystemPromptModule
 from .modules.forward_nodes import (
     FORWARD_NODE_HARD_LIMIT_DEFAULT,
     FORWARD_NODE_MAX_LENGTH_DEFAULT,
@@ -19,13 +20,20 @@ DEFAULT_CONFIG = {
     "optimize_forward_nodes": False,
     "forward_node_max_length": FORWARD_NODE_MAX_LENGTH_DEFAULT,
     "forward_node_hard_limit": FORWARD_NODE_HARD_LIMIT_DEFAULT,
+    "optimize_dynamic_system_prompt": False,
 }
 
 
 class AstrNaRuntime:
     """按配置调度 AstrNa 的运行时优化模块。"""
 
-    def __init__(self, context: Any, config: dict | None, logger: Any):
+    def __init__(
+        self,
+        context: Any,
+        config: dict | None,
+        logger: Any,
+        kv_store: Any | None = None,
+    ):
         self.context = context
         self.config = merge_config(config)
         self.logger = logger
@@ -36,10 +44,19 @@ class AstrNaRuntime:
             target_length=self.config["forward_node_max_length"],
             hard_limit=self.config["forward_node_hard_limit"],
         )
+        self.dynamic_system_prompt = DynamicSystemPromptModule(
+            logger=logger,
+            kv_store=kv_store,
+        )
         if self.config.get("optimize_forward_nodes", False):
             self.forward_nodes.install()
+        if self.config.get("optimize_dynamic_system_prompt", False):
+            self.dynamic_system_prompt.install()
 
     async def sanitize_request(self, event: Any, req: Any) -> None:
+        if self.config.get("optimize_dynamic_system_prompt", False):
+            self.dynamic_system_prompt.install()
+
         if self.config.get("fix_deepseek_v4_400", False):
             self.deepseek_v4_400.sanitize(event, req)
 
@@ -60,6 +77,7 @@ class AstrNaRuntime:
 
     async def terminate(self) -> None:
         self.forward_nodes.terminate()
+        self.dynamic_system_prompt.terminate()
 
 
 def merge_config(config: dict | None) -> dict[str, Any]:
