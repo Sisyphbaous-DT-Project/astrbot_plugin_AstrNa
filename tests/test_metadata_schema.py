@@ -69,7 +69,10 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "optimize_forward_nodes": True,
     }
     assert schema["optimize_dynamic_system_prompt"]["type"] == "bool"
-    assert schema["optimize_dynamic_system_prompt"]["description"] == "AstrBot缓存优化"
+    assert (
+        schema["optimize_dynamic_system_prompt"]["description"]
+        == "AstrBot插件缓存优化"
+    )
     assert schema["optimize_dynamic_system_prompt"]["default"] is False
 
 
