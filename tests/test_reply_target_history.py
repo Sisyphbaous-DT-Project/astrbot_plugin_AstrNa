@@ -42,6 +42,16 @@ class TextPart:
         return {"type": "text", "text": self.text}
 
 
+class ThinkPart:
+    type = "think"
+
+    def __init__(self, think):
+        self.think = think
+
+    def model_dump(self):
+        return {"type": "think", "think": self.think}
+
+
 class Message:
     def __init__(self, role, content, *, tool_calls=None, no_save=False):
         self.role = role
@@ -99,6 +109,7 @@ class DummyEvent:
         platform_name="aiocqhttp",
         extras=None,
         result_chain=None,
+        self_id="bot123",
     ):
         self.message_type = message_type
         self.group_id = group_id
@@ -107,6 +118,7 @@ class DummyEvent:
         self.platform_name = platform_name
         self._extras = extras or {}
         self.message_obj = SimpleNamespace(
+            self_id=self_id,
             group_id=group_id,
             sender=SimpleNamespace(user_id=sender_id, nickname=sender_name),
             message=[],
@@ -124,6 +136,9 @@ class DummyEvent:
 
     def get_sender_name(self):
         return self.sender_name
+
+    def get_self_id(self):
+        return self.message_obj.self_id
 
     def get_platform_name(self):
         return self.platform_name
@@ -147,6 +162,8 @@ class DummyRequest:
     def __init__(self):
         self.prompt = ""
         self.extra_user_content_parts = []
+        self.conversation = None
+        self.contexts = None
 
 
 class DummyProvider:
@@ -224,7 +241,11 @@ def astr_main_agent(monkeypatch):
         main_provider_supports_image=False,
         skip_quote_image_caption=False,
     ):
-        text = "<Quoted Message>\n原引用内容\n</Quoted Message>"
+        quote = event.message_obj.message[0] if event.message_obj.message else None
+        quote_body = getattr(quote, "message_str", "") or "原引用内容"
+        if quote and getattr(quote, "sender_nickname", None):
+            quote_body = f"({quote.sender_nickname}): {quote_body}"
+        text = f"<Quoted Message>\n{quote_body}\n</Quoted Message>"
         req.extra_user_content_parts.append(TextPart(text))
         if (
             img_cap_prov_id
@@ -325,10 +346,46 @@ def test_outputpro_like_split_keeps_marker_on_full_original_llm_reply(
 
     run(stage._save_to_history(event, object(), object(), [original_message], object()))
 
-    saved_text = stage.saved[0]["all_messages"][-1].content[0].text
-    assert "第一句。第二句。第三句" in saved_text
+    saved_parts = stage.saved[0]["all_messages"][-1].content
+    assert saved_parts[0].text.startswith("<astrna_reply_target>")
+    assert saved_parts[1].text == "第一句。第二句。第三句"
     assert "第三句" in event.get_result().chain[0].text
     assert event.get_result().chain[0].text == "第三句"
+
+
+def test_reply_target_marker_is_saved_before_think_part(internal_module):
+    module = ReplyTargetHistoryModule(logger=DummyLogger())
+    module.install()
+    stage = internal_module.InternalAgentSubStage()
+    original_message = Message(
+        "assistant",
+        [ThinkPart("用户是另一个人"), TextPart("明知故问，就是回复你的。")],
+    )
+
+    run(stage._save_to_history(DummyEvent(), object(), object(), [original_message], None))
+
+    saved_parts = stage.saved[0]["all_messages"][-1].content
+    assert saved_parts[0].text.startswith("<astrna_reply_target>")
+    assert saved_parts[1].think == "用户是另一个人"
+    assert saved_parts[2].text == "明知故问，就是回复你的。"
+    assert original_message.content[0].think == "用户是另一个人"
+
+
+def test_reply_target_marker_is_not_duplicated(internal_module):
+    module = ReplyTargetHistoryModule(logger=DummyLogger())
+    module.install()
+    stage = internal_module.InternalAgentSubStage()
+    marked_text = (
+        '<astrna_reply_target>{"scope":"group"}</astrna_reply_target>\n'
+        "已经标记过"
+    )
+    original_message = Message("assistant", [TextPart(marked_text)])
+
+    run(stage._save_to_history(DummyEvent(), object(), object(), [original_message], None))
+
+    saved_parts = stage.saved[0]["all_messages"][-1].content
+    assert len(saved_parts) == 1
+    assert saved_parts[0].text.count("<astrna_reply_target>") == 1
 
 
 def test_private_reply_target_marker_uses_private_scope(internal_module):
@@ -418,10 +475,10 @@ def test_reply_target_marker_skips_no_save_content_part(internal_module):
     run(stage._save_to_history(DummyEvent(), object(), object(), [message], None))
 
     saved_parts = stage.saved[0]["all_messages"][-1].content
-    assert saved_parts[0].text == "临时思考"
-    assert not saved_parts[0].text.startswith("<astrna_reply_target>")
-    assert saved_parts[1].text.startswith("<astrna_reply_target>")
-    assert "可保存回复" in saved_parts[1].text
+    assert saved_parts[0].text.startswith("<astrna_reply_target>")
+    assert saved_parts[1].text == "临时思考"
+    assert not saved_parts[1].text.startswith("<astrna_reply_target>")
+    assert saved_parts[2].text == "可保存回复"
 
 
 def test_quote_sender_marker_is_injected(astr_main_agent):
@@ -449,6 +506,7 @@ def test_quote_sender_marker_is_injected(astr_main_agent):
         "nickname": "Quoted Nick",
     }
     assert text.index("<astrna_quoted_sender>") > text.index("<Quoted Message>")
+    assert "<astrna_quoted_reply_target>" not in text
 
 
 def test_quote_sender_marker_skips_missing_sender(astr_main_agent):
@@ -482,6 +540,170 @@ def test_quote_marker_sanitizes_values(astr_main_agent):
     assert metadata["user_id"] == "user 123"
     assert metadata["nickname"].startswith("Bad＜Nick＞")
     assert len(metadata["nickname"]) == 128
+
+
+def test_quoted_bot_message_injects_original_reply_target(astr_main_agent):
+    module = ReplyTargetHistoryModule(logger=DummyLogger())
+    module.install()
+    event = DummyEvent(self_id="bot123")
+    event.message_obj.message = [
+        Reply(
+            sender_id="bot123",
+            sender_nickname="清漪酱",
+            message_str="明知故问，就是回复你的。",
+        )
+    ]
+    req = DummyRequest()
+    req.conversation = SimpleNamespace(
+        history=json.dumps(
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                '<astrna_reply_target>{"scope":"group",'
+                                '"user":{"user_id":"user123","nickname":"GroupCard"},'
+                                '"group":{"group_id":"group456"}}'
+                                "</astrna_reply_target>\n"
+                            ),
+                        },
+                        {"type": "think", "think": "旧思考"},
+                        {"type": "text", "text": "明知故问，就是回复你的。"},
+                    ],
+                }
+            ],
+            ensure_ascii=False,
+        )
+    )
+
+    run(astr_main_agent._process_quote_message(event, req, "", DummyContext()))
+
+    text = req.extra_user_content_parts[-1].text
+    assert "<astrna_quoted_sender>" in text
+    assert extract_quoted_reply_target_json(text) == {
+        "scope": "group",
+        "user": {"user_id": "user123", "nickname": "GroupCard"},
+        "group": {"group_id": "group456"},
+    }
+
+
+def test_quoted_bot_message_can_match_legacy_reply_target_text_part(astr_main_agent):
+    module = ReplyTargetHistoryModule(logger=DummyLogger())
+    module.install()
+    event = DummyEvent(self_id="bot123")
+    event.message_obj.message = [
+        Reply(
+            sender_id="bot123",
+            sender_nickname="清漪酱",
+            message_str="旧格式回复正文",
+        )
+    ]
+    req = DummyRequest()
+    req.contexts = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "think", "think": "旧思考"},
+                {
+                    "type": "text",
+                    "text": (
+                        '<astrna_reply_target>{"scope":"group",'
+                        '"user":{"user_id":"legacy-user"}}'
+                        "</astrna_reply_target>\n"
+                        "旧格式回复正文"
+                    ),
+                },
+            ],
+        }
+    ]
+
+    run(astr_main_agent._process_quote_message(event, req, "", DummyContext()))
+
+    assert extract_quoted_reply_target_json(req.extra_user_content_parts[-1].text) == {
+        "scope": "group",
+        "user": {"user_id": "legacy-user"},
+    }
+
+
+def test_quoted_non_bot_message_does_not_inject_reply_target(astr_main_agent):
+    module = ReplyTargetHistoryModule(logger=DummyLogger())
+    module.install()
+    event = DummyEvent(self_id="bot123")
+    event.message_obj.message = [
+        Reply(
+            sender_id="quoted-user",
+            sender_nickname="Quoted Nick",
+            message_str="明知故问，就是回复你的。",
+        )
+    ]
+    req = DummyRequest()
+    req.contexts = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        '<astrna_reply_target>{"scope":"group"}'
+                        "</astrna_reply_target>\n明知故问，就是回复你的。"
+                    ),
+                }
+            ],
+        }
+    ]
+
+    run(astr_main_agent._process_quote_message(event, req, "", DummyContext()))
+
+    text = req.extra_user_content_parts[-1].text
+    assert "<astrna_quoted_sender>" in text
+    assert "<astrna_quoted_reply_target>" not in text
+
+
+def test_quoted_bot_message_skips_ambiguous_reply_target(astr_main_agent):
+    module = ReplyTargetHistoryModule(logger=DummyLogger())
+    module.install()
+    event = DummyEvent(self_id="bot123")
+    event.message_obj.message = [
+        Reply(sender_id="bot123", sender_nickname="清漪酱", message_str="相同回复")
+    ]
+    req = DummyRequest()
+    req.contexts = [
+        {
+            "role": "assistant",
+            "content": (
+                '<astrna_reply_target>{"scope":"group","user":{"user_id":"u1"}}'
+                "</astrna_reply_target>\n相同回复"
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": (
+                '<astrna_reply_target>{"scope":"group","user":{"user_id":"u2"}}'
+                "</astrna_reply_target>\n相同回复"
+            ),
+        },
+    ]
+
+    run(astr_main_agent._process_quote_message(event, req, "", DummyContext()))
+
+    assert "<astrna_quoted_reply_target>" not in req.extra_user_content_parts[-1].text
+
+
+def test_quoted_bot_message_skips_broken_or_missing_history(astr_main_agent):
+    module = ReplyTargetHistoryModule(logger=DummyLogger())
+    module.install()
+    event = DummyEvent(self_id="bot123")
+    event.message_obj.message = [
+        Reply(sender_id="bot123", sender_nickname="清漪酱", message_str="引用正文")
+    ]
+    req = DummyRequest()
+    req.conversation = SimpleNamespace(history="{broken")
+
+    run(astr_main_agent._process_quote_message(event, req, "", DummyContext()))
+
+    assert "<astrna_quoted_reply_target>" not in req.extra_user_content_parts[-1].text
 
 
 def test_reply_target_and_image_caption_quote_patches_can_coexist(
@@ -601,4 +823,10 @@ def extract_reply_target_json(text):
 def extract_quoted_sender_json(text):
     prefix = "<astrna_quoted_sender>"
     suffix = "</astrna_quoted_sender>"
+    return json.loads(text.split(prefix, 1)[1].split(suffix, 1)[0])
+
+
+def extract_quoted_reply_target_json(text):
+    prefix = "<astrna_quoted_reply_target>"
+    suffix = "</astrna_quoted_reply_target>"
     return json.loads(text.split(prefix, 1)[1].split(suffix, 1)[0])

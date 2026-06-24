@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import inspect
+import json
+import re
 from dataclasses import replace
 from typing import Any
 
@@ -107,8 +109,8 @@ class ReplyTargetHistoryModule:
         result = await original_process_quote_message(*args, **kwargs)
 
         quote = find_reply_component(event)
-        marker = build_quoted_sender_marker(quote)
-        if not marker:
+        sender_marker = build_quoted_sender_marker(quote)
+        if quote is None and not sender_marker:
             return result
 
         parts = getattr(req, "extra_user_content_parts", None)
@@ -120,7 +122,21 @@ class ReplyTargetHistoryModule:
             text = getattr(part, "text", None)
             if not isinstance(text, str):
                 continue
-            optimized_text = inject_quoted_sender_marker(text, marker)
+
+            markers = []
+            if sender_marker:
+                markers.append(sender_marker)
+
+            reply_target_marker = build_quoted_reply_target_marker(
+                event,
+                req,
+                quote,
+                text,
+            )
+            if reply_target_marker:
+                markers.append(reply_target_marker)
+
+            optimized_text = inject_quoted_markers(text, markers)
             if optimized_text == text:
                 continue
             try:
@@ -310,6 +326,56 @@ def build_quoted_sender_marker(quote: Any) -> str:
     return f"<astrna_quoted_sender>{format_metadata_json(metadata)}</astrna_quoted_sender>"
 
 
+def build_quoted_reply_target_marker(
+    event: Any,
+    req: Any,
+    quote: Any,
+    quoted_text: str,
+) -> str:
+    if not is_quote_from_self(event, quote):
+        return ""
+
+    quote_body = normalize_quoted_message_text(
+        extract_quoted_message_body(quoted_text),
+        quote,
+    )
+    if not quote_body:
+        return ""
+
+    metadata = find_unique_reply_target_metadata(req, quote_body)
+    if not metadata:
+        return ""
+
+    return (
+        "<astrna_quoted_reply_target>"
+        f"{format_metadata_json(metadata)}"
+        "</astrna_quoted_reply_target>"
+    )
+
+
+def is_quote_from_self(event: Any, quote: Any) -> bool:
+    if quote is None:
+        return False
+
+    quote_sender_id = sanitize_optional_metadata_value(
+        getattr(quote, "sender_id", None)
+    )
+    if not quote_sender_id:
+        return False
+
+    self_id = sanitize_optional_metadata_value(
+        safe_call(getattr(event, "get_self_id", None))
+    )
+    if not self_id:
+        self_id = sanitize_optional_metadata_value(
+            getattr(getattr(event, "message_obj", None), "self_id", None)
+        )
+    if not self_id:
+        return False
+
+    return quote_sender_id == self_id
+
+
 def detect_reply_scope(event: Any) -> str:
     if is_proactive_or_synthetic_event(event):
         return "unknown"
@@ -467,9 +533,8 @@ def prepend_marker_to_message(message: Any, marker: str) -> Any:
         text_index = find_first_text_part_index(optimized_parts)
         if text_index is None:
             return message
-        part = optimized_parts[text_index]
-        old_text = getattr(part, "text", "")
-        optimized_parts[text_index] = clone_text_part(part, f"{marker}\n{old_text}")
+        marker_part = clone_text_part(optimized_parts[text_index], f"{marker}\n")
+        optimized_parts.insert(0, marker_part)
         return clone_message(message, content=optimized_parts)
 
     return message
@@ -499,17 +564,170 @@ def find_first_text_part_index(parts: list[Any]) -> int | None:
     return None
 
 
-def inject_quoted_sender_marker(text: str, marker: str) -> str:
-    if not text or "<astrna_quoted_sender>" in text:
+def inject_quoted_markers(text: str, markers: list[str]) -> str:
+    if not text or not markers:
         return text
 
+    new_markers = [
+        marker
+        for marker in markers
+        if marker and marker_tag_name(marker) not in text
+    ]
+    if not new_markers:
+        return text
+
+    marker_text = "\n".join(new_markers)
     open_tag = "<Quoted Message>"
     close_tag = "</Quoted Message>"
     if open_tag in text:
-        return text.replace(open_tag, f"{open_tag}\n{marker}", 1)
+        return text.replace(open_tag, f"{open_tag}\n{marker_text}", 1)
     if close_tag in text:
-        return text.replace(close_tag, f"{marker}\n{close_tag}", 1)
+        return text.replace(close_tag, f"{marker_text}\n{close_tag}", 1)
     return text
+
+
+def marker_tag_name(marker: str) -> str:
+    match = re.match(r"<([a-zA-Z0-9_]+)>", marker)
+    return f"<{match.group(1)}>" if match else marker
+
+
+def extract_quoted_message_body(text: str) -> str:
+    open_tag = "<Quoted Message>"
+    close_tag = "</Quoted Message>"
+    if open_tag in text and close_tag in text:
+        return text.split(open_tag, 1)[1].split(close_tag, 1)[0]
+    return text
+
+
+def normalize_quoted_message_text(text: str, quote: Any = None) -> str:
+    text = strip_astrna_markers(text)
+    nickname = sanitize_optional_metadata_value(
+        getattr(quote, "sender_nickname", None)
+    )
+    if nickname:
+        prefix = f"({nickname}):"
+        stripped = text.lstrip()
+        if stripped.startswith(prefix):
+            text = stripped[len(prefix) :]
+    return normalize_match_text(text)
+
+
+def normalize_match_text(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def strip_astrna_markers(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    return re.sub(
+        r"<astrna_[a-zA-Z0-9_]+>.*?</astrna_[a-zA-Z0-9_]+>",
+        "",
+        text,
+        flags=re.DOTALL,
+    )
+
+
+def find_unique_reply_target_metadata(req: Any, quote_body: str) -> dict[str, Any] | None:
+    if not quote_body:
+        return None
+
+    exact_matches: list[dict[str, Any]] = []
+    contains_matches: list[dict[str, Any]] = []
+    for message in reversed(load_request_history(req)):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+
+        metadata = extract_reply_target_metadata(message.get("content"))
+        if not metadata:
+            continue
+
+        assistant_text = normalize_history_assistant_text(message.get("content"))
+        if not assistant_text:
+            continue
+
+        if assistant_text == quote_body:
+            exact_matches.append(metadata)
+        elif len(quote_body) >= 8 and quote_body in assistant_text:
+            contains_matches.append(metadata)
+
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if not exact_matches and len(contains_matches) == 1:
+        return contains_matches[0]
+    return None
+
+
+def load_request_history(req: Any) -> list[Any]:
+    conversation = getattr(req, "conversation", None)
+    history = getattr(conversation, "history", None)
+    parsed_history = parse_history_value(history)
+    if parsed_history is not None:
+        return parsed_history
+
+    contexts = getattr(req, "contexts", None)
+    parsed_contexts = parse_history_value(contexts)
+    if parsed_contexts is not None:
+        return parsed_contexts
+
+    return []
+
+
+def parse_history_value(value: Any) -> list[Any] | None:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except Exception:  # noqa: BLE001
+            return None
+        if isinstance(parsed, list):
+            return parsed
+    return None
+
+
+def extract_reply_target_metadata(content: Any) -> dict[str, Any] | None:
+    text = join_text_content(content)
+    prefix = "<astrna_reply_target>"
+    suffix = "</astrna_reply_target>"
+    if prefix not in text or suffix not in text:
+        return None
+    raw_json = text.split(prefix, 1)[1].split(suffix, 1)[0]
+    try:
+        metadata = json.loads(raw_json)
+    except Exception:  # noqa: BLE001
+        return None
+    return metadata if isinstance(metadata, dict) else None
+
+
+def normalize_history_assistant_text(content: Any) -> str:
+    return normalize_match_text(strip_astrna_markers(join_text_content(content)))
+
+
+def join_text_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+
+    texts: list[str] = []
+    for part in content:
+        part_type = ""
+        text = ""
+        if isinstance(part, dict):
+            part_type = str(part.get("type", ""))
+            text = part.get("text", "")
+        else:
+            part_type = str(getattr(part, "type", ""))
+            text = getattr(part, "text", "")
+
+        if part_type and part_type != "text":
+            continue
+        if not isinstance(text, str):
+            continue
+        texts.append(text)
+    return "\n".join(texts)
 
 
 def find_reply_component(event: Any) -> Any | None:
