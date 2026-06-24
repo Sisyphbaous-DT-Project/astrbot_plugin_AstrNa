@@ -9,6 +9,7 @@ from .modules.forward_nodes import (
     FORWARD_NODE_MAX_LENGTH_DEFAULT,
     ForwardNodesModule,
 )
+from .modules.image_caption import ImageCaptionModule
 from .modules.identity_metadata import IdentityMetadataModule
 
 
@@ -21,6 +22,7 @@ DEFAULT_CONFIG = {
     "forward_node_max_length": FORWARD_NODE_MAX_LENGTH_DEFAULT,
     "forward_node_hard_limit": FORWARD_NODE_HARD_LIMIT_DEFAULT,
     "optimize_dynamic_system_prompt": False,
+    "optimize_image_caption": False,
 }
 
 
@@ -48,10 +50,13 @@ class AstrNaRuntime:
             logger=logger,
             kv_store=kv_store,
         )
+        self.image_caption = ImageCaptionModule(logger=logger)
         if self.config.get("optimize_forward_nodes", False):
             self.forward_nodes.install()
         if self.config.get("optimize_dynamic_system_prompt", False):
             self.dynamic_system_prompt.install()
+        if self.config.get("optimize_image_caption", False):
+            self.image_caption.install()
 
     async def sanitize_request(self, event: Any, req: Any) -> None:
         if self.config.get("optimize_dynamic_system_prompt", False):
@@ -78,6 +83,7 @@ class AstrNaRuntime:
     async def terminate(self) -> None:
         self.forward_nodes.terminate()
         self.dynamic_system_prompt.terminate()
+        self.image_caption.terminate()
 
 
 def merge_config(config: dict | None) -> dict[str, Any]:
