@@ -253,6 +253,126 @@ def test_quote_image_caption_prompt_includes_user_question_and_quoted_text(
     assert "引用里说这是一张照片" in prompt
 
 
+def test_quote_image_caption_supports_old_astrbot_quote_signature(astr_main_agent):
+    provider = DummyProvider()
+    original_calls = []
+
+    async def old_process_quote_message(
+        event,
+        req,
+        img_cap_prov_id,
+        plugin_context,
+        quoted_message_settings=None,
+        config=None,
+        main_provider_supports_image=False,
+    ):
+        original_calls.append(
+            {
+                "quoted_message_settings": quoted_message_settings,
+                "config": config,
+                "main_provider_supports_image": main_provider_supports_image,
+            }
+        )
+        if main_provider_supports_image or not img_cap_prov_id:
+            return None
+        provider = plugin_context.get_provider_by_id(img_cap_prov_id)
+        await provider.text_chat(
+            prompt="Please describe the image content.",
+            image_urls=["quoted-image://1"],
+        )
+        return None
+
+    astr_main_agent._process_quote_message = old_process_quote_message
+    module = ImageCaptionModule(logger=DummyLogger())
+    module.install()
+
+    run(
+        astr_main_agent._process_quote_message(
+            DummyEvent([Reply(message_str="旧版引用文本")]),
+            DummyRequest(prompt="旧版用户问题"),
+            "caption-provider",
+            DummyContext(provider),
+            {"legacy": True},
+            SimpleNamespace(provider_settings={}),
+            False,
+        )
+    )
+
+    assert original_calls == [
+        {
+            "quoted_message_settings": {"legacy": True},
+            "config": SimpleNamespace(provider_settings={}),
+            "main_provider_supports_image": False,
+        }
+    ]
+    prompt = provider.prompts[0]
+    assert "旧版用户问题" in prompt
+    assert "旧版引用文本" in prompt
+
+
+def test_quote_image_caption_keeps_new_skip_quote_flag(astr_main_agent):
+    provider = DummyProvider()
+    module = ImageCaptionModule(logger=DummyLogger())
+    module.install()
+
+    run(
+        astr_main_agent._process_quote_message(
+            DummyEvent([Reply(message_str="引用文本")]),
+            DummyRequest(prompt="问题文本"),
+            "caption-provider",
+            DummyContext(provider),
+            skip_quote_image_caption=True,
+        )
+    )
+
+    assert provider.prompts == []
+
+
+def test_quote_image_caption_safely_degrades_for_unknown_future_kwargs(
+    astr_main_agent,
+):
+    provider = DummyProvider()
+    calls = []
+
+    async def future_process_quote_message(
+        event,
+        req,
+        img_cap_prov_id,
+        plugin_context,
+        quoted_message_settings=None,
+        config=None,
+        main_provider_supports_image=False,
+        skip_quote_image_caption=False,
+        future_option=False,
+    ):
+        calls.append(future_option)
+        if skip_quote_image_caption or main_provider_supports_image or not img_cap_prov_id:
+            return None
+        provider = plugin_context.get_provider_by_id(img_cap_prov_id)
+        await provider.text_chat(
+            prompt="Please describe the image content.",
+            image_urls=["quoted-image://1"],
+        )
+        return None
+
+    astr_main_agent._process_quote_message = future_process_quote_message
+    module = ImageCaptionModule(logger=DummyLogger())
+    module.install()
+
+    run(
+        astr_main_agent._process_quote_message(
+            DummyEvent([Reply(message_str="未来引用文本")]),
+            DummyRequest(prompt="未来用户问题"),
+            "caption-provider",
+            DummyContext(provider),
+            future_option=True,
+        )
+    )
+
+    assert calls == [True]
+    assert provider.prompts == ["Please describe the image content."]
+
+
 def test_quote_image_caption_falls_back_to_astrbot_prompt_without_custom_config(
     astr_main_agent,
 ):

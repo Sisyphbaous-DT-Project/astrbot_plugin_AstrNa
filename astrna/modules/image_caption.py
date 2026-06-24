@@ -24,6 +24,20 @@ class ProviderPatch:
     ref_count: int = 0
 
 
+@dataclass(frozen=True)
+class QuoteMessageCall:
+    args: tuple[Any, ...]
+    kwargs: dict[str, Any]
+    event: Any
+    req: Any
+    img_cap_prov_id: str
+    plugin_context: Any
+    quoted_message_settings: Any = _MISSING
+    config: Any | None = None
+    main_provider_supports_image: bool = False
+    skip_quote_image_caption: bool = False
+
+
 class ImageCaptionModule:
     """让 AstrBot 图片转述模型看到用户当前问题和引用文本。"""
 
@@ -95,41 +109,16 @@ class ImageCaptionModule:
                     image_caption_provider,
                 )
 
-            async def astrna_process_quote_message(
-                event: Any,
-                req: Any,
-                img_cap_prov_id: str,
-                plugin_context: Any,
-                quoted_message_settings: Any = _MISSING,
-                config: Any | None = None,
-                main_provider_supports_image: bool = False,
-                skip_quote_image_caption: bool = False,
-            ) -> Any:
+            async def astrna_process_quote_message(*args: Any, **kwargs: Any) -> Any:
                 active_module = module_cls._active_module
                 original = module_cls._original_process_quote_message
-                if active_module is None:
-                    return await call_original_quote_message(
-                        original,
-                        event,
-                        req,
-                        img_cap_prov_id,
-                        plugin_context,
-                        quoted_message_settings,
-                        config,
-                        main_provider_supports_image,
-                        skip_quote_image_caption,
-                    )
+                call = parse_quote_message_call(args, kwargs)
+                if active_module is None or call is None:
+                    return await original(*args, **kwargs)
 
                 return await active_module.run_quote_message_with_context(
                     original,
-                    event,
-                    req,
-                    img_cap_prov_id,
-                    plugin_context,
-                    quoted_message_settings,
-                    config,
-                    main_provider_supports_image,
-                    skip_quote_image_caption,
+                    call,
                 )
 
             astrna_ensure_img_caption._astrna_image_caption_patch = True
@@ -190,65 +179,42 @@ class ImageCaptionModule:
     async def run_quote_message_with_context(
         self,
         original_process_quote_message: Any,
-        event: Any,
-        req: Any,
-        img_cap_prov_id: str,
-        plugin_context: Any,
-        quoted_message_settings: Any,
-        config: Any | None,
-        main_provider_supports_image: bool,
-        skip_quote_image_caption: bool,
+        call: QuoteMessageCall,
     ) -> Any:
-        if skip_quote_image_caption or main_provider_supports_image or not img_cap_prov_id:
+        if (
+            call.skip_quote_image_caption
+            or call.main_provider_supports_image
+            or not call.img_cap_prov_id
+        ):
             return await call_original_quote_message(
                 original_process_quote_message,
-                event,
-                req,
-                img_cap_prov_id,
-                plugin_context,
-                quoted_message_settings,
-                config,
-                main_provider_supports_image,
-                skip_quote_image_caption,
+                call,
             )
 
         quoted_text = await self.collect_quoted_text(
-            event,
-            quoted_message_settings=quoted_message_settings,
-            config=config,
+            call.event,
+            quoted_message_settings=call.quoted_message_settings,
+            config=call.config,
         )
-        base_prompt = get_quote_caption_base_prompt(config)
+        base_prompt = get_quote_caption_base_prompt(call.config)
         optimized_prompt = build_image_caption_prompt(
             base_prompt,
-            user_prompt=getattr(req, "prompt", None),
+            user_prompt=getattr(call.req, "prompt", None),
             quoted_text=quoted_text,
         )
         if optimized_prompt == QUOTE_IMAGE_CAPTION_PROMPT:
             return await call_original_quote_message(
                 original_process_quote_message,
-                event,
-                req,
-                img_cap_prov_id,
-                plugin_context,
-                quoted_message_settings,
-                config,
-                main_provider_supports_image,
-                skip_quote_image_caption,
+                call,
             )
 
-        prompt_context = _ImageCaptionContextProxy(plugin_context, self)
+        prompt_context = _ImageCaptionContextProxy(call.plugin_context, self)
         token = _QUOTE_PROMPT_CONTEXT.set(optimized_prompt)
         try:
             return await call_original_quote_message(
                 original_process_quote_message,
-                event,
-                req,
-                img_cap_prov_id,
-                prompt_context,
-                quoted_message_settings,
-                config,
-                main_provider_supports_image,
-                skip_quote_image_caption,
+                call,
+                plugin_context=prompt_context,
             )
         finally:
             _QUOTE_PROMPT_CONTEXT.reset(token)
@@ -458,37 +424,75 @@ def replace_quote_caption_prompt(
     return args, kwargs
 
 
+QUOTE_MESSAGE_PARAM_NAMES = (
+    "event",
+    "req",
+    "img_cap_prov_id",
+    "plugin_context",
+    "quoted_message_settings",
+    "config",
+    "main_provider_supports_image",
+    "skip_quote_image_caption",
+)
+QUOTE_MESSAGE_REQUIRED_PARAMS = QUOTE_MESSAGE_PARAM_NAMES[:4]
+
+
+def parse_quote_message_call(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> QuoteMessageCall | None:
+    if len(args) > len(QUOTE_MESSAGE_PARAM_NAMES):
+        return None
+
+    unknown_kwargs = set(kwargs) - set(QUOTE_MESSAGE_PARAM_NAMES)
+    if unknown_kwargs:
+        return None
+
+    values: dict[str, Any] = {}
+    for index, value in enumerate(args):
+        name = QUOTE_MESSAGE_PARAM_NAMES[index]
+        if name in kwargs:
+            return None
+        values[name] = value
+
+    values.update(kwargs)
+    if any(name not in values for name in QUOTE_MESSAGE_REQUIRED_PARAMS):
+        return None
+
+    return QuoteMessageCall(
+        args=tuple(args),
+        kwargs=dict(kwargs),
+        event=values["event"],
+        req=values["req"],
+        img_cap_prov_id=values["img_cap_prov_id"],
+        plugin_context=values["plugin_context"],
+        quoted_message_settings=values.get("quoted_message_settings", _MISSING),
+        config=values.get("config"),
+        main_provider_supports_image=bool(
+            values.get("main_provider_supports_image", False)
+        ),
+        skip_quote_image_caption=bool(
+            values.get("skip_quote_image_caption", False)
+        ),
+    )
+
+
 async def call_original_quote_message(
     original: Any,
-    event: Any,
-    req: Any,
-    img_cap_prov_id: str,
-    plugin_context: Any,
-    quoted_message_settings: Any,
-    config: Any | None,
-    main_provider_supports_image: bool,
-    skip_quote_image_caption: bool,
+    call: QuoteMessageCall,
+    *,
+    plugin_context: Any = _MISSING,
 ) -> Any:
-    if quoted_message_settings is _MISSING:
-        kwargs = {}
-        if config is not None:
-            kwargs["config"] = config
-        if main_provider_supports_image:
-            kwargs["main_provider_supports_image"] = main_provider_supports_image
-        if skip_quote_image_caption:
-            kwargs["skip_quote_image_caption"] = skip_quote_image_caption
-        return await original(event, req, img_cap_prov_id, plugin_context, **kwargs)
+    args = list(call.args)
+    kwargs = dict(call.kwargs)
 
-    return await original(
-        event,
-        req,
-        img_cap_prov_id,
-        plugin_context,
-        quoted_message_settings,
-        config,
-        main_provider_supports_image,
-        skip_quote_image_caption,
-    )
+    if plugin_context is not _MISSING:
+        if len(args) >= 4:
+            args[3] = plugin_context
+        else:
+            kwargs["plugin_context"] = plugin_context
+
+    return await original(*args, **kwargs)
 
 
 def find_reply_component(event: Any, astr_main_agent: Any) -> Any | None:
