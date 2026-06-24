@@ -11,6 +11,7 @@ from .modules.forward_nodes import (
 )
 from .modules.image_caption import ImageCaptionModule
 from .modules.identity_metadata import IdentityMetadataModule
+from .modules.send_message_to_user import SendMessageToUserModule
 
 
 DEFAULT_CONFIG = {
@@ -23,6 +24,7 @@ DEFAULT_CONFIG = {
     "forward_node_hard_limit": FORWARD_NODE_HARD_LIMIT_DEFAULT,
     "optimize_dynamic_system_prompt": False,
     "optimize_image_caption": False,
+    "optimize_send_message_to_user": False,
 }
 
 
@@ -51,16 +53,22 @@ class AstrNaRuntime:
             kv_store=kv_store,
         )
         self.image_caption = ImageCaptionModule(logger=logger)
+        self.send_message_to_user = SendMessageToUserModule(logger=logger)
         if self.config.get("optimize_forward_nodes", False):
             self.forward_nodes.install()
         if self.config.get("optimize_dynamic_system_prompt", False):
             self.dynamic_system_prompt.install()
         if self.config.get("optimize_image_caption", False):
             self.image_caption.install()
+        if self.config.get("optimize_send_message_to_user", False):
+            self.send_message_to_user.install()
 
     async def sanitize_request(self, event: Any, req: Any) -> None:
         if self.config.get("optimize_dynamic_system_prompt", False):
             self.dynamic_system_prompt.install()
+        if self.config.get("optimize_send_message_to_user", False):
+            self.send_message_to_user.install()
+            self.send_message_to_user.prepare_request(event, req)
 
         if self.config.get("fix_deepseek_v4_400", False):
             self.deepseek_v4_400.sanitize(event, req)
@@ -84,6 +92,7 @@ class AstrNaRuntime:
         self.forward_nodes.terminate()
         self.dynamic_system_prompt.terminate()
         self.image_caption.terminate()
+        self.send_message_to_user.terminate()
 
 
 def merge_config(config: dict | None) -> dict[str, Any]:

@@ -69,5 +69,11 @@
     "description": "更好的图像转述",
     "hint": "开启后，AstrNa 会在 AstrBot 使用独立图片转述模型时，保留用户设置的自定义转述提示词，并把用户当前问题和引用消息文本补充给转述模型，让转述模型带着问题看图，而不是只做全局描述。适用于主模型非多模态、但配置了 AstrBot 图片转述模型的场景；主模型本身支持图片，或 AstrBot 切换整次请求到多模态 fallback provider 时不会干预。默认关闭。",
     "default": false
+  },
+  "optimize_send_message_to_user": {
+    "type": "bool",
+    "description": "优化send_message_to_user工具",
+    "hint": "开启后，AstrNa 会在普通聊天中拦截模型误调用 send_message_to_user 发送当前会话纯文本的情况，把这段文本改为普通最终回复，让发送前插件、表情包识别、分段回复、合并转发等正常生效。为保证这些发送前插件能命中，本模块会在普通聊天里提前关闭本轮流式输出；跨会话主动消息、定时任务、live、图片/文件/语音/视频/@ 等非纯文本消息不会接管，仍走 AstrBot 原逻辑。默认关闭。",
+    "default": false
   }
 }
