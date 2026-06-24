@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "0.0.9"
+    assert metadata["version"] == "0.1.1"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -40,6 +40,7 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "optimize_image_caption",
         "optimize_send_message_to_user",
         "provide_group_identity_tools",
+        "optimize_reply_target_history",
     ]
     assert schema["fix_deepseek_v4_400"]["type"] == "bool"
     assert schema["fix_deepseek_v4_400"]["default"] is False
@@ -100,6 +101,12 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         == "提供群身份查询工具"
     )
     assert schema["provide_group_identity_tools"]["default"] is False
+    assert schema["optimize_reply_target_history"]["type"] == "bool"
+    assert (
+        schema["optimize_reply_target_history"]["description"]
+        == "优化回复历史标记"
+    )
+    assert schema["optimize_reply_target_history"]["default"] is False
 
 
 def test_changelog_contains_release_notes():
@@ -114,3 +121,4 @@ def test_changelog_contains_release_notes():
     assert "## 0.0.7" in changelog
     assert "## 0.0.8" in changelog
     assert "## 0.0.9" in changelog
+    assert "## 0.1.1" in changelog

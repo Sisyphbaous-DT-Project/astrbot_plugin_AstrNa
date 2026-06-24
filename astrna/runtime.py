@@ -12,6 +12,7 @@ from .modules.forward_nodes import (
 from .modules.image_caption import ImageCaptionModule
 from .modules.group_identity_tools import GroupIdentityToolsModule
 from .modules.identity_metadata import IdentityMetadataModule
+from .modules.reply_target_history import ReplyTargetHistoryModule
 from .modules.send_message_to_user import SendMessageToUserModule
 
 
@@ -28,6 +29,7 @@ DEFAULT_CONFIG = {
     "optimize_image_caption": False,
     "optimize_send_message_to_user": False,
     "provide_group_identity_tools": False,
+    "optimize_reply_target_history": False,
 }
 
 
@@ -61,10 +63,13 @@ class AstrNaRuntime:
             context=context,
             logger=logger,
         )
+        self.reply_target_history = ReplyTargetHistoryModule(logger=logger)
         if self.config.get("optimize_forward_nodes", False):
             self.forward_nodes.install()
         if self.config.get("optimize_dynamic_system_prompt", False):
             self.dynamic_system_prompt.install()
+        if self.config.get("optimize_reply_target_history", False):
+            self.reply_target_history.install()
         if self.config.get("optimize_image_caption", False):
             self.image_caption.install()
         if self.config.get("optimize_send_message_to_user", False):
@@ -107,6 +112,7 @@ class AstrNaRuntime:
         self.image_caption.terminate()
         self.send_message_to_user.terminate()
         self.group_identity_tools.terminate()
+        self.reply_target_history.terminate()
 
 
 def merge_config(config: dict | None) -> dict[str, Any]:

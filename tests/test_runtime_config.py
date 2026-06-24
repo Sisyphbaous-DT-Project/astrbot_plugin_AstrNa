@@ -19,6 +19,7 @@ def test_merge_config_keeps_defaults_for_missing_values():
         "optimize_image_caption": False,
         "optimize_send_message_to_user": False,
         "provide_group_identity_tools": False,
+        "optimize_reply_target_history": False,
     }
 
 
@@ -37,6 +38,7 @@ def test_merge_config_can_enable_modules():
             "optimize_image_caption": True,
             "optimize_send_message_to_user": True,
             "provide_group_identity_tools": True,
+            "optimize_reply_target_history": True,
         }
     )
 
@@ -53,6 +55,7 @@ def test_merge_config_can_enable_modules():
         "optimize_image_caption": True,
         "optimize_send_message_to_user": True,
         "provide_group_identity_tools": True,
+        "optimize_reply_target_history": True,
     }
 
 

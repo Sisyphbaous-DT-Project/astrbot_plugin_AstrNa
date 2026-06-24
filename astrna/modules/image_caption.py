@@ -44,6 +44,8 @@ class ImageCaptionModule:
     _astr_main_agent: Any = None
     _original_ensure_img_caption: Any = None
     _original_process_quote_message: Any = None
+    _ensure_img_caption_wrapper: Any = None
+    _process_quote_message_wrapper: Any = None
     _active_module: ImageCaptionModule | None = None
     _provider_patches: dict[int, ProviderPatch] = {}
 
@@ -77,6 +79,8 @@ class ImageCaptionModule:
             module_cls._original_process_quote_message = (
                 astr_main_agent._process_quote_message
             )
+            original_ensure_img_caption = module_cls._original_ensure_img_caption
+            original_process_quote_message = module_cls._original_process_quote_message
 
             async def astrna_ensure_img_caption(
                 event: Any,
@@ -86,9 +90,8 @@ class ImageCaptionModule:
                 image_caption_provider: str,
             ) -> Any:
                 active_module = module_cls._active_module
-                original = module_cls._original_ensure_img_caption
                 if active_module is None:
-                    return await original(
+                    return await original_ensure_img_caption(
                         event,
                         req,
                         cfg,
@@ -101,7 +104,7 @@ class ImageCaptionModule:
                     req,
                     cfg,
                 )
-                return await original(
+                return await original_ensure_img_caption(
                     event,
                     req,
                     optimized_cfg,
@@ -111,18 +114,24 @@ class ImageCaptionModule:
 
             async def astrna_process_quote_message(*args: Any, **kwargs: Any) -> Any:
                 active_module = module_cls._active_module
-                original = module_cls._original_process_quote_message
                 call = parse_quote_message_call(args, kwargs)
                 if active_module is None or call is None:
-                    return await original(*args, **kwargs)
+                    return await original_process_quote_message(*args, **kwargs)
 
                 return await active_module.run_quote_message_with_context(
-                    original,
+                    original_process_quote_message,
                     call,
                 )
 
             astrna_ensure_img_caption._astrna_image_caption_patch = True
             astrna_process_quote_message._astrna_image_caption_patch = True
+            mark_wrapper_active(astrna_ensure_img_caption, original_ensure_img_caption)
+            mark_wrapper_active(
+                astrna_process_quote_message,
+                original_process_quote_message,
+            )
+            module_cls._ensure_img_caption_wrapper = astrna_ensure_img_caption
+            module_cls._process_quote_message_wrapper = astrna_process_quote_message
             astr_main_agent._ensure_img_caption = astrna_ensure_img_caption
             astr_main_agent._process_quote_message = astrna_process_quote_message
 
@@ -139,20 +148,36 @@ class ImageCaptionModule:
 
     @classmethod
     def restore_patch(cls) -> None:
+        mark_wrapper_inactive(cls._ensure_img_caption_wrapper)
+        mark_wrapper_inactive(cls._process_quote_message_wrapper)
         if cls._astr_main_agent is not None:
-            if cls._original_ensure_img_caption is not None:
+            current_ensure = getattr(cls._astr_main_agent, "_ensure_img_caption", None)
+            if (
+                cls._original_ensure_img_caption is not None
+                and getattr(current_ensure, "_astrna_image_caption_patch", False)
+            ):
                 cls._astr_main_agent._ensure_img_caption = (
-                    cls._original_ensure_img_caption
+                    unwrap_inactive_wrapper(cls._original_ensure_img_caption)
                 )
-            if cls._original_process_quote_message is not None:
+            current_quote = getattr(
+                cls._astr_main_agent,
+                "_process_quote_message",
+                None,
+            )
+            if (
+                cls._original_process_quote_message is not None
+                and getattr(current_quote, "_astrna_image_caption_patch", False)
+            ):
                 cls._astr_main_agent._process_quote_message = (
-                    cls._original_process_quote_message
+                    unwrap_inactive_wrapper(cls._original_process_quote_message)
                 )
         for provider_id in list(cls._provider_patches):
             cls._restore_provider_patch(provider_id, force=True)
         cls._astr_main_agent = None
         cls._original_ensure_img_caption = None
         cls._original_process_quote_message = None
+        cls._ensure_img_caption_wrapper = None
+        cls._process_quote_message_wrapper = None
         cls._active_module = None
 
     async def build_image_caption_config(
@@ -403,6 +428,38 @@ def sanitize_caption_context_text(value: Any) -> str:
     text = text.replace("<", "＜").replace(">", "＞")
     text = re.sub(r"\s+", " ", text).strip()
     return text[:FIELD_MAX_LENGTH]
+
+
+def mark_wrapper_active(wrapper: Any, original: Any) -> None:
+    try:
+        wrapper._astrna_wrapper_active = True
+        wrapper._astrna_wrapped_original = original
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def mark_wrapper_inactive(wrapper: Any) -> None:
+    if wrapper is None:
+        return
+    try:
+        wrapper._astrna_wrapper_active = False
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def unwrap_inactive_wrapper(func: Any) -> Any:
+    seen: set[int] = set()
+    while (
+        callable(func)
+        and getattr(func, "_astrna_wrapper_active", True) is False
+        and id(func) not in seen
+    ):
+        seen.add(id(func))
+        original = getattr(func, "_astrna_wrapped_original", None)
+        if not callable(original) or original is func:
+            break
+        func = original
+    return func
 
 
 def replace_quote_caption_prompt(
