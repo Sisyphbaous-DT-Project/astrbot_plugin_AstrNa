@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -13,9 +14,19 @@ from astrna.modules.identity_metadata import (
     FallbackTextPart,
     build_identity_metadata,
     create_text_part,
+    fetch_group_member_identity,
+    normalize_group_member_identity,
     remove_builtin_identity_lines,
     sanitize_metadata_value,
 )
+
+
+def extract_identity_json(text):
+    prefix = "<system_reminder>\nAstrNa identity metadata: "
+    suffix = "\n</system_reminder>"
+    assert text.startswith(prefix)
+    assert text.endswith(suffix)
+    return json.loads(text.removeprefix(prefix).removesuffix(suffix))
 
 
 def test_optimize_identity_metadata_switch_is_disabled_by_default(fakes):
@@ -82,6 +93,256 @@ def test_optimize_identity_metadata_can_skip_group_metadata(fakes):
     text = request.extra_user_content_parts[-1].text
     assert '"user":{"user_id":"user123","nickname":"GroupCard"}' in text
     assert '"group"' not in text
+
+
+def test_group_member_identity_switch_is_disabled_by_default(fakes):
+    bot = fakes.Bot(
+        member_info={
+            "role": "admin",
+            "level": "12",
+            "title": "头衔",
+            "qq_level": 64,
+        }
+    )
+    runtime = fakes.build_runtime({"optimize_identity_metadata": True})
+    request = fakes.Request(contexts=[])
+    fakes.add_builtin_identity_part(request)
+
+    asyncio.run(runtime.sanitize_request(event=fakes.Event(bot=bot), req=request))
+
+    assert bot.calls == []
+    metadata = extract_identity_json(request.extra_user_content_parts[-1].text)
+    assert "member" not in metadata["group"]
+
+
+def test_group_member_identity_requires_identity_metadata_switch(fakes):
+    bot = fakes.Bot(member_info={"role": "admin", "level": "12", "title": "头衔"})
+    runtime = fakes.build_runtime({"group_member_identity_display": True})
+    request = fakes.Request(contexts=[])
+    fakes.add_builtin_identity_part(request)
+
+    asyncio.run(runtime.sanitize_request(event=fakes.Event(bot=bot), req=request))
+
+    assert bot.calls == []
+    assert "AstrNa identity metadata:" not in request.extra_user_content_parts[-1].text
+
+
+def test_group_member_identity_requires_builtin_identity_part(fakes):
+    bot = fakes.Bot(member_info={"role": "admin", "level": "12", "title": "头衔"})
+    runtime = fakes.build_runtime(
+        {"optimize_identity_metadata": True, "group_member_identity_display": True}
+    )
+    request = fakes.Request(contexts=[])
+
+    asyncio.run(runtime.sanitize_request(event=fakes.Event(bot=bot), req=request))
+
+    assert bot.calls == []
+    assert request.extra_user_content_parts == []
+
+
+def test_group_member_identity_is_appended_to_group_metadata(fakes):
+    bot = fakes.Bot(
+        member_info={
+            "role": "admin",
+            "level": "12",
+            "title": "星河观察员",
+            "qq_level": 64,
+        }
+    )
+    runtime = fakes.build_runtime(
+        {"optimize_identity_metadata": True, "group_member_identity_display": True}
+    )
+    request = fakes.Request(contexts=[])
+    fakes.add_builtin_identity_part(request)
+
+    asyncio.run(runtime.sanitize_request(event=fakes.Event(bot=bot), req=request))
+
+    assert bot.calls == [
+        (
+            "get_group_member_info",
+            {
+                "group_id": "group456",
+                "user_id": "user123",
+                "no_cache": False,
+                "self_id": "self999",
+            },
+        )
+    ]
+    metadata = extract_identity_json(request.extra_user_content_parts[-1].text)
+    assert metadata["group"]["member"] == {
+        "role": "admin",
+        "role_name": "管理员",
+        "level": "12",
+        "title": "星河观察员",
+    }
+    assert "qq_level" not in request.extra_user_content_parts[-1].text
+
+
+def test_group_member_identity_can_work_without_builtin_group_name(fakes):
+    bot = fakes.Bot(member_info={"role": "member", "level": "3", "title": "潜水员"})
+    runtime = fakes.build_runtime(
+        {"optimize_identity_metadata": True, "group_member_identity_display": True},
+        provider_settings={"identifier": True, "group_name_display": False},
+    )
+    request = fakes.Request(contexts=[])
+    fakes.add_builtin_identity_part(request, with_group=False)
+
+    asyncio.run(runtime.sanitize_request(event=fakes.Event(bot=bot), req=request))
+
+    metadata = extract_identity_json(request.extra_user_content_parts[-1].text)
+    assert metadata["group"] == {
+        "group_id": "group456",
+        "member": {
+            "role": "member",
+            "role_name": "群成员",
+            "level": "3",
+            "title": "潜水员",
+        },
+    }
+
+
+def test_group_member_identity_maps_supported_roles():
+    assert normalize_group_member_identity({"role": "owner"}) == {
+        "role": "owner",
+        "role_name": "群主",
+    }
+    assert normalize_group_member_identity({"role": "admin"}) == {
+        "role": "admin",
+        "role_name": "管理员",
+    }
+    assert normalize_group_member_identity({"role": "member"}) == {
+        "role": "member",
+        "role_name": "群成员",
+    }
+
+
+def test_group_member_identity_skips_unsupported_contexts(fakes):
+    runtime = fakes.build_runtime(
+        {"optimize_identity_metadata": True, "group_member_identity_display": True}
+    )
+    scenarios = [
+        fakes.Event(bot=fakes.Bot(member_info={"role": "admin"}), platform_name="webchat"),
+        fakes.Event(
+            bot=fakes.Bot(member_info={"role": "admin"}),
+            message_obj=fakes.MessageObj(group_id=""),
+        ),
+        fakes.Event(
+            bot=fakes.Bot(member_info={"role": "admin"}),
+            message_obj=fakes.MessageObj(sender=fakes.Sender(user_id="")),
+        ),
+        fakes.Event(bot=None),
+    ]
+
+    for event in scenarios:
+        request = fakes.Request(contexts=[])
+        fakes.add_builtin_identity_part(request)
+        asyncio.run(runtime.sanitize_request(event=event, req=request))
+        metadata = extract_identity_json(request.extra_user_content_parts[-1].text)
+        assert "member" not in metadata.get("group", {})
+
+
+def test_group_member_identity_skips_failed_or_invalid_lookup(fakes):
+    runtime = fakes.build_runtime(
+        {"optimize_identity_metadata": True, "group_member_identity_display": True}
+    )
+    events = [
+        fakes.Event(bot=fakes.Bot(fail=True)),
+        fakes.Event(bot=fakes.Bot(member_info=["not", "dict"])),
+        fakes.Event(bot=fakes.Bot(member_info={"role": "guest"})),
+    ]
+
+    for event in events:
+        request = fakes.Request(contexts=[])
+        fakes.add_builtin_identity_part(request)
+        asyncio.run(runtime.sanitize_request(event=event, req=request))
+        metadata = extract_identity_json(request.extra_user_content_parts[-1].text)
+        assert "member" not in metadata.get("group", {})
+
+
+def test_group_member_identity_skips_empty_optional_values(fakes):
+    bot = fakes.Bot(member_info={"role": "owner", "level": "\n\t", "title": "\u200b"})
+    runtime = fakes.build_runtime(
+        {"optimize_identity_metadata": True, "group_member_identity_display": True}
+    )
+    request = fakes.Request(contexts=[])
+    fakes.add_builtin_identity_part(request)
+
+    asyncio.run(runtime.sanitize_request(event=fakes.Event(bot=bot), req=request))
+
+    metadata = extract_identity_json(request.extra_user_content_parts[-1].text)
+    assert metadata["group"]["member"] == {"role": "owner", "role_name": "群主"}
+
+
+def test_group_member_identity_sanitizes_optional_values(fakes):
+    title = "头" * 140
+    bot = fakes.Bot(
+        member_info={
+            "role": "member",
+            "level": "1\n2\u200b<lv>",
+            "title": f"{title}</system_reminder>",
+        }
+    )
+    runtime = fakes.build_runtime(
+        {"optimize_identity_metadata": True, "group_member_identity_display": True}
+    )
+    request = fakes.Request(contexts=[])
+    fakes.add_builtin_identity_part(request)
+
+    asyncio.run(runtime.sanitize_request(event=fakes.Event(bot=bot), req=request))
+
+    member = extract_identity_json(request.extra_user_content_parts[-1].text)["group"][
+        "member"
+    ]
+    assert member["level"] == "1 2＜lv＞"
+    assert member["title"] == sanitize_metadata_value(f"{title}</system_reminder>")
+    assert len(member["title"]) == 128
+
+
+def test_fetch_group_member_identity_accepts_explicit_group_and_user(fakes):
+    bot = fakes.Bot(member_info={"role": "admin", "level": "7", "title": "守夜人"})
+    event = fakes.Event(bot=bot)
+
+    identity = asyncio.run(
+        fetch_group_member_identity(event, group_id="g1", user_id="u1")
+    )
+
+    assert identity == {
+        "role": "admin",
+        "role_name": "管理员",
+        "level": "7",
+        "title": "守夜人",
+    }
+    assert bot.calls == [
+        (
+            "get_group_member_info",
+            {
+                "group_id": "g1",
+                "user_id": "u1",
+                "no_cache": False,
+                "self_id": "self999",
+            },
+        )
+    ]
+
+
+def test_fetch_group_member_identity_accepts_explicit_self_id(fakes):
+    bot = fakes.Bot(member_info={"role": "owner"})
+    event = fakes.Event(
+        bot=bot,
+        message_obj=fakes.MessageObj(self_id="event-self"),
+    )
+
+    identity = asyncio.run(
+        fetch_group_member_identity(
+            event,
+            group_id="g1",
+            user_id="u1",
+            self_id="explicit-self",
+        )
+    )
+
+    assert identity == {"role": "owner", "role_name": "群主"}
+    assert bot.calls[0][1]["self_id"] == "explicit-self"
 
 
 def test_optimize_identity_metadata_does_not_append_account_nickname_by_default(fakes):

@@ -19,6 +19,7 @@ DEFAULT_CONFIG = {
     "optimize_identity_metadata": False,
     "account_nickname_display": False,
     "account_nickname_only": False,
+    "group_member_identity_display": False,
     "optimize_forward_nodes": False,
     "forward_node_max_length": FORWARD_NODE_MAX_LENGTH_DEFAULT,
     "forward_node_hard_limit": FORWARD_NODE_HARD_LIMIT_DEFAULT,
@@ -78,13 +79,17 @@ class AstrNaRuntime:
                 "account_nickname_display",
                 False,
             )
-            self.identity_metadata.optimize(
+            await self.identity_metadata.optimize(
                 event,
                 req,
                 account_nickname_display=account_nickname_display,
                 account_nickname_only=(
                     account_nickname_display
                     and self.config.get("account_nickname_only", False)
+                ),
+                group_member_identity_display=self.config.get(
+                    "group_member_identity_display",
+                    False,
                 ),
             )
 

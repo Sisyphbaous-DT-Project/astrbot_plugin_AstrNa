@@ -23,23 +23,32 @@ class IdentityMetadataModule:
     def __init__(self, logger: Any):
         self.logger = logger
 
-    def optimize(
+    async def optimize(
         self,
         event: Any,
         req: Any,
         *,
         account_nickname_display: bool = False,
         account_nickname_only: bool = False,
+        group_member_identity_display: bool = False,
     ) -> None:
         removal = remove_builtin_identity_parts(req)
         if not removal.removed_identity:
             return
+
+        group_member_identity = None
+        if group_member_identity_display:
+            group_member_identity = await fetch_group_member_identity(
+                event,
+                logger=self.logger,
+            )
 
         metadata = build_identity_metadata(
             event,
             account_nickname_display=account_nickname_display,
             account_nickname_only=account_nickname_only,
             group_name_display=removal.removed_group_name,
+            group_member_identity=group_member_identity,
         )
         if not metadata:
             return
@@ -82,7 +91,8 @@ def build_identity_metadata(
     account_nickname_display: bool = False,
     account_nickname_only: bool = False,
     group_name_display: bool = False,
-) -> dict[str, dict[str, str]]:
+    group_member_identity: dict[str, str] | None = None,
+) -> dict[str, Any]:
     message_obj = getattr(event, "message_obj", None)
     sender = getattr(message_obj, "sender", None)
     if sender is None:
@@ -103,23 +113,112 @@ def build_identity_metadata(
             elif account_nickname != display_nickname:
                 user_metadata["account_nickname"] = account_nickname
 
-    metadata: dict[str, dict[str, str]] = {}
+    metadata: dict[str, Any] = {}
     if user_metadata:
         metadata["user"] = user_metadata
 
-    if group_name_display:
-        group_metadata: dict[str, str] = {}
+    if group_name_display or group_member_identity:
+        group_metadata: dict[str, Any] = {}
         group_id = getattr(message_obj, "group_id", None)
         if group_id:
             put_required(group_metadata, "group_id", group_id)
 
         group = getattr(message_obj, "group", None)
         group_name = getattr(group, "group_name", None)
-        put_optional(group_metadata, "name", group_name)
+        if group_name_display:
+            put_optional(group_metadata, "name", group_name)
+        if group_member_identity:
+            group_metadata["member"] = group_member_identity
         if group_metadata:
             metadata["group"] = group_metadata
 
     return metadata
+
+
+ROLE_NAME_MAP = {
+    "owner": "群主",
+    "admin": "管理员",
+    "member": "群成员",
+}
+
+
+async def fetch_group_member_identity(
+    event: Any,
+    *,
+    group_id: Any | None = None,
+    user_id: Any | None = None,
+    self_id: Any | None = None,
+    logger: Any | None = None,
+) -> dict[str, str] | None:
+    """查询当前平台可提供的群成员身份，供身份元数据和后续工具复用。"""
+    platform_name = get_event_platform_name(event)
+    if platform_name != "aiocqhttp":
+        return None
+
+    message_obj = getattr(event, "message_obj", None)
+    sender = getattr(message_obj, "sender", None)
+    group_id = (
+        group_id if group_id is not None else getattr(message_obj, "group_id", None)
+    )
+    user_id = user_id if user_id is not None else getattr(sender, "user_id", None)
+    if not group_id or not user_id:
+        return None
+
+    bot = getattr(event, "bot", None)
+    call_action = getattr(bot, "call_action", None)
+    if not callable(call_action):
+        return None
+
+    params: dict[str, Any] = {
+        "group_id": group_id,
+        "user_id": user_id,
+        "no_cache": False,
+    }
+    self_id = self_id if self_id is not None else getattr(message_obj, "self_id", None)
+    if self_id:
+        params["self_id"] = self_id
+
+    try:
+        member_info = await call_action("get_group_member_info", **params)
+    except Exception as exc:
+        if logger is not None:
+            logger.debug(
+                "AstrNa 查询群成员身份失败: group_id=%s, user_id=%s, error=%s",
+                group_id,
+                user_id,
+                exc,
+            )
+        return None
+
+    return normalize_group_member_identity(member_info)
+
+
+def get_event_platform_name(event: Any) -> str:
+    get_platform_name = getattr(event, "get_platform_name", None)
+    if callable(get_platform_name):
+        try:
+            return str(get_platform_name())
+        except Exception:
+            return ""
+    platform_meta = getattr(event, "platform_meta", None)
+    return str(getattr(platform_meta, "name", "") or "")
+
+
+def normalize_group_member_identity(member_info: Any) -> dict[str, str] | None:
+    if not isinstance(member_info, dict):
+        return None
+
+    role = sanitize_optional_metadata_value(member_info.get("role"))
+    if role not in ROLE_NAME_MAP:
+        return None
+
+    identity: dict[str, str] = {
+        "role": role,
+        "role_name": ROLE_NAME_MAP[role],
+    }
+    put_optional(identity, "level", member_info.get("level"))
+    put_optional(identity, "title", member_info.get("title"))
+    return identity
 
 
 def get_account_nickname(sender: Any, message_obj: Any) -> Any:
@@ -167,7 +266,7 @@ def sanitize_optional_metadata_value(value: Any) -> str | None:
     return sanitized or None
 
 
-def format_metadata_json(metadata: dict[str, dict[str, str]]) -> str:
+def format_metadata_json(metadata: dict[str, Any]) -> str:
     return json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
 
 

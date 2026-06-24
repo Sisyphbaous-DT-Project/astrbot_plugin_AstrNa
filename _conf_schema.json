@@ -32,6 +32,16 @@
       "account_nickname_display": true
     }
   },
+  "group_member_identity_display": {
+    "type": "bool",
+    "description": "补充群成员身份",
+    "hint": "开启后，AstrNa 会在 AstrBot 自带身份识别已生效时，通过 NapCat/aiocqhttp 补充当前发言人在群里的身份、群等级和专属头衔；只支持群聊和可查询成员信息的平台，查不到会自动跳过。不会注入 QQ 等级，不会写入会话历史。默认关闭。",
+    "default": false,
+    "collapsed": true,
+    "condition": {
+      "optimize_identity_metadata": true
+    }
+  },
   "optimize_forward_nodes": {
     "type": "bool",
     "description": "优化合并转发",

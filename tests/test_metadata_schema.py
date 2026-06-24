@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "0.0.6"
+    assert metadata["version"] == "0.0.7"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -32,6 +32,7 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "optimize_identity_metadata",
         "account_nickname_display",
         "account_nickname_only",
+        "group_member_identity_display",
         "optimize_forward_nodes",
         "forward_node_max_length",
         "forward_node_hard_limit",
@@ -55,6 +56,13 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
     assert schema["account_nickname_only"]["condition"] == {
         "optimize_identity_metadata": True,
         "account_nickname_display": True,
+    }
+    assert schema["group_member_identity_display"]["type"] == "bool"
+    assert schema["group_member_identity_display"]["description"] == "补充群成员身份"
+    assert schema["group_member_identity_display"]["default"] is False
+    assert schema["group_member_identity_display"]["collapsed"] is True
+    assert schema["group_member_identity_display"]["condition"] == {
+        "optimize_identity_metadata": True,
     }
     assert schema["optimize_forward_nodes"]["type"] == "bool"
     assert schema["optimize_forward_nodes"]["default"] is False
@@ -96,3 +104,4 @@ def test_changelog_contains_release_notes():
     assert "## 0.0.4" in changelog
     assert "## 0.0.5" in changelog
     assert "## 0.0.6" in changelog
+    assert "## 0.0.7" in changelog

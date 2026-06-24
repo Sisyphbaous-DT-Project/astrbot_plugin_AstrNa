@@ -25,6 +25,19 @@ class DummyLogger:
         self.debugs.append(args)
 
 
+class DummyBot:
+    def __init__(self, member_info=None, *, fail=False):
+        self.member_info = member_info
+        self.fail = fail
+        self.calls = []
+
+    async def call_action(self, action, **params):
+        self.calls.append((action, params))
+        if self.fail:
+            raise RuntimeError("call_action failed")
+        return self.member_info
+
+
 class DummyKVStore:
     def __init__(self, initial=None, *, fail_get=False, fail_put=False):
         self.data = dict(initial or {})
@@ -103,16 +116,24 @@ class DummyMessageObj:
         raw_message=None,
         group_id="group456",
         group=None,
+        self_id="self999",
     ):
         self.sender = sender or DummySender()
         self.raw_message = raw_message
         self.group_id = group_id
         self.group = group if group is not None else DummyGroup()
+        self.self_id = self_id
 
 
 class DummyEvent:
-    unified_msg_origin = "platform:GroupMessage:123456"
-    message_obj = DummyMessageObj()
+    def __init__(self, message_obj=None, bot=None, platform_name="aiocqhttp"):
+        self.unified_msg_origin = "platform:GroupMessage:123456"
+        self.message_obj = message_obj or DummyMessageObj()
+        self.bot = bot
+        self.platform_name = platform_name
+
+    def get_platform_name(self):
+        return self.platform_name
 
 
 def build_runtime(config=None, provider_settings=None, kv_store=None):
@@ -142,6 +163,7 @@ def add_builtin_identity_part(request, *, with_group=True):
 def fakes():
     return SimpleNamespace(
         Logger=DummyLogger,
+        Bot=DummyBot,
         KVStore=DummyKVStore,
         Conversation=DummyConversation,
         Request=DummyRequest,
