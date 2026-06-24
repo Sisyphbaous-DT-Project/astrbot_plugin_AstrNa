@@ -8,7 +8,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from astrna.modules.image_caption import ImageCaptionModule
-from astrna.modules.reply_target_history import ReplyTargetHistoryModule
+from astrna.modules.reply_target_history import ReplyTargetHistoryModule, hash_reply_text
 
 
 def run(coro):
@@ -96,6 +96,17 @@ class DummyInternalAgentSubStage:
         )
 
 
+class DummyToolLoopAgentRunner:
+    completed = []
+
+    async def _complete_with_assistant_response(self, llm_response):
+        self.completed.append(llm_response)
+
+    async def _iter_llm_responses(self):
+        for response in self.responses:
+            yield response
+
+
 class DummyEvent:
     unified_msg_origin = "aiocqhttp:GroupMessage:group456"
 
@@ -175,6 +186,24 @@ class DummyProvider:
         return SimpleNamespace(completion_text="caption")
 
 
+class DummyLLMResponse:
+    def __init__(self, completion_text, *, is_chunk=False, result_chain=None):
+        self.role = "assistant"
+        self.completion_text = completion_text
+        self.is_chunk = is_chunk
+        self.result_chain = result_chain
+
+
+class DummyPlain:
+    def __init__(self, text):
+        self.text = text
+
+
+class DummyResultChain:
+    def __init__(self, chain):
+        self.chain = chain
+
+
 class DummyContext:
     def __init__(self, provider=None):
         self.provider = provider or DummyProvider()
@@ -191,6 +220,7 @@ def reset_patches():
     ReplyTargetHistoryModule.restore_patch()
     ImageCaptionModule.restore_patch()
     DummyInternalAgentSubStage.saved = []
+    DummyToolLoopAgentRunner.completed = []
     yield
     ReplyTargetHistoryModule.restore_patch()
     ImageCaptionModule.restore_patch()
@@ -223,6 +253,30 @@ def internal_module(monkeypatch):
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
     return internal
+
+
+@pytest.fixture
+def runner_module(monkeypatch):
+    for name in [
+        "astrbot",
+        "astrbot.core",
+        "astrbot.core.agent",
+        "astrbot.core.agent.runners",
+    ]:
+        monkeypatch.setitem(
+            sys.modules,
+            name,
+            sys.modules.get(name) or ModuleType(name),
+        )
+
+    module = ModuleType("astrbot.core.agent.runners.tool_loop_agent_runner")
+    module.ToolLoopAgentRunner = DummyToolLoopAgentRunner
+    monkeypatch.setitem(
+        sys.modules,
+        "astrbot.core.agent.runners.tool_loop_agent_runner",
+        module,
+    )
+    return module
 
 
 @pytest.fixture
@@ -285,15 +339,28 @@ def test_default_config_does_not_install_patch(fakes, internal_module):
     run(runtime.terminate())
 
 
-def test_enabled_runtime_installs_and_restores_patch(fakes, internal_module):
+def test_enabled_runtime_installs_and_restores_patch(
+    fakes,
+    internal_module,
+    runner_module,
+):
     original = internal_module.InternalAgentSubStage._save_to_history
+    original_response = runner_module.ToolLoopAgentRunner._complete_with_assistant_response
     runtime = fakes.build_runtime({"optimize_reply_target_history": True})
 
     assert internal_module.InternalAgentSubStage._save_to_history is not original
+    assert (
+        runner_module.ToolLoopAgentRunner._complete_with_assistant_response
+        is not original_response
+    )
 
     run(runtime.terminate())
 
     assert internal_module.InternalAgentSubStage._save_to_history is original
+    assert (
+        runner_module.ToolLoopAgentRunner._complete_with_assistant_response
+        is original_response
+    )
 
 
 def test_repeated_install_does_not_stack_patches(internal_module, astr_main_agent):
@@ -384,8 +451,125 @@ def test_reply_target_marker_is_not_duplicated(internal_module):
     run(stage._save_to_history(DummyEvent(), object(), object(), [original_message], None))
 
     saved_parts = stage.saved[0]["all_messages"][-1].content
-    assert len(saved_parts) == 1
+    assert len(saved_parts) == 2
     assert saved_parts[0].text.count("<astrna_reply_target>") == 1
+    assert "已经标记过" in saved_parts[1].text
+
+
+def test_wrong_existing_reply_target_marker_is_replaced(internal_module):
+    module = ReplyTargetHistoryModule(logger=DummyLogger())
+    module.install()
+    stage = internal_module.InternalAgentSubStage()
+    marked_text = (
+        '<astrna_reply_target>{"scope":"group","user":{"user_id":"wrong"}}'
+        "</astrna_reply_target>\n"
+        "模型输出了旧标签"
+    )
+    original_message = Message("assistant", [TextPart(marked_text)])
+    event = DummyEvent(sender_id="right-user", sender_name="Right Name")
+
+    run(stage._save_to_history(event, object(), object(), [original_message], None))
+
+    saved_parts = stage.saved[0]["all_messages"][-1].content
+    metadata = extract_reply_target_json(saved_parts[0].text)
+    assert metadata["user"] == {"user_id": "right-user", "nickname": "Right Name"}
+    assert "wrong" not in "".join(getattr(part, "text", "") for part in saved_parts)
+    assert saved_parts[1].text == "模型输出了旧标签"
+
+
+def test_llm_response_marker_is_removed_before_completion(runner_module):
+    module = ReplyTargetHistoryModule(logger=DummyLogger())
+    module.install()
+    runner = runner_module.ToolLoopAgentRunner()
+    response = DummyLLMResponse(
+        '<astrna_reply_target>{"scope":"group","user":{"user_id":"wrong"}}'
+        "</astrna_reply_target>\n"
+        "真正要发出的内容"
+    )
+
+    run(runner._complete_with_assistant_response(response))
+
+    assert runner.completed[0].completion_text == "真正要发出的内容"
+
+
+def test_streaming_chunk_marker_is_removed_before_yield(runner_module):
+    module = ReplyTargetHistoryModule(logger=DummyLogger())
+    module.install()
+    runner = runner_module.ToolLoopAgentRunner()
+    runner.responses = [
+        DummyLLMResponse(
+            '<astrna_reply_target>{"scope":"group"}</astrna_reply_target>\n流式内容',
+            is_chunk=True,
+        )
+    ]
+
+    responses = run(collect_runner_responses(runner))
+
+    assert responses[0].completion_text == "流式内容"
+
+
+def test_streaming_chunk_without_marker_keeps_whitespace(runner_module):
+    module = ReplyTargetHistoryModule(logger=DummyLogger())
+    module.install()
+    runner = runner_module.ToolLoopAgentRunner()
+    runner.responses = [DummyLLMResponse(" world\n", is_chunk=True)]
+
+    responses = run(collect_runner_responses(runner))
+
+    assert responses[0].completion_text == " world\n"
+
+
+def test_result_chain_plain_marker_is_removed_before_completion(runner_module):
+    module = ReplyTargetHistoryModule(logger=DummyLogger())
+    module.install()
+    runner = runner_module.ToolLoopAgentRunner()
+    response = DummyLLMResponse(
+        "",
+        result_chain=DummyResultChain(
+            [
+                DummyPlain(
+                    '<astrna_reply_target>{"scope":"group"}</astrna_reply_target>'
+                    "\n链路内容"
+                )
+            ]
+        ),
+    )
+
+    run(runner._complete_with_assistant_response(response))
+
+    assert runner.completed[0].result_chain.chain[0].text == "链路内容"
+
+
+def test_request_context_markers_are_stripped_without_mutating_conversation(
+    fakes,
+    internal_module,
+):
+    runtime = fakes.build_runtime({"optimize_reply_target_history": True})
+    old_history = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        '<astrna_reply_target>{"scope":"group"}'
+                        "</astrna_reply_target>\n旧回复"
+                    ),
+                }
+            ],
+        }
+    ]
+    raw_history = json.dumps(old_history, ensure_ascii=False)
+    conversation = fakes.Conversation(cid="conv-1", history=raw_history)
+    request = fakes.Request(contexts=None, conversation=conversation)
+
+    run(runtime.sanitize_request(fakes.Event(), request))
+
+    assert request.contexts == [
+        {"role": "assistant", "content": [{"type": "text", "text": "旧回复"}]}
+    ]
+    assert conversation.history == raw_history
+    run(runtime.terminate())
 
 
 def test_private_reply_target_marker_uses_private_scope(internal_module):
@@ -583,9 +767,13 @@ def test_quoted_bot_message_injects_original_reply_target(astr_main_agent):
     text = req.extra_user_content_parts[-1].text
     assert "<astrna_quoted_sender>" in text
     assert extract_quoted_reply_target_json(text) == {
-        "scope": "group",
-        "user": {"user_id": "user123", "nickname": "GroupCard"},
-        "group": {"group_id": "group456"},
+        "meaning": "被引用的这条 Bot 回复原本回复给以下用户；这不是当前发言人。",
+        "quoted_assistant_reply_target": {
+            "scope": "group",
+            "user": {"user_id": "user123", "nickname": "GroupCard"},
+            "group": {"group_id": "group456"},
+        },
+        "not_current_sender": True,
     }
 
 
@@ -622,9 +810,96 @@ def test_quoted_bot_message_can_match_legacy_reply_target_text_part(astr_main_ag
     run(astr_main_agent._process_quote_message(event, req, "", DummyContext()))
 
     assert extract_quoted_reply_target_json(req.extra_user_content_parts[-1].text) == {
-        "scope": "group",
-        "user": {"user_id": "legacy-user"},
+        "meaning": "被引用的这条 Bot 回复原本回复给以下用户；这不是当前发言人。",
+        "quoted_assistant_reply_target": {
+            "scope": "group",
+            "user": {"user_id": "legacy-user"},
+        },
+        "not_current_sender": True,
     }
+
+
+def test_quoted_bot_message_can_match_kv_reply_target_index(astr_main_agent, fakes):
+    kv_store = fakes.KVStore(
+        {
+            "reply_target_history_state_v2": {
+                "sessions": {
+                    "aiocqhttp:GroupMessage:group456#conv-1": [
+                        {
+                            "hash": hash_reply_text("KV 匹配回复"),
+                            "metadata": {
+                                "scope": "group",
+                                "user": {"user_id": "user123"},
+                                "group": {"group_id": "group456"},
+                            },
+                        }
+                    ]
+                }
+            }
+        }
+    )
+    module = ReplyTargetHistoryModule(logger=DummyLogger(), kv_store=kv_store)
+    module.install()
+    event = DummyEvent(self_id="bot123")
+    event.message_obj.message = [
+        Reply(sender_id="bot123", sender_nickname="清漪酱", message_str="KV 匹配回复")
+    ]
+    req = DummyRequest()
+    req.conversation = SimpleNamespace(cid="conv-1", history="[]")
+
+    run(astr_main_agent._process_quote_message(event, req, "", DummyContext()))
+
+    assert extract_quoted_reply_target_json(req.extra_user_content_parts[-1].text) == {
+        "meaning": "被引用的这条 Bot 回复原本回复给以下用户；这不是当前发言人。",
+        "quoted_assistant_reply_target": {
+            "scope": "group",
+            "user": {"user_id": "user123"},
+            "group": {"group_id": "group456"},
+        },
+        "not_current_sender": True,
+    }
+
+
+def test_quoted_bot_message_skips_ambiguous_kv_reply_target_index(
+    astr_main_agent,
+    fakes,
+):
+    kv_store = fakes.KVStore(
+        {
+            "reply_target_history_state_v2": {
+                "sessions": {
+                    "aiocqhttp:GroupMessage:group456#conv-1": [
+                        {
+                            "hash": hash_reply_text("收到"),
+                            "metadata": {
+                                "scope": "group",
+                                "user": {"user_id": "user-a"},
+                            },
+                        },
+                        {
+                            "hash": hash_reply_text("收到"),
+                            "metadata": {
+                                "scope": "group",
+                                "user": {"user_id": "user-b"},
+                            },
+                        },
+                    ]
+                }
+            }
+        }
+    )
+    module = ReplyTargetHistoryModule(logger=DummyLogger(), kv_store=kv_store)
+    module.install()
+    event = DummyEvent(self_id="bot123")
+    event.message_obj.message = [
+        Reply(sender_id="bot123", sender_nickname="清漪酱", message_str="收到")
+    ]
+    req = DummyRequest()
+    req.conversation = SimpleNamespace(cid="conv-1", history="[]")
+
+    run(astr_main_agent._process_quote_message(event, req, "", DummyContext()))
+
+    assert "<astrna_quoted_reply_target>" not in req.extra_user_content_parts[-1].text
 
 
 def test_quoted_non_bot_message_does_not_inject_reply_target(astr_main_agent):
@@ -830,3 +1105,10 @@ def extract_quoted_reply_target_json(text):
     prefix = "<astrna_quoted_reply_target>"
     suffix = "</astrna_quoted_reply_target>"
     return json.loads(text.split(prefix, 1)[1].split(suffix, 1)[0])
+
+
+async def collect_runner_responses(runner):
+    responses = []
+    async for response in runner._iter_llm_responses():
+        responses.append(response)
+    return responses

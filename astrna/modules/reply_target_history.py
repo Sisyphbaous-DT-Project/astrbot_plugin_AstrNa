@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import re
@@ -12,25 +13,44 @@ from .identity_metadata import (
 )
 
 
+REPLY_TARGET_HISTORY_STATE_KEY = "reply_target_history_state_v2"
+MAX_REPLY_TARGET_INDEX_PER_SESSION = 200
+MAX_REPLY_TARGET_SESSIONS = 300
+ASTRNA_MARKER_PATTERN = re.compile(
+    r"<astrna_(?:reply_target|quoted_sender|quoted_reply_target)>"
+    r".*?</astrna_(?:reply_target|quoted_sender|quoted_reply_target)>",
+    flags=re.DOTALL,
+)
+
+
 class ReplyTargetHistoryModule:
     """为保存到 LLM 历史的回复和引用消息补充指向性标记。"""
 
     _internal_stage_cls: type | None = None
     _original_save_to_history: Any = None
+    _runner_cls: type | None = None
+    _original_complete_with_assistant_response: Any = None
+    _original_iter_llm_responses: Any = None
     _astr_main_agent: Any = None
     _original_process_quote_message: Any = None
     _save_history_wrapper: Any = None
+    _response_wrapper: Any = None
+    _response_stream_wrapper: Any = None
     _quote_message_wrapper: Any = None
     _active_module: ReplyTargetHistoryModule | None = None
 
-    def __init__(self, logger: Any):
+    def __init__(self, logger: Any, kv_store: Any | None = None):
         self.logger = logger
+        self.kv_store = kv_store
         self._installed = False
+        self._state_loaded = kv_store is None
+        self._state_cache: dict[str, Any] = {"sessions": {}}
 
     def install(self) -> bool:
         save_installed = self._install_save_history_patch()
+        response_installed = self._install_response_patch()
         quote_installed = self._install_quote_message_patch()
-        if not save_installed and not quote_installed:
+        if not save_installed and not response_installed and not quote_installed:
             return False
 
         type(self)._active_module = self
@@ -47,6 +67,8 @@ class ReplyTargetHistoryModule:
     @classmethod
     def restore_patch(cls) -> None:
         mark_wrapper_inactive(cls._save_history_wrapper)
+        mark_wrapper_inactive(cls._response_wrapper)
+        mark_wrapper_inactive(cls._response_stream_wrapper)
         mark_wrapper_inactive(cls._quote_message_wrapper)
         if (
             cls._internal_stage_cls is not None
@@ -58,6 +80,23 @@ class ReplyTargetHistoryModule:
                     cls._original_save_to_history
                 )
         if (
+            cls._runner_cls is not None
+            and cls._original_complete_with_assistant_response is not None
+        ):
+            current = getattr(cls._runner_cls, "_complete_with_assistant_response", None)
+            if getattr(current, "_astrna_reply_target_history_patch", False):
+                cls._runner_cls._complete_with_assistant_response = (
+                    unwrap_inactive_wrapper(
+                        cls._original_complete_with_assistant_response,
+                    )
+                )
+            if cls._original_iter_llm_responses is not None:
+                current_stream = getattr(cls._runner_cls, "_iter_llm_responses", None)
+                if getattr(current_stream, "_astrna_reply_target_history_patch", False):
+                    cls._runner_cls._iter_llm_responses = (
+                        unwrap_inactive_wrapper(cls._original_iter_llm_responses)
+                    )
+        if (
             cls._astr_main_agent is not None
             and cls._original_process_quote_message is not None
         ):
@@ -68,18 +107,25 @@ class ReplyTargetHistoryModule:
                 )
         cls._internal_stage_cls = None
         cls._original_save_to_history = None
+        cls._runner_cls = None
+        cls._original_complete_with_assistant_response = None
+        cls._original_iter_llm_responses = None
         cls._astr_main_agent = None
         cls._original_process_quote_message = None
         cls._save_history_wrapper = None
+        cls._response_wrapper = None
+        cls._response_stream_wrapper = None
         cls._quote_message_wrapper = None
         cls._active_module = None
 
-    def optimize_messages_for_history(
+    async def optimize_messages_for_history(
         self,
         event: Any,
+        req: Any,
         all_messages: list[Any],
     ) -> list[Any]:
-        marker = build_reply_target_marker(event)
+        marker_metadata = build_reply_target_metadata(event)
+        marker = build_reply_target_marker_from_metadata(marker_metadata)
         if not marker:
             return all_messages
 
@@ -89,12 +135,74 @@ class ReplyTargetHistoryModule:
             return all_messages
 
         target_message = copied_messages[target_index]
-        optimized_message = prepend_marker_to_message(target_message, marker)
+        sanitized_message = strip_markers_from_message(target_message)
+        optimized_message = prepend_marker_to_message(sanitized_message, marker)
         if optimized_message is target_message:
             return all_messages
 
         copied_messages[target_index] = optimized_message
+        await self.remember_reply_target(event, req, optimized_message, marker_metadata)
         return copied_messages
+
+    def sanitize_request(self, req: Any) -> None:
+        if req is None:
+            return
+
+        contexts = parse_history_value(getattr(req, "contexts", None))
+        if contexts is None:
+            conversation = getattr(req, "conversation", None)
+            contexts = parse_history_value(getattr(conversation, "history", None))
+            if contexts is None:
+                return
+
+        optimized_contexts, changed = strip_markers_from_contexts(contexts)
+        if changed:
+            try:
+                req.contexts = optimized_contexts
+            except Exception:  # noqa: BLE001
+                pass
+
+    def sanitize_llm_response(self, llm_response: Any) -> Any:
+        if llm_response is None:
+            return llm_response
+        text = getattr(llm_response, "completion_text", None)
+        chain_changed = self.sanitize_result_chain(llm_response)
+        if not isinstance(text, str) or not text:
+            if chain_changed:
+                self._log("debug", "AstrNa 已移除模型输出中的内部回复历史标记。")
+            return llm_response
+        cleaned = strip_astrna_markers(text)
+        if cleaned == text:
+            if chain_changed:
+                self._log("debug", "AstrNa 已移除模型输出中的内部回复历史标记。")
+            return llm_response
+        try:
+            llm_response.completion_text = cleaned
+        except Exception:  # noqa: BLE001
+            return llm_response
+        self._log("debug", "AstrNa 已移除模型输出中的内部回复历史标记。")
+        return llm_response
+
+    def sanitize_result_chain(self, llm_response: Any) -> bool:
+        result_chain = getattr(llm_response, "result_chain", None)
+        chain = getattr(result_chain, "chain", None)
+        if not isinstance(chain, list):
+            return False
+
+        changed = False
+        for component in chain:
+            text = getattr(component, "text", None)
+            if not isinstance(text, str) or not text:
+                continue
+            cleaned = strip_astrna_markers(text)
+            if cleaned == text:
+                continue
+            try:
+                component.text = cleaned
+                changed = True
+            except Exception:  # noqa: BLE001
+                continue
+        return changed
 
     async def optimize_quote_message(
         self,
@@ -128,10 +236,7 @@ class ReplyTargetHistoryModule:
                 markers.append(sender_marker)
 
             reply_target_marker = build_quoted_reply_target_marker(
-                event,
-                req,
-                quote,
-                text,
+                await self.find_quoted_reply_target_metadata(event, req, quote, text),
             )
             if reply_target_marker:
                 markers.append(reply_target_marker)
@@ -173,7 +278,7 @@ class ReplyTargetHistoryModule:
             async def astrna_save_to_history(*args: Any, **kwargs: Any) -> Any:
                 active_module = module_cls._active_module
                 if active_module is not None:
-                    args, kwargs = active_module.optimize_save_history_call(
+                    args, kwargs = await active_module.optimize_save_history_call(
                         original_save_to_history,
                         args,
                         kwargs,
@@ -184,6 +289,78 @@ class ReplyTargetHistoryModule:
             mark_wrapper_active(astrna_save_to_history, original_save_to_history)
             module_cls._save_history_wrapper = astrna_save_to_history
             internal_stage_cls._save_to_history = astrna_save_to_history
+
+        return True
+
+    def _install_response_patch(self) -> bool:
+        runner_cls = load_tool_loop_runner_cls()
+        if runner_cls is None:
+            self._log("warning", "AstrNa 未找到 LLM 最终回复入口，跳过回复标记净化。")
+            return False
+
+        original = getattr(runner_cls, "_complete_with_assistant_response", None)
+        if not callable(original):
+            self._log(
+                "warning",
+                "AstrNa 未找到 _complete_with_assistant_response，跳过回复标记净化。",
+            )
+            return False
+
+        module_cls = type(self)
+        if module_cls._runner_cls is not None and module_cls._runner_cls is not runner_cls:
+            module_cls.restore_patch()
+
+        if module_cls._original_complete_with_assistant_response is None:
+            module_cls._runner_cls = runner_cls
+            module_cls._original_complete_with_assistant_response = original
+            original_complete = original
+
+            async def astrna_complete_with_assistant_response(
+                runner_self: Any,
+                llm_response: Any,
+            ) -> Any:
+                active_module = module_cls._active_module
+                if active_module is not None:
+                    llm_response = active_module.sanitize_llm_response(llm_response)
+                return await original_complete(runner_self, llm_response)
+
+            astrna_complete_with_assistant_response._astrna_reply_target_history_patch = (  # type: ignore[attr-defined]
+                True
+            )
+            mark_wrapper_active(astrna_complete_with_assistant_response, original_complete)
+            module_cls._response_wrapper = astrna_complete_with_assistant_response
+            runner_cls._complete_with_assistant_response = (
+                astrna_complete_with_assistant_response
+            )
+
+        stream_original = getattr(runner_cls, "_iter_llm_responses", None)
+        if (
+            callable(stream_original)
+            and module_cls._original_iter_llm_responses is None
+        ):
+            module_cls._original_iter_llm_responses = stream_original
+            original_stream = stream_original
+
+            async def astrna_iter_llm_responses(
+                runner_self: Any,
+                *args: Any,
+                **kwargs: Any,
+            ):
+                active_module = module_cls._active_module
+                async for llm_response in original_stream(runner_self, *args, **kwargs):
+                    if active_module is not None:
+                        llm_response = active_module.sanitize_llm_response(llm_response)
+                    yield llm_response
+
+            astrna_iter_llm_responses._astrna_reply_target_history_patch = (  # type: ignore[attr-defined]
+                True
+            )
+            mark_wrapper_active(
+                astrna_iter_llm_responses,
+                original_stream,
+            )
+            module_cls._response_stream_wrapper = astrna_iter_llm_responses
+            runner_cls._iter_llm_responses = astrna_iter_llm_responses
 
         return True
 
@@ -227,7 +404,7 @@ class ReplyTargetHistoryModule:
 
         return True
 
-    def optimize_save_history_call(
+    async def optimize_save_history_call(
         self,
         original_method: Any,
         args: tuple[Any, ...],
@@ -242,7 +419,12 @@ class ReplyTargetHistoryModule:
         if bound is not None and "all_messages" in bound.arguments:
             all_messages = bound.arguments["all_messages"]
             event = bound.arguments.get("event")
-            optimized_messages = self.optimize_messages_for_history(event, all_messages)
+            req = bound.arguments.get("req")
+            optimized_messages = await self.optimize_messages_for_history(
+                event,
+                req,
+                all_messages,
+            )
             if optimized_messages is all_messages:
                 return args, kwargs
             bound.arguments["all_messages"] = optimized_messages
@@ -250,13 +432,121 @@ class ReplyTargetHistoryModule:
 
         return args, kwargs
 
+    async def remember_reply_target(
+        self,
+        event: Any,
+        req: Any,
+        message: Any,
+        metadata: dict[str, Any],
+    ) -> None:
+        session_key = get_reply_target_session_key(event, req)
+        if not session_key:
+            return
+
+        text = normalize_history_assistant_text(getattr(message, "content", None))
+        if not text:
+            return
+
+        await self._ensure_state_loaded()
+        sessions = self._state_cache.setdefault("sessions", {})
+        if not isinstance(sessions, dict):
+            sessions = {}
+            self._state_cache["sessions"] = sessions
+
+        entries = sessions.get(session_key)
+        if not isinstance(entries, list):
+            entries = []
+
+        text_hash = hash_reply_text(text)
+        public_metadata = public_reply_target_metadata(metadata)
+        entries.append({"hash": text_hash, "metadata": public_metadata})
+        sessions[session_key] = entries[-MAX_REPLY_TARGET_INDEX_PER_SESSION:]
+        trim_reply_target_sessions(sessions)
+        await self._persist_state()
+
+    async def find_quoted_reply_target_metadata(
+        self,
+        event: Any,
+        req: Any,
+        quote: Any,
+        quoted_text: str,
+    ) -> dict[str, Any] | None:
+        if not is_quote_from_self(event, quote):
+            return None
+
+        quote_body = normalize_quoted_message_text(
+            extract_quoted_message_body(quoted_text),
+            quote,
+        )
+        if not quote_body:
+            return None
+
+        metadata = await self.find_reply_target_from_state(event, req, quote_body)
+        if metadata:
+            return metadata
+
+        return find_unique_reply_target_metadata(req, quote_body)
+
+    async def find_reply_target_from_state(
+        self,
+        event: Any,
+        req: Any,
+        quote_body: str,
+    ) -> dict[str, Any] | None:
+        session_key = get_reply_target_session_key(event, req)
+        if not session_key:
+            return None
+
+        await self._ensure_state_loaded()
+        sessions = self._state_cache.get("sessions")
+        if not isinstance(sessions, dict):
+            return None
+
+        entries = sessions.get(session_key)
+        if not isinstance(entries, list):
+            return None
+
+        text_hash = hash_reply_text(quote_body)
+        matches: list[dict[str, Any]] = [
+            entry.get("metadata")
+            for entry in entries
+            if isinstance(entry, dict) and entry.get("hash") == text_hash
+        ]
+        matches = [metadata for metadata in matches if isinstance(metadata, dict)]
+        unique_matches = unique_metadata_matches(matches)
+        return unique_matches[0] if len(unique_matches) == 1 else None
+
+    async def _ensure_state_loaded(self) -> None:
+        if self._state_loaded:
+            return
+        self._state_loaded = True
+        getter = getattr(self.kv_store, "get_kv_data", None)
+        if not callable(getter):
+            return
+        try:
+            state = await getter(REPLY_TARGET_HISTORY_STATE_KEY, {"sessions": {}})
+        except Exception as exc:  # noqa: BLE001
+            self._log("debug", "AstrNa 读取回复目标索引失败：%s", exc)
+            return
+        if isinstance(state, dict) and isinstance(state.get("sessions"), dict):
+            self._state_cache = state
+
+    async def _persist_state(self) -> None:
+        putter = getattr(self.kv_store, "put_kv_data", None)
+        if not callable(putter):
+            return
+        try:
+            await putter(REPLY_TARGET_HISTORY_STATE_KEY, self._state_cache)
+        except Exception as exc:  # noqa: BLE001
+            self._log("debug", "AstrNa 保存回复目标索引失败：%s", exc)
+
     def _log(self, level: str, message: str, *args: Any) -> None:
         logger_method = getattr(self.logger, level, None)
         if callable(logger_method):
             logger_method(message, *args)
 
 
-def build_reply_target_marker(event: Any) -> str:
+def build_reply_target_metadata(event: Any) -> dict[str, Any]:
     metadata: dict[str, Any] = {}
     scope = detect_reply_scope(event)
     metadata["scope"] = scope
@@ -270,8 +560,18 @@ def build_reply_target_marker(event: Any) -> str:
         metadata["group"] = group_metadata
 
     if scope == "unknown" and not user_metadata and not group_metadata:
-        return ""
+        return {}
 
+    return metadata
+
+
+def build_reply_target_marker(event: Any) -> str:
+    return build_reply_target_marker_from_metadata(build_reply_target_metadata(event))
+
+
+def build_reply_target_marker_from_metadata(metadata: dict[str, Any] | None) -> str:
+    if not metadata:
+        return ""
     return f"<astrna_reply_target>{format_metadata_json(metadata)}</astrna_reply_target>"
 
 
@@ -326,31 +626,16 @@ def build_quoted_sender_marker(quote: Any) -> str:
     return f"<astrna_quoted_sender>{format_metadata_json(metadata)}</astrna_quoted_sender>"
 
 
-def build_quoted_reply_target_marker(
-    event: Any,
-    req: Any,
-    quote: Any,
-    quoted_text: str,
-) -> str:
-    if not is_quote_from_self(event, quote):
-        return ""
-
-    quote_body = normalize_quoted_message_text(
-        extract_quoted_message_body(quoted_text),
-        quote,
-    )
-    if not quote_body:
-        return ""
-
-    metadata = find_unique_reply_target_metadata(req, quote_body)
+def build_quoted_reply_target_marker(metadata: dict[str, Any] | None) -> str:
     if not metadata:
         return ""
 
-    return (
-        "<astrna_quoted_reply_target>"
-        f"{format_metadata_json(metadata)}"
-        "</astrna_quoted_reply_target>"
-    )
+    payload = {
+        "meaning": "被引用的这条 Bot 回复原本回复给以下用户；这不是当前发言人。",
+        "quoted_assistant_reply_target": metadata,
+        "not_current_sender": True,
+    }
+    return f"<astrna_quoted_reply_target>{format_metadata_json(payload)}</astrna_quoted_reply_target>"
 
 
 def is_quote_from_self(event: Any, quote: Any) -> bool:
@@ -521,9 +806,6 @@ def message_has_text_content(message: Any) -> bool:
 
 
 def prepend_marker_to_message(message: Any, marker: str) -> Any:
-    if message_already_marked(message):
-        return message
-
     content = getattr(message, "content", None)
     if isinstance(content, str):
         return clone_message(message, content=f"{marker}\n{content}")
@@ -538,19 +820,6 @@ def prepend_marker_to_message(message: Any, marker: str) -> Any:
         return clone_message(message, content=optimized_parts)
 
     return message
-
-
-def message_already_marked(message: Any) -> bool:
-    content = getattr(message, "content", None)
-    if isinstance(content, str):
-        return "<astrna_reply_target>" in content
-    if isinstance(content, list):
-        return any(
-            isinstance(getattr(part, "text", None), str)
-            and "<astrna_reply_target>" in getattr(part, "text", "")
-            for part in content
-        )
-    return False
 
 
 def find_first_text_part_index(parts: list[Any]) -> int | None:
@@ -621,12 +890,98 @@ def normalize_match_text(text: str) -> str:
 def strip_astrna_markers(text: str) -> str:
     if not isinstance(text, str):
         return ""
-    return re.sub(
-        r"<astrna_[a-zA-Z0-9_]+>.*?</astrna_[a-zA-Z0-9_]+>",
-        "",
-        text,
-        flags=re.DOTALL,
-    )
+    if ASTRNA_MARKER_PATTERN.search(text) is None:
+        return text
+    cleaned = ASTRNA_MARKER_PATTERN.sub("", text)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n[ \t]+", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def strip_markers_from_contexts(contexts: Any) -> tuple[Any, bool]:
+    if not isinstance(contexts, list):
+        return contexts, False
+
+    changed = False
+    optimized: list[Any] = []
+    for message in contexts:
+        stripped_message = strip_markers_from_history_message(message)
+        if stripped_message is not message:
+            changed = True
+        optimized.append(stripped_message)
+    return optimized, changed
+
+
+def strip_markers_from_history_message(message: Any) -> Any:
+    if isinstance(message, dict):
+        stripped_content, changed = strip_markers_from_content(message.get("content"))
+        if not changed:
+            return message
+        copied = dict(message)
+        copied["content"] = stripped_content
+        return copied
+
+    return strip_markers_from_message(message)
+
+
+def strip_markers_from_message(message: Any) -> Any:
+    content = getattr(message, "content", None)
+    stripped_content, changed = strip_markers_from_content(content)
+    if not changed:
+        return message
+    return clone_message(message, content=stripped_content)
+
+
+def strip_markers_from_content(content: Any) -> tuple[Any, bool]:
+    if isinstance(content, str):
+        cleaned = strip_astrna_markers(content)
+        return cleaned, cleaned != content
+
+    if not isinstance(content, list):
+        return content, False
+
+    changed = False
+    optimized_parts: list[Any] = []
+    for part in content:
+        stripped_part = strip_markers_from_part(part)
+        if stripped_part is not part:
+            changed = True
+        if part_text_is_empty_after_strip(stripped_part):
+            changed = True
+            continue
+        optimized_parts.append(stripped_part)
+    return optimized_parts, changed
+
+
+def strip_markers_from_part(part: Any) -> Any:
+    if isinstance(part, dict):
+        text = part.get("text")
+        if not isinstance(text, str):
+            return part
+        cleaned = strip_astrna_markers(text)
+        if cleaned == text:
+            return part
+        copied = dict(part)
+        copied["text"] = cleaned
+        return copied
+
+    text = getattr(part, "text", None)
+    if not isinstance(text, str):
+        return part
+    cleaned = strip_astrna_markers(text)
+    if cleaned == text:
+        return part
+    return clone_text_part(part, cleaned)
+
+
+def part_text_is_empty_after_strip(part: Any) -> bool:
+    if isinstance(part, dict):
+        part_type = str(part.get("type", ""))
+        return part_type == "text" and part.get("text") == ""
+
+    part_type = str(getattr(part, "type", ""))
+    return part_type == "text" and getattr(part, "text", None) == ""
 
 
 def find_unique_reply_target_metadata(req: Any, quote_body: str) -> dict[str, Any] | None:
@@ -639,7 +994,9 @@ def find_unique_reply_target_metadata(req: Any, quote_body: str) -> dict[str, An
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
 
-        metadata = extract_reply_target_metadata(message.get("content"))
+        metadata = public_reply_target_metadata(
+            extract_reply_target_metadata(message.get("content")),
+        )
         if not metadata:
             continue
 
@@ -703,6 +1060,71 @@ def extract_reply_target_metadata(content: Any) -> dict[str, Any] | None:
 
 def normalize_history_assistant_text(content: Any) -> str:
     return normalize_match_text(strip_astrna_markers(join_text_content(content)))
+
+
+def hash_reply_text(text: str) -> str:
+    return hashlib.sha256(normalize_match_text(text).encode("utf-8")).hexdigest()
+
+
+def get_reply_target_session_key(event: Any, req: Any) -> str:
+    session = sanitize_optional_metadata_value(getattr(event, "unified_msg_origin", None))
+    conversation = getattr(req, "conversation", None)
+    cid = sanitize_optional_metadata_value(getattr(conversation, "cid", None))
+    if session and cid:
+        return f"{session}#{cid}"
+    return session or cid
+
+
+def public_reply_target_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+
+    public: dict[str, Any] = {}
+    scope = sanitize_optional_metadata_value(metadata.get("scope"))
+    if scope:
+        public["scope"] = scope
+
+    user = sanitize_metadata_mapping(metadata.get("user"), {"user_id", "nickname"})
+    if user:
+        public["user"] = user
+
+    group = sanitize_metadata_mapping(metadata.get("group"), {"group_id"})
+    if group:
+        public["group"] = group
+
+    return public
+
+
+def unique_metadata_matches(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for metadata in matches:
+        key = format_metadata_json(metadata)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(metadata)
+    return unique
+
+
+def trim_reply_target_sessions(sessions: dict[str, Any]) -> None:
+    if len(sessions) <= MAX_REPLY_TARGET_SESSIONS:
+        return
+
+    overflow = len(sessions) - MAX_REPLY_TARGET_SESSIONS
+    for key in list(sessions)[:overflow]:
+        sessions.pop(key, None)
+
+
+def sanitize_metadata_mapping(value: Any, allowed_keys: set[str]) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    sanitized: dict[str, str] = {}
+    for key in allowed_keys:
+        sanitized_value = sanitize_optional_metadata_value(value.get(key))
+        if sanitized_value:
+            sanitized[key] = sanitized_value
+    return sanitized
 
 
 def join_text_content(content: Any) -> str:
@@ -785,6 +1207,14 @@ def load_internal_stage_cls() -> type | None:
     except Exception:
         return None
     return InternalAgentSubStage
+
+
+def load_tool_loop_runner_cls() -> type | None:
+    try:
+        from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
+    except Exception:
+        return None
+    return ToolLoopAgentRunner
 
 
 def load_astr_main_agent() -> Any | None:

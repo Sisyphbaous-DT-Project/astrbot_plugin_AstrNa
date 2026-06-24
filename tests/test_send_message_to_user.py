@@ -11,6 +11,8 @@ from astrna.modules.send_message_to_user import (
     NORMAL_CHAT_REQUEST_MARKER,
     SendMessageToUserModule,
     clone_as_assistant_response,
+    mark_wrapper_active,
+    mark_wrapper_inactive,
 )
 
 
@@ -193,6 +195,29 @@ def test_enabled_runtime_installs_patch_and_terminate_restores(
     assert astrbot_runner_modules.runner_cls._iter_llm_responses_with_fallback is not original
     asyncio.run(runtime.terminate())
     assert astrbot_runner_modules.runner_cls._iter_llm_responses_with_fallback is original
+
+
+def test_restore_does_not_remove_outer_wrapper(astrbot_runner_modules):
+    original = astrbot_runner_modules.runner_cls._iter_llm_responses_with_fallback
+    module = SendMessageToUserModule(logger=SimpleNamespace(info=lambda *a: None))
+    module.install()
+    send_wrapper = astrbot_runner_modules.runner_cls._iter_llm_responses_with_fallback
+
+    async def outer_wrapper(runner_self):
+        async for item in send_wrapper(runner_self):
+            yield item
+
+    mark_wrapper_active(outer_wrapper, send_wrapper)
+    astrbot_runner_modules.runner_cls._iter_llm_responses_with_fallback = outer_wrapper
+
+    module.terminate()
+
+    assert (
+        astrbot_runner_modules.runner_cls._iter_llm_responses_with_fallback
+        is outer_wrapper
+    )
+    mark_wrapper_inactive(outer_wrapper)
+    astrbot_runner_modules.runner_cls._iter_llm_responses_with_fallback = original
 
 
 def test_install_is_idempotent(astrbot_runner_modules, fakes):

@@ -63,7 +63,10 @@ class AstrNaRuntime:
             context=context,
             logger=logger,
         )
-        self.reply_target_history = ReplyTargetHistoryModule(logger=logger)
+        self.reply_target_history = ReplyTargetHistoryModule(
+            logger=logger,
+            kv_store=kv_store,
+        )
         if self.config.get("optimize_forward_nodes", False):
             self.forward_nodes.install()
         if self.config.get("optimize_dynamic_system_prompt", False):
@@ -83,6 +86,10 @@ class AstrNaRuntime:
         if self.config.get("optimize_send_message_to_user", False):
             self.send_message_to_user.install()
             self.send_message_to_user.prepare_request(event, req)
+
+        if self.config.get("optimize_reply_target_history", False):
+            self.reply_target_history.install()
+            self.reply_target_history.sanitize_request(req)
 
         if self.config.get("fix_deepseek_v4_400", False):
             self.deepseek_v4_400.sanitize(event, req)

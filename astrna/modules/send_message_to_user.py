@@ -17,6 +17,8 @@ class SendMessageToUserModule:
     _original_iter_llm_responses_with_fallback: Any = None
     _internal_stage_cls: type | None = None
     _original_internal_process: Any = None
+    _response_wrapper: Any = None
+    _stage_wrapper: Any = None
     _active_module: SendMessageToUserModule | None = None
 
     def __init__(self, logger: Any):
@@ -60,6 +62,8 @@ class SendMessageToUserModule:
             astrna_iter_llm_responses_with_fallback._astrna_send_message_to_user_patch = (  # type: ignore[attr-defined]
                 True
             )
+            mark_wrapper_active(astrna_iter_llm_responses_with_fallback, original)
+            module_cls._response_wrapper = astrna_iter_llm_responses_with_fallback
             runner_cls._iter_llm_responses_with_fallback = (
                 astrna_iter_llm_responses_with_fallback
             )
@@ -109,19 +113,49 @@ class SendMessageToUserModule:
 
     @classmethod
     def restore_patch(cls) -> None:
+        mark_wrapper_inactive(cls._response_wrapper)
+        mark_wrapper_inactive(cls._stage_wrapper)
         if (
             cls._runner_cls is not None
             and cls._original_iter_llm_responses_with_fallback is not None
         ):
-            cls._runner_cls._iter_llm_responses_with_fallback = (
-                cls._original_iter_llm_responses_with_fallback
-            )
+            current = getattr(cls._runner_cls, "_iter_llm_responses_with_fallback", None)
+            if getattr(current, "_astrna_send_message_to_user_patch", False):
+                cls._runner_cls._iter_llm_responses_with_fallback = (
+                    unwrap_inactive_wrapper(
+                        cls._original_iter_llm_responses_with_fallback,
+                    )
+                )
+            elif getattr(
+                cls._original_iter_llm_responses_with_fallback,
+                "_astrna_wrapper_active",
+                True,
+            ) is False:
+                cls._original_iter_llm_responses_with_fallback = (
+                    unwrap_inactive_wrapper(
+                        cls._original_iter_llm_responses_with_fallback,
+                    )
+                )
         if cls._internal_stage_cls is not None and cls._original_internal_process is not None:
-            cls._internal_stage_cls.process = cls._original_internal_process
+            current_process = getattr(cls._internal_stage_cls, "process", None)
+            if getattr(current_process, "_astrna_send_message_to_user_stage_patch", False):
+                cls._internal_stage_cls.process = unwrap_inactive_wrapper(
+                    cls._original_internal_process,
+                )
+            elif getattr(
+                cls._original_internal_process,
+                "_astrna_wrapper_active",
+                True,
+            ) is False:
+                cls._original_internal_process = unwrap_inactive_wrapper(
+                    cls._original_internal_process,
+                )
         cls._runner_cls = None
         cls._original_iter_llm_responses_with_fallback = None
         cls._internal_stage_cls = None
         cls._original_internal_process = None
+        cls._response_wrapper = None
+        cls._stage_wrapper = None
         cls._active_module = None
 
     def optimize_response(self, runner: Any, llm_response: Any) -> Any:
@@ -253,6 +287,8 @@ class SendMessageToUserModule:
                 yield item
 
         astrna_internal_process._astrna_send_message_to_user_stage_patch = True  # type: ignore[attr-defined]
+        mark_wrapper_active(astrna_internal_process, stage_cls.process)
+        module_cls._stage_wrapper = astrna_internal_process
         stage_cls.process = astrna_internal_process
 
     def _load_internal_stage_cls(self) -> type | None:
@@ -403,3 +439,35 @@ def log(logger: Any, level: str, message: str, *args: Any) -> None:
     method = getattr(logger, level, None)
     if callable(method):
         method(message, *args)
+
+
+def mark_wrapper_active(wrapper: Any, original: Any) -> None:
+    try:
+        wrapper._astrna_wrapper_active = True
+        wrapper._astrna_wrapped_original = original
+    except Exception:
+        pass
+
+
+def mark_wrapper_inactive(wrapper: Any) -> None:
+    if wrapper is None:
+        return
+    try:
+        wrapper._astrna_wrapper_active = False
+    except Exception:
+        pass
+
+
+def unwrap_inactive_wrapper(func: Any) -> Any:
+    seen: set[int] = set()
+    while (
+        callable(func)
+        and getattr(func, "_astrna_wrapper_active", True) is False
+        and id(func) not in seen
+    ):
+        seen.add(id(func))
+        original = getattr(func, "_astrna_wrapped_original", None)
+        if not callable(original) or original is func:
+            break
+        func = original
+    return func
