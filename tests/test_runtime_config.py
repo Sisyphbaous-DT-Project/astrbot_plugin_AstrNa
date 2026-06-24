@@ -18,6 +18,7 @@ def test_merge_config_keeps_defaults_for_missing_values():
         "optimize_dynamic_system_prompt": False,
         "optimize_image_caption": False,
         "optimize_send_message_to_user": False,
+        "provide_group_identity_tools": False,
     }
 
 
@@ -35,6 +36,7 @@ def test_merge_config_can_enable_modules():
             "optimize_dynamic_system_prompt": True,
             "optimize_image_caption": True,
             "optimize_send_message_to_user": True,
+            "provide_group_identity_tools": True,
         }
     )
 
@@ -50,6 +52,7 @@ def test_merge_config_can_enable_modules():
         "optimize_dynamic_system_prompt": True,
         "optimize_image_caption": True,
         "optimize_send_message_to_user": True,
+        "provide_group_identity_tools": True,
     }
 
 

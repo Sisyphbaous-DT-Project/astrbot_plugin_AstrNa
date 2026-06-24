@@ -35,6 +35,11 @@ class DummyBot:
         self.calls.append((action, params))
         if self.fail:
             raise RuntimeError("call_action failed")
+        if isinstance(self.member_info, dict) and action in self.member_info:
+            result = self.member_info[action]
+            if callable(result):
+                return result(**params)
+            return result
         return self.member_info
 
 
@@ -83,9 +88,21 @@ class DummyContext:
             if provider_settings is not None
             else {"identifier": True, "group_name_display": True}
         )
+        self.llm_tools = []
+        self.unregistered_tools = []
 
     def get_config(self, umo=None):
         return {"provider_settings": self.provider_settings}
+
+    def add_llm_tools(self, *tools):
+        existing = {tool.name: tool for tool in self.llm_tools}
+        for tool in tools:
+            existing[tool.name] = tool
+        self.llm_tools = list(existing.values())
+
+    def unregister_llm_tool(self, name):
+        self.unregistered_tools.append(name)
+        self.llm_tools = [tool for tool in self.llm_tools if tool.name != name]
 
 
 class DummyRequest:

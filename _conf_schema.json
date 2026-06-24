@@ -35,7 +35,7 @@
   "group_member_identity_display": {
     "type": "bool",
     "description": "补充群成员身份",
-    "hint": "开启后，AstrNa 会在 AstrBot 自带身份识别已生效时，通过 NapCat/aiocqhttp 补充当前发言人在群里的身份、群等级和专属头衔；只支持群聊和可查询成员信息的平台，查不到会自动跳过。不会注入 QQ 等级，不会写入会话历史。默认关闭。",
+    "hint": "开启后，AstrNa 会在 AstrBot 自带身份识别已生效时，通过 NapCat/aiocqhttp 补充当前发言人在群里的身份、群等级和专属头衔；只支持群聊和可查询成员信息的平台，查不到会自动跳过。不会写入会话历史。默认关闭。",
     "default": false,
     "collapsed": true,
     "condition": {
@@ -84,6 +84,12 @@
     "type": "bool",
     "description": "优化send_message_to_user工具",
     "hint": "开启后，AstrNa 会在普通聊天中拦截模型误调用 send_message_to_user 发送当前会话纯文本的情况，把这段文本改为普通最终回复，让发送前插件、表情包识别、分段回复、合并转发等正常生效。为保证这些发送前插件能命中，本模块会在普通聊天里提前关闭本轮流式输出；跨会话主动消息、定时任务、live、图片/文件/语音/视频/@ 等非纯文本消息不会接管，仍走 AstrBot 原逻辑。默认关闭。",
+    "default": false
+  },
+  "provide_group_identity_tools": {
+    "type": "bool",
+    "description": "提供群身份查询工具",
+    "hint": "开启后，AstrNa 会为 Bot 提供按需查询当前群成员身份、群等级、专属头衔、群主和管理员的工具；仅支持群聊和可查询成员信息的平台。这个功能不会主动注入到每轮上下文，只有模型需要查询群身份、群头衔、群等级、群主或管理员时才调用；不会查询跨群信息。默认关闭。",
     "default": false
   }
 }

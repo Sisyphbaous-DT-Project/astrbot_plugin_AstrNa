@@ -10,6 +10,7 @@ from .modules.forward_nodes import (
     ForwardNodesModule,
 )
 from .modules.image_caption import ImageCaptionModule
+from .modules.group_identity_tools import GroupIdentityToolsModule
 from .modules.identity_metadata import IdentityMetadataModule
 from .modules.send_message_to_user import SendMessageToUserModule
 
@@ -26,6 +27,7 @@ DEFAULT_CONFIG = {
     "optimize_dynamic_system_prompt": False,
     "optimize_image_caption": False,
     "optimize_send_message_to_user": False,
+    "provide_group_identity_tools": False,
 }
 
 
@@ -55,6 +57,10 @@ class AstrNaRuntime:
         )
         self.image_caption = ImageCaptionModule(logger=logger)
         self.send_message_to_user = SendMessageToUserModule(logger=logger)
+        self.group_identity_tools = GroupIdentityToolsModule(
+            context=context,
+            logger=logger,
+        )
         if self.config.get("optimize_forward_nodes", False):
             self.forward_nodes.install()
         if self.config.get("optimize_dynamic_system_prompt", False):
@@ -63,6 +69,8 @@ class AstrNaRuntime:
             self.image_caption.install()
         if self.config.get("optimize_send_message_to_user", False):
             self.send_message_to_user.install()
+        if self.config.get("provide_group_identity_tools", False):
+            self.group_identity_tools.install()
 
     async def sanitize_request(self, event: Any, req: Any) -> None:
         if self.config.get("optimize_dynamic_system_prompt", False):
@@ -98,6 +106,7 @@ class AstrNaRuntime:
         self.dynamic_system_prompt.terminate()
         self.image_caption.terminate()
         self.send_message_to_user.terminate()
+        self.group_identity_tools.terminate()
 
 
 def merge_config(config: dict | None) -> dict[str, Any]:
