@@ -6,6 +6,8 @@ AstrNa是一款AstrBot优化插件。
 
 作者主页：[Sisyphbaous-DT-Project](https://github.com/Sisyphbaous-DT-Project)
 
+许可证：[MIT License](LICENSE)
+
 更新日志：[CHANGELOG.md](CHANGELOG.md)
 
 ## 框架
