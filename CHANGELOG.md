@@ -1,5 +1,10 @@
 # 更新日志
 
+## 0.1.5
+
+- 增强 DeepSeek v4 400 修复模块：同一个开关现在会同时清理异常 assistant 历史，并修复代理模型名下 DeepSeek V4 thinking mode 未回传 `reasoning_content` 导致的 400。
+- 支持 `deepseek-v4`、`deepseek-v4-pro`、`deepseek-v4-flash` 及带代理前缀的同名模型，避免误处理 `deepseek-chat`、`deepseek-reasoner`。
+
 ## 0.1.4
 
 - 优化回复历史标记改为临时中文自然语言提示，不再长期依赖机器标签来区分回复对象。

@@ -2,7 +2,7 @@
   "fix_deepseek_v4_400": {
     "type": "bool",
     "description": "修复 DeepSeek v4 400 报错",
-    "hint": "开启后，AstrNa 会在 LLM 请求发送前清理会触发 DeepSeek v4 接口 400 的异常 assistant 历史，包括空 assistant、只有 reasoning_content 的 assistant、以及只有 think 内容块的 assistant；带有效 tool_calls、普通文本和正常多模态内容会保留。默认关闭。",
+    "hint": "开启后，AstrNa 会同时处理两类 DeepSeek v4 400 报错：一是清理会触发接口 400 的异常 assistant 历史，包括空 assistant、只有 reasoning_content 的 assistant、以及只有 think 内容块的 assistant；二是兼容修复代理模型名下 DeepSeek v4 thinking mode 未回传 reasoning_content 导致的 400，适用于 deepseek-v4、deepseek-v4-pro、deepseek-v4-flash 及带代理前缀的同名模型。deepseek-chat、deepseek-reasoner 等旧版模型不会被误处理。默认关闭。",
     "default": false
   },
   "optimize_identity_metadata": {

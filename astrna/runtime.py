@@ -73,6 +73,8 @@ class AstrNaRuntime:
         if self.config.get("optimize_dynamic_system_prompt", False):
             self.dynamic_system_prompt.install()
         self.reply_target_history.install()
+        if self.config.get("fix_deepseek_v4_400", False):
+            self.deepseek_v4_400.install()
         if self.config.get("optimize_image_caption", False):
             self.image_caption.install()
         if self.config.get("optimize_send_message_to_user", False):
@@ -94,7 +96,10 @@ class AstrNaRuntime:
         self.reply_target_history.sanitize_request(req)
 
         if self.config.get("fix_deepseek_v4_400", False):
+            self.deepseek_v4_400.install()
             self.deepseek_v4_400.sanitize(event, req)
+        else:
+            self.deepseek_v4_400.terminate()
 
         if self.config.get("optimize_identity_metadata", False):
             account_nickname_display = self.config.get(
@@ -122,6 +127,7 @@ class AstrNaRuntime:
         self.send_message_to_user.terminate()
         self.group_identity_tools.terminate()
         self.reply_target_history.terminate()
+        self.deepseek_v4_400.terminate()
 
 
 def merge_config(config: dict | None) -> dict[str, Any]:
