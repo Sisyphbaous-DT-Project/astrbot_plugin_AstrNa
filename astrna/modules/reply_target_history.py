@@ -24,7 +24,7 @@ ASTRNA_MARKER_PATTERN = re.compile(
 
 
 class ReplyTargetHistoryModule:
-    """为保存到 LLM 历史的回复和引用消息补充指向性标记。"""
+    """清理旧内部标记，并用临时自然语言提示补充回复指向。"""
 
     _internal_stage_cls: type | None = None
     _original_save_to_history: Any = None
@@ -39,14 +39,23 @@ class ReplyTargetHistoryModule:
     _quote_message_wrapper: Any = None
     _active_module: ReplyTargetHistoryModule | None = None
 
-    def __init__(self, logger: Any, kv_store: Any | None = None):
+    def __init__(
+        self,
+        logger: Any,
+        kv_store: Any | None = None,
+        semantic_enabled: bool = False,
+    ):
         self.logger = logger
         self.kv_store = kv_store
+        self.semantic_enabled = semantic_enabled
         self._installed = False
         self._state_loaded = kv_store is None
         self._state_cache: dict[str, Any] = {"sessions": {}}
 
     def install(self) -> bool:
+        self.set_semantic_enabled(self.semantic_enabled)
+        if self._installed and type(self)._active_module is self:
+            return True
         save_installed = self._install_save_history_patch()
         response_installed = self._install_response_patch()
         quote_installed = self._install_quote_message_patch()
@@ -55,8 +64,12 @@ class ReplyTargetHistoryModule:
 
         type(self)._active_module = self
         self._installed = True
-        self._log("info", "AstrNa 已启用优化回复历史标记。")
+        if self.semantic_enabled:
+            self._log("info", "AstrNa 已启用优化回复历史标记。")
         return True
+
+    def set_semantic_enabled(self, enabled: bool) -> None:
+        self.semantic_enabled = enabled
 
     def terminate(self) -> None:
         module_cls = type(self)
@@ -124,25 +137,30 @@ class ReplyTargetHistoryModule:
         req: Any,
         all_messages: list[Any],
     ) -> list[Any]:
-        marker_metadata = build_reply_target_metadata(event)
-        marker = build_reply_target_marker_from_metadata(marker_metadata)
-        if not marker:
-            return all_messages
-
         copied_messages = list(all_messages or [])
-        target_index = find_last_persistable_assistant_message_index(copied_messages)
-        if target_index is None:
-            return all_messages
+        changed = False
+        for index, message in enumerate(copied_messages):
+            sanitized_message = strip_markers_from_message(message)
+            if sanitized_message is not message:
+                copied_messages[index] = sanitized_message
+                changed = True
+                continue
 
-        target_message = copied_messages[target_index]
-        sanitized_message = strip_markers_from_message(target_message)
-        optimized_message = prepend_marker_to_message(sanitized_message, marker)
-        if optimized_message is target_message:
-            return all_messages
+        if self.semantic_enabled:
+            marker_metadata = build_reply_target_metadata(event)
+            if marker_metadata:
+                target_index = find_last_persistable_assistant_message_index(
+                    copied_messages,
+                )
+                if target_index is not None:
+                    await self.remember_reply_target(
+                        event,
+                        req,
+                        copied_messages[target_index],
+                        marker_metadata,
+                    )
 
-        copied_messages[target_index] = optimized_message
-        await self.remember_reply_target(event, req, optimized_message, marker_metadata)
-        return copied_messages
+        return copied_messages if changed else all_messages
 
     def sanitize_request(self, req: Any) -> None:
         if req is None:
@@ -152,15 +170,44 @@ class ReplyTargetHistoryModule:
         if contexts is None:
             conversation = getattr(req, "conversation", None)
             contexts = parse_history_value(getattr(conversation, "history", None))
-            if contexts is None:
-                return
 
-        optimized_contexts, changed = strip_markers_from_contexts(contexts)
-        if changed:
+        if contexts is not None:
+            optimized_contexts, changed = strip_markers_from_contexts(contexts)
+            if changed:
+                try:
+                    req.contexts = optimized_contexts
+                except Exception:  # noqa: BLE001
+                    pass
+
+        conversation = getattr(req, "conversation", None)
+        raw_history = getattr(conversation, "history", None)
+        history_contexts = parse_history_value(raw_history)
+        if history_contexts is not None:
+            optimized_history, changed = strip_markers_from_contexts(history_contexts)
+            if changed:
+                try:
+                    conversation.history = serialize_history_like(
+                        raw_history,
+                        optimized_history,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+        for attr in ("prompt", "system_prompt"):
+            value = getattr(req, attr, None)
+            if not isinstance(value, str) or not value:
+                continue
+            cleaned = strip_astrna_markers(value)
+            if cleaned == value:
+                continue
             try:
-                req.contexts = optimized_contexts
+                setattr(req, attr, cleaned)
             except Exception:  # noqa: BLE001
                 pass
+
+        parts = getattr(req, "extra_user_content_parts", None)
+        if isinstance(parts, list):
+            strip_markers_from_extra_parts(parts)
 
     def sanitize_llm_response(self, llm_response: Any) -> Any:
         if llm_response is None:
@@ -212,43 +259,32 @@ class ReplyTargetHistoryModule:
     ) -> Any:
         event = args[0] if args else kwargs.get("event")
         req = args[1] if len(args) > 1 else kwargs.get("req")
-        before_count = len(getattr(req, "extra_user_content_parts", []) or [])
 
         result = await original_process_quote_message(*args, **kwargs)
 
+        if not self.semantic_enabled:
+            return result
+
         quote = find_reply_component(event)
-        sender_marker = build_quoted_sender_marker(quote)
-        if quote is None and not sender_marker:
+        if quote is None:
             return result
 
-        parts = getattr(req, "extra_user_content_parts", None)
-        if not isinstance(parts, list):
-            return result
-
-        for index in range(len(parts) - 1, before_count - 1, -1):
-            part = parts[index]
-            text = getattr(part, "text", None)
-            if not isinstance(text, str):
-                continue
-
-            markers = []
-            if sender_marker:
-                markers.append(sender_marker)
-
-            reply_target_marker = build_quoted_reply_target_marker(
-                await self.find_quoted_reply_target_metadata(event, req, quote, text),
+        quoted_reply_target = None
+        if is_quote_from_self(event, quote):
+            quoted_text = normalize_match_text(
+                getattr(quote, "message_str", None)
+                or extract_last_quoted_message_text(req),
             )
-            if reply_target_marker:
-                markers.append(reply_target_marker)
+            quoted_reply_target = await self.find_quoted_reply_target_metadata(
+                event,
+                req,
+                quote,
+                quoted_text,
+            )
 
-            optimized_text = inject_quoted_markers(text, markers)
-            if optimized_text == text:
-                continue
-            try:
-                part.text = optimized_text
-            except Exception:  # noqa: BLE001
-                parts[index] = clone_text_part(part, optimized_text)
-            break
+        hint = build_reply_direction_hint(event, quote, quoted_reply_target)
+        if hint:
+            append_temp_text_part(req, hint)
 
         return result
 
@@ -573,6 +609,95 @@ def build_reply_target_marker_from_metadata(metadata: dict[str, Any] | None) -> 
     if not metadata:
         return ""
     return f"<astrna_reply_target>{format_metadata_json(metadata)}</astrna_reply_target>"
+
+
+def build_reply_direction_hint(
+    event: Any,
+    quote: Any,
+    quoted_reply_target: dict[str, Any] | None = None,
+) -> str:
+    current_user = build_event_user_metadata(event)
+    quoted_sender = build_quoted_sender_metadata(quote)
+    if not current_user and not quoted_sender and not quoted_reply_target:
+        return ""
+
+    current_user_text = format_user_description(current_user, "当前发言人")
+    quoted_sender_text = format_user_description(quoted_sender, "被引用消息发送者")
+    reply_target_text = format_user_description(
+        get_metadata_user(quoted_reply_target),
+        "被引用回复的原接收者",
+    )
+
+    lines = ["AstrNa 回复指向说明："]
+    if current_user_text:
+        lines.append(f"当前发言人是{current_user_text}。")
+    if quoted_sender_text:
+        if is_quote_from_self(event, quote):
+            lines.append("当前发言人引用了一条你之前发送的消息。")
+        else:
+            lines.append(f"当前发言人引用了一条由{quoted_sender_text}发送的消息。")
+
+    if quoted_reply_target and reply_target_text:
+        lines.append(f"被引用的这条消息是你之前回复给{reply_target_text}的。")
+        if current_user_text:
+            if not same_user_metadata(current_user, get_metadata_user(quoted_reply_target)):
+                lines.append(f"这不代表当前发言人是{reply_target_text}。")
+            lines.append(
+                f"你这次需要回复当前发言人{current_user_text}，不要把当前发言人、引用消息发送者、被引用回复的原接收者混淆。",
+            )
+        else:
+            lines.append("不要把引用消息发送者和被引用回复的原接收者混淆。")
+    elif current_user_text:
+        lines.append(
+            f"你这次需要回复当前发言人{current_user_text}，不要把当前发言人与被引用消息发送者混淆。",
+        )
+
+    return "\n".join(lines)
+
+
+def build_quoted_sender_metadata(quote: Any) -> dict[str, str]:
+    if quote is None:
+        return {}
+
+    metadata: dict[str, str] = {}
+    put_optional(metadata, "user_id", getattr(quote, "sender_id", None))
+    put_optional(metadata, "nickname", getattr(quote, "sender_nickname", None))
+    return metadata
+
+
+def get_metadata_user(metadata: dict[str, Any] | None) -> dict[str, str]:
+    if not isinstance(metadata, dict):
+        return {}
+    return sanitize_metadata_mapping(metadata.get("user"), {"user_id", "nickname"})
+
+
+def format_user_description(metadata: dict[str, Any], fallback: str) -> str:
+    if not isinstance(metadata, dict) or not metadata:
+        return ""
+
+    nickname = sanitize_optional_metadata_value(metadata.get("nickname"))
+    user_id = sanitize_optional_metadata_value(metadata.get("user_id"))
+    if nickname and user_id:
+        return f"{nickname}（用户 ID：{user_id}）"
+    if nickname:
+        return nickname
+    if user_id:
+        return f"{fallback}（用户 ID：{user_id}）"
+    return ""
+
+
+def same_user_metadata(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    if not isinstance(first, dict) or not isinstance(second, dict):
+        return False
+
+    first_id = sanitize_optional_metadata_value(first.get("user_id"))
+    second_id = sanitize_optional_metadata_value(second.get("user_id"))
+    if first_id and second_id:
+        return first_id == second_id
+
+    first_nickname = sanitize_optional_metadata_value(first.get("nickname"))
+    second_nickname = sanitize_optional_metadata_value(second.get("nickname"))
+    return bool(first_nickname and second_nickname and first_nickname == second_nickname)
 
 
 def mark_wrapper_active(wrapper: Any, original: Any) -> None:
@@ -913,6 +1038,22 @@ def strip_markers_from_contexts(contexts: Any) -> tuple[Any, bool]:
     return optimized, changed
 
 
+def strip_markers_from_extra_parts(parts: list[Any]) -> bool:
+    optimized_parts: list[Any] = []
+    changed = False
+    for part in parts:
+        stripped_part = strip_markers_from_part(part)
+        if stripped_part is not part:
+            changed = True
+        if part_text_is_empty_after_strip(stripped_part):
+            changed = True
+            continue
+        optimized_parts.append(stripped_part)
+    if changed:
+        parts[:] = optimized_parts
+    return changed
+
+
 def strip_markers_from_history_message(message: Any) -> Any:
     if isinstance(message, dict):
         stripped_content, changed = strip_markers_from_content(message.get("content"))
@@ -1031,6 +1172,20 @@ def load_request_history(req: Any) -> list[Any]:
     return []
 
 
+def extract_last_quoted_message_text(req: Any) -> str:
+    parts = getattr(req, "extra_user_content_parts", None)
+    if not isinstance(parts, list):
+        return ""
+    for part in reversed(parts):
+        text = getattr(part, "text", None)
+        if not isinstance(text, str):
+            continue
+        body = extract_quoted_message_body(text)
+        if body and body != text:
+            return body
+    return ""
+
+
 def parse_history_value(value: Any) -> list[Any] | None:
     if isinstance(value, list):
         return value
@@ -1042,6 +1197,12 @@ def parse_history_value(value: Any) -> list[Any] | None:
         if isinstance(parsed, list):
             return parsed
     return None
+
+
+def serialize_history_like(original: Any, contexts: list[Any]) -> Any:
+    if isinstance(original, str):
+        return json.dumps(contexts, ensure_ascii=False)
+    return contexts
 
 
 def extract_reply_target_metadata(content: Any) -> dict[str, Any] | None:
@@ -1158,6 +1319,55 @@ def find_reply_component(event: Any) -> Any | None:
         if comp.__class__.__name__ == "Reply":
             return comp
     return None
+
+
+def append_temp_text_part(req: Any, text: str) -> None:
+    if not text:
+        return
+    parts = getattr(req, "extra_user_content_parts", None)
+    if not isinstance(parts, list):
+        try:
+            req.extra_user_content_parts = []
+            parts = req.extra_user_content_parts
+        except Exception:  # noqa: BLE001
+            return
+    parts.append(create_temp_text_part(text))
+
+
+def create_temp_text_part(text: str) -> Any:
+    try:
+        from astrbot.core.agent.message import TextPart
+    except Exception:
+        TextPart = None  # type: ignore[assignment]
+
+    if TextPart is not None:
+        try:
+            part = TextPart(text=text)
+        except Exception:  # noqa: BLE001
+            part = None
+        if part is not None:
+            mark_as_temp = getattr(part, "mark_as_temp", None)
+            if callable(mark_as_temp):
+                try:
+                    return mark_as_temp()
+                except Exception:  # noqa: BLE001
+                    pass
+            mark_part_as_temp(part)
+            return part
+
+    part = type("AstrNaTempTextPart", (), {})()
+    part.type = "text"
+    part.text = text
+    mark_part_as_temp(part)
+    return part
+
+
+def mark_part_as_temp(part: Any) -> None:
+    try:
+        part._is_temp = True
+        part._no_save = True
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def clone_message(message: Any, *, content: Any) -> Any:
