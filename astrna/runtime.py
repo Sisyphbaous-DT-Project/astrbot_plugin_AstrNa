@@ -11,6 +11,7 @@ from .modules.forward_nodes import (
 )
 from .modules.image_caption import ImageCaptionModule
 from .modules.group_identity_tools import GroupIdentityToolsModule
+from .modules.group_sender_concurrency import GroupSenderConcurrencyModule
 from .modules.identity_metadata import IdentityMetadataModule
 from .modules.long_reply_context import LongReplyContextModule
 from .modules.reply_target_history import ReplyTargetHistoryModule
@@ -33,6 +34,7 @@ DEFAULT_CONFIG = {
     "provide_group_identity_tools": False,
     "optimize_reply_target_history": False,
     "optimize_long_reply_context": False,
+    "unlock_group_sender_concurrency": False,
 }
 
 
@@ -66,6 +68,7 @@ class AstrNaRuntime:
             context=context,
             logger=logger,
         )
+        self.group_sender_concurrency = GroupSenderConcurrencyModule(logger=logger)
         self.long_reply_context = LongReplyContextModule(logger=logger)
         self.reply_target_history = ReplyTargetHistoryModule(
             logger=logger,
@@ -87,6 +90,8 @@ class AstrNaRuntime:
             self.group_identity_tools.install()
         if self.config.get("optimize_long_reply_context", False):
             self.long_reply_context.install()
+        if self.config.get("unlock_group_sender_concurrency", False):
+            self.group_sender_concurrency.install()
 
     async def sanitize_request(self, event: Any, req: Any) -> None:
         if self.config.get("optimize_dynamic_system_prompt", False):
@@ -107,10 +112,27 @@ class AstrNaRuntime:
         else:
             self.deepseek_v4_400.terminate()
 
-        if self.config.get("optimize_long_reply_context", False):
+        long_reply_enabled = self.config.get("optimize_long_reply_context", False)
+        group_concurrency_enabled = self.config.get(
+            "unlock_group_sender_concurrency",
+            False,
+        )
+        long_reply_will_change = (
+            bool(getattr(self.long_reply_context, "_installed", False))
+            != long_reply_enabled
+        )
+        if long_reply_will_change:
+            self.group_sender_concurrency.terminate()
+
+        if long_reply_enabled:
             self.long_reply_context.install()
         else:
             self.long_reply_context.terminate()
+
+        if group_concurrency_enabled:
+            self.group_sender_concurrency.install()
+        else:
+            self.group_sender_concurrency.terminate()
 
         if self.config.get("optimize_identity_metadata", False):
             account_nickname_display = self.config.get(
@@ -136,6 +158,7 @@ class AstrNaRuntime:
             )
 
     async def terminate(self) -> None:
+        self.group_sender_concurrency.terminate()
         self.long_reply_context.terminate()
         self.forward_nodes.terminate()
         self.dynamic_system_prompt.terminate()

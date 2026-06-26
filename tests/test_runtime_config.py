@@ -22,6 +22,7 @@ def test_merge_config_keeps_defaults_for_missing_values():
         "optimize_send_message_to_user": False,
         "provide_group_identity_tools": False,
         "optimize_reply_target_history": False,
+        "unlock_group_sender_concurrency": False,
     }
 
 
@@ -43,6 +44,7 @@ def test_merge_config_can_enable_modules():
             "optimize_send_message_to_user": True,
             "provide_group_identity_tools": True,
             "optimize_reply_target_history": True,
+            "unlock_group_sender_concurrency": True,
         }
     )
 
@@ -62,6 +64,7 @@ def test_merge_config_can_enable_modules():
         "optimize_send_message_to_user": True,
         "provide_group_identity_tools": True,
         "optimize_reply_target_history": True,
+        "unlock_group_sender_concurrency": True,
     }
 
 

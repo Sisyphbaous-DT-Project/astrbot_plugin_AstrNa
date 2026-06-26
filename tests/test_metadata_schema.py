@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.1.8"
+    assert metadata["version"] == "1.1.9"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -43,6 +43,7 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "optimize_send_message_to_user",
         "provide_group_identity_tools",
         "optimize_reply_target_history",
+        "unlock_group_sender_concurrency",
     ]
     assert schema["fix_deepseek_v4_400"]["type"] == "bool"
     assert schema["fix_deepseek_v4_400"]["default"] is False
@@ -120,6 +121,14 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         == "优化回复历史标记"
     )
     assert schema["optimize_reply_target_history"]["default"] is False
+    assert schema["unlock_group_sender_concurrency"]["type"] == "bool"
+    assert (
+        schema["unlock_group_sender_concurrency"]["description"]
+        == "解锁群聊并发回复（实验性）"
+    )
+    assert "⚠️" in schema["unlock_group_sender_concurrency"]["hint"]
+    assert "防抖" in schema["unlock_group_sender_concurrency"]["hint"]
+    assert schema["unlock_group_sender_concurrency"]["default"] is False
 
 
 def test_changelog_contains_release_notes():
@@ -142,3 +151,4 @@ def test_changelog_contains_release_notes():
     assert "## 0.1.7" in changelog
     assert "## 0.1.8" in changelog
     assert "## 1.1.8" in changelog
+    assert "## 1.1.9" in changelog
