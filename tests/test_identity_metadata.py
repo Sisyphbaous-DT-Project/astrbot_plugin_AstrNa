@@ -15,6 +15,8 @@ from astrna.modules.identity_metadata import (
     build_identity_metadata,
     create_text_part,
     fetch_group_member_identity,
+    fetch_user_birthday,
+    normalize_user_birthday,
     normalize_group_member_identity,
     remove_builtin_identity_lines,
     sanitize_metadata_value,
@@ -113,6 +115,195 @@ def test_group_member_identity_switch_is_disabled_by_default(fakes):
     assert bot.calls == []
     metadata = extract_identity_json(request.extra_user_content_parts[-1].text)
     assert "member" not in metadata["group"]
+
+
+def test_birthday_info_switch_is_disabled_by_default(fakes):
+    bot = fakes.Bot(
+        stranger_info={
+            "birthday_year": 2000,
+            "birthday_month": 2,
+            "birthday_day": 17,
+        }
+    )
+    runtime = fakes.build_runtime({"optimize_identity_metadata": True})
+    request = fakes.Request(contexts=[])
+    fakes.add_builtin_identity_part(request)
+
+    asyncio.run(runtime.sanitize_request(event=fakes.Event(bot=bot), req=request))
+
+    assert bot.calls == []
+    metadata = extract_identity_json(request.extra_user_content_parts[-1].text)
+    assert "birthday" not in metadata["user"]
+
+
+def test_birthday_info_requires_identity_metadata_switch(fakes):
+    bot = fakes.Bot(stranger_info={"birthday_month": 2, "birthday_day": 17})
+    runtime = fakes.build_runtime({"birthday_info_display": True})
+    request = fakes.Request(contexts=[])
+    fakes.add_builtin_identity_part(request)
+
+    asyncio.run(runtime.sanitize_request(event=fakes.Event(bot=bot), req=request))
+
+    assert bot.calls == []
+    assert "AstrNa identity metadata:" not in request.extra_user_content_parts[-1].text
+
+
+def test_birthday_info_requires_builtin_identity_part(fakes):
+    bot = fakes.Bot(stranger_info={"birthday_month": 2, "birthday_day": 17})
+    runtime = fakes.build_runtime(
+        {"optimize_identity_metadata": True, "birthday_info_display": True}
+    )
+    request = fakes.Request(contexts=[])
+
+    asyncio.run(runtime.sanitize_request(event=fakes.Event(bot=bot), req=request))
+
+    assert bot.calls == []
+    assert request.extra_user_content_parts == []
+
+
+def test_birthday_info_is_appended_to_group_sender_metadata(fakes):
+    bot = fakes.Bot(
+        stranger_info={
+            "birthday_year": 2000,
+            "birthday_month": 2,
+            "birthday_day": 17,
+        }
+    )
+    runtime = fakes.build_runtime(
+        {"optimize_identity_metadata": True, "birthday_info_display": True}
+    )
+    request = fakes.Request(contexts=[])
+    fakes.add_builtin_identity_part(request)
+
+    asyncio.run(runtime.sanitize_request(event=fakes.Event(bot=bot), req=request))
+
+    assert bot.calls == [
+        (
+            "get_stranger_info",
+            {
+                "user_id": "user123",
+                "no_cache": False,
+                "self_id": "self999",
+            },
+        )
+    ]
+    metadata = extract_identity_json(request.extra_user_content_parts[-1].text)
+    assert metadata["user"]["birthday"] == {"month": "2", "day": "17"}
+    assert "birthday_year" not in request.extra_user_content_parts[-1].text
+
+
+def test_birthday_info_is_appended_to_private_sender_metadata(fakes):
+    bot = fakes.Bot(stranger_info={"birthday_month": "12", "birthday_day": "31"})
+    runtime = fakes.build_runtime(
+        {"optimize_identity_metadata": True, "birthday_info_display": True}
+    )
+    request = fakes.Request(contexts=[])
+    fakes.add_builtin_identity_part(request, with_group=False)
+    event = fakes.Event(
+        bot=bot,
+        message_obj=fakes.MessageObj(group_id="", group=None),
+    )
+
+    asyncio.run(runtime.sanitize_request(event=event, req=request))
+
+    metadata = extract_identity_json(request.extra_user_content_parts[-1].text)
+    assert metadata["user"]["birthday"] == {"month": "12", "day": "31"}
+    assert "group" not in metadata
+
+
+def test_birthday_info_skips_unsupported_contexts(fakes):
+    runtime = fakes.build_runtime(
+        {"optimize_identity_metadata": True, "birthday_info_display": True}
+    )
+    scenarios = [
+        fakes.Event(
+            bot=fakes.Bot(stranger_info={"birthday_month": 2, "birthday_day": 17}),
+            platform_name="webchat",
+        ),
+        fakes.Event(
+            bot=fakes.Bot(stranger_info={"birthday_month": 2, "birthday_day": 17}),
+            message_obj=fakes.MessageObj(sender=fakes.Sender(user_id="")),
+        ),
+        fakes.Event(bot=None),
+    ]
+
+    for event in scenarios:
+        request = fakes.Request(contexts=[])
+        fakes.add_builtin_identity_part(request)
+        asyncio.run(runtime.sanitize_request(event=event, req=request))
+        metadata = extract_identity_json(request.extra_user_content_parts[-1].text)
+        assert "birthday" not in metadata["user"]
+
+
+def test_birthday_info_skips_failed_or_invalid_lookup(fakes):
+    runtime = fakes.build_runtime(
+        {"optimize_identity_metadata": True, "birthday_info_display": True}
+    )
+    events = [
+        fakes.Event(bot=fakes.Bot(fail=True)),
+        fakes.Event(bot=fakes.Bot(stranger_info=["not", "dict"])),
+        fakes.Event(
+            bot=fakes.Bot(stranger_info={"birthday_month": 0, "birthday_day": 17})
+        ),
+        fakes.Event(
+            bot=fakes.Bot(stranger_info={"birthday_month": 2, "birthday_day": 0})
+        ),
+        fakes.Event(
+            bot=fakes.Bot(stranger_info={"birthday_month": 13, "birthday_day": 17})
+        ),
+        fakes.Event(
+            bot=fakes.Bot(stranger_info={"birthday_month": 2, "birthday_day": 32})
+        ),
+        fakes.Event(
+            bot=fakes.Bot(stranger_info={"birthday_month": "二", "birthday_day": 17})
+        ),
+    ]
+
+    for event in events:
+        request = fakes.Request(contexts=[])
+        fakes.add_builtin_identity_part(request)
+        asyncio.run(runtime.sanitize_request(event=event, req=request))
+        metadata = extract_identity_json(request.extra_user_content_parts[-1].text)
+        assert "birthday" not in metadata["user"]
+
+
+def test_birthday_info_can_coexist_with_account_and_group_member_metadata(fakes):
+    bot = fakes.Bot(
+        member_info={"role": "owner", "level": "9", "title": "今天生日"},
+        stranger_info={"birthday_month": 2, "birthday_day": 17},
+    )
+    runtime = fakes.build_runtime(
+        {
+            "optimize_identity_metadata": True,
+            "account_nickname_display": True,
+            "group_member_identity_display": True,
+            "birthday_info_display": True,
+        }
+    )
+    request = fakes.Request(contexts=[])
+    event = fakes.Event(
+        bot=bot,
+        message_obj=fakes.MessageObj(
+            sender=fakes.Sender(account_nickname="AccountNick"),
+        ),
+    )
+    fakes.add_builtin_identity_part(request)
+
+    asyncio.run(runtime.sanitize_request(event=event, req=request))
+
+    metadata = extract_identity_json(request.extra_user_content_parts[-1].text)
+    assert metadata["user"] == {
+        "user_id": "user123",
+        "nickname": "GroupCard",
+        "account_nickname": "AccountNick",
+        "birthday": {"month": "2", "day": "17"},
+    }
+    assert metadata["group"]["member"] == {
+        "role": "owner",
+        "role_name": "群主",
+        "level": "9",
+        "title": "今天生日",
+    }
 
 
 def test_group_member_identity_requires_identity_metadata_switch(fakes):
@@ -343,6 +534,49 @@ def test_fetch_group_member_identity_accepts_explicit_self_id(fakes):
 
     assert identity == {"role": "owner", "role_name": "群主"}
     assert bot.calls[0][1]["self_id"] == "explicit-self"
+
+
+def test_user_birthday_normalizes_valid_month_and_day():
+    assert normalize_user_birthday(
+        {"birthday_year": 2000, "birthday_month": 2, "birthday_day": 17}
+    ) == {"month": "2", "day": "17"}
+    assert normalize_user_birthday({"birthday_month": "02", "birthday_day": "07"}) == {
+        "month": "2",
+        "day": "7",
+    }
+    assert normalize_user_birthday({"birthday_month": 2, "birthday_day": 29}) == {
+        "month": "2",
+        "day": "29",
+    }
+
+
+def test_user_birthday_rejects_invalid_calendar_day():
+    assert normalize_user_birthday({"birthday_month": 2, "birthday_day": 30}) is None
+    assert normalize_user_birthday({"birthday_month": 4, "birthday_day": 31}) is None
+
+
+def test_fetch_user_birthday_accepts_explicit_user_and_self_id(fakes):
+    bot = fakes.Bot(stranger_info={"birthday_month": 2, "birthday_day": 17})
+    event = fakes.Event(
+        bot=bot,
+        message_obj=fakes.MessageObj(self_id="event-self"),
+    )
+
+    birthday = asyncio.run(
+        fetch_user_birthday(event, user_id="u1", self_id="explicit-self")
+    )
+
+    assert birthday == {"month": "2", "day": "17"}
+    assert bot.calls == [
+        (
+            "get_stranger_info",
+            {
+                "user_id": "u1",
+                "no_cache": False,
+                "self_id": "explicit-self",
+            },
+        )
+    ]
 
 
 def test_optimize_identity_metadata_does_not_append_account_nickname_by_default(fakes):

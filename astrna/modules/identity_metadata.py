@@ -15,6 +15,20 @@ METADATA_CONTROL_CHARS = dict.fromkeys(range(32), " ")
 METADATA_CONTROL_CHARS[127] = " "
 METADATA_CONTROL_CHARS.update(dict.fromkeys(range(128, 160), " "))
 METADATA_ZERO_WIDTH_CHARS = "\u200b\u200c\u200d\u2060\ufeff"
+BIRTHDAY_MONTH_MAX_DAYS = {
+    1: 31,
+    2: 29,
+    3: 31,
+    4: 30,
+    5: 31,
+    6: 30,
+    7: 31,
+    8: 31,
+    9: 30,
+    10: 31,
+    11: 30,
+    12: 31,
+}
 
 
 class IdentityMetadataModule:
@@ -31,6 +45,7 @@ class IdentityMetadataModule:
         account_nickname_display: bool = False,
         account_nickname_only: bool = False,
         group_member_identity_display: bool = False,
+        birthday_info_display: bool = False,
     ) -> None:
         removal = remove_builtin_identity_parts(req)
         if not removal.removed_identity:
@@ -43,12 +58,17 @@ class IdentityMetadataModule:
                 logger=self.logger,
             )
 
+        birthday = None
+        if birthday_info_display:
+            birthday = await fetch_user_birthday(event, logger=self.logger)
+
         metadata = build_identity_metadata(
             event,
             account_nickname_display=account_nickname_display,
             account_nickname_only=account_nickname_only,
             group_name_display=removal.removed_group_name,
             group_member_identity=group_member_identity,
+            birthday=birthday,
         )
         if not metadata:
             return
@@ -92,13 +112,14 @@ def build_identity_metadata(
     account_nickname_only: bool = False,
     group_name_display: bool = False,
     group_member_identity: dict[str, str] | None = None,
+    birthday: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     message_obj = getattr(event, "message_obj", None)
     sender = getattr(message_obj, "sender", None)
     if sender is None:
         return {}
 
-    user_metadata: dict[str, str] = {}
+    user_metadata: dict[str, Any] = {}
     put_required(user_metadata, "user_id", getattr(sender, "user_id", None))
     display_nickname = sanitize_metadata_value(getattr(sender, "nickname", None))
     user_metadata["nickname"] = display_nickname
@@ -112,6 +133,9 @@ def build_identity_metadata(
                 user_metadata["nickname"] = account_nickname
             elif account_nickname != display_nickname:
                 user_metadata["account_nickname"] = account_nickname
+
+    if birthday:
+        user_metadata["birthday"] = birthday
 
     metadata: dict[str, Any] = {}
     if user_metadata:
@@ -219,6 +243,81 @@ def normalize_group_member_identity(member_info: Any) -> dict[str, str] | None:
     put_optional(identity, "level", member_info.get("level"))
     put_optional(identity, "title", member_info.get("title"))
     return identity
+
+
+async def fetch_user_birthday(
+    event: Any,
+    *,
+    user_id: Any | None = None,
+    self_id: Any | None = None,
+    logger: Any | None = None,
+) -> dict[str, str] | None:
+    """查询当前平台可提供的 QQ 生日月日，供身份元数据和后续工具复用。"""
+    platform_name = get_event_platform_name(event)
+    if platform_name != "aiocqhttp":
+        return None
+
+    message_obj = getattr(event, "message_obj", None)
+    sender = getattr(message_obj, "sender", None)
+    user_id = user_id if user_id is not None else getattr(sender, "user_id", None)
+    if not user_id:
+        return None
+
+    bot = getattr(event, "bot", None)
+    call_action = getattr(bot, "call_action", None)
+    if not callable(call_action):
+        return None
+
+    params: dict[str, Any] = {
+        "user_id": user_id,
+        "no_cache": False,
+    }
+    self_id = self_id if self_id is not None else getattr(message_obj, "self_id", None)
+    if self_id:
+        params["self_id"] = self_id
+
+    try:
+        user_info = await call_action("get_stranger_info", **params)
+    except Exception as exc:
+        if logger is not None:
+            logger.debug(
+                "AstrNa 查询生日信息失败: user_id=%s, error=%s",
+                user_id,
+                exc,
+            )
+        return None
+
+    return normalize_user_birthday(user_info)
+
+
+def normalize_user_birthday(user_info: Any) -> dict[str, str] | None:
+    if not isinstance(user_info, dict):
+        return None
+
+    month_number = normalize_birthday_number(user_info.get("birthday_month"), 1, 12)
+    day_number = normalize_birthday_number(user_info.get("birthday_day"), 1, 31)
+    if month_number is None or day_number is None:
+        return None
+    if day_number > BIRTHDAY_MONTH_MAX_DAYS[month_number]:
+        return None
+    month = str(month_number)
+    day = str(day_number)
+    return {"month": month, "day": day}
+
+
+def normalize_birthday_number(value: Any, minimum: int, maximum: int) -> int | None:
+    if isinstance(value, bool):
+        return None
+    sanitized = sanitize_optional_metadata_value(value)
+    if sanitized is None:
+        return None
+    try:
+        number = int(sanitized)
+    except ValueError:
+        return None
+    if not minimum <= number <= maximum:
+        return None
+    return number
 
 
 def get_account_nickname(sender: Any, message_obj: Any) -> Any:

@@ -26,20 +26,33 @@ class DummyLogger:
 
 
 class DummyBot:
-    def __init__(self, member_info=None, *, fail=False):
+    def __init__(
+        self,
+        member_info=None,
+        *,
+        stranger_info=None,
+        fail_actions=None,
+        fail=False,
+    ):
         self.member_info = member_info
+        self.stranger_info = stranger_info
+        self.fail_actions = set(fail_actions or [])
         self.fail = fail
         self.calls = []
 
     async def call_action(self, action, **params):
         self.calls.append((action, params))
-        if self.fail:
+        if self.fail or action in self.fail_actions:
             raise RuntimeError("call_action failed")
         if isinstance(self.member_info, dict) and action in self.member_info:
             result = self.member_info[action]
             if callable(result):
                 return result(**params)
             return result
+        if action == "get_stranger_info" and self.stranger_info is not None:
+            if callable(self.stranger_info):
+                return self.stranger_info(**params)
+            return self.stranger_info
         return self.member_info
 
 

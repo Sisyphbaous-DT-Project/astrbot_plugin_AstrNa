@@ -42,6 +42,16 @@
       "optimize_identity_metadata": true
     }
   },
+  "birthday_info_display": {
+    "type": "bool",
+    "description": "注入生日信息",
+    "hint": "开启后，AstrNa 会在 AstrBot 自带身份识别已生效时，通过 NapCat/aiocqhttp 的 get_stranger_info 尝试读取当前发言人或私聊对象的 QQ 生日月日，并写入临时身份元数据；只注入月日，不注入年份。查不到、字段为空或为 0 时会自动跳过，不会写入会话历史。默认关闭。",
+    "default": false,
+    "collapsed": true,
+    "condition": {
+      "optimize_identity_metadata": true
+    }
+  },
   "optimize_forward_nodes": {
     "type": "bool",
     "description": "优化合并转发",

@@ -22,6 +22,7 @@ DEFAULT_CONFIG = {
     "account_nickname_display": False,
     "account_nickname_only": False,
     "group_member_identity_display": False,
+    "birthday_info_display": False,
     "optimize_forward_nodes": False,
     "forward_node_max_length": FORWARD_NODE_MAX_LENGTH_DEFAULT,
     "forward_node_hard_limit": FORWARD_NODE_HARD_LIMIT_DEFAULT,
@@ -116,6 +117,10 @@ class AstrNaRuntime:
                 ),
                 group_member_identity_display=self.config.get(
                     "group_member_identity_display",
+                    False,
+                ),
+                birthday_info_display=self.config.get(
+                    "birthday_info_display",
                     False,
                 ),
             )
