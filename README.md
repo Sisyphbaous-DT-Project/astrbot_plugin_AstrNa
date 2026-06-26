@@ -1,44 +1,209 @@
 # AstrNa
 
-AstrNa是一款AstrBot优化插件。
+AstrNa 是一款面向 AstrBot 的优化插件，目标是在不修改 AstrBot Core 的前提下，通过可独立开关的运行时补丁，改善上下文、发送链路、身份元数据、工具调用和部分模型兼容问题。
 
-仓库地址：[Sisyphbaous-DT-Project/astrbot_plugin_AstrNa](https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_AstrNa)
+🎉 AstrNa 第一个正式版已经发布。当前正式版：`1.1.8`
 
-作者主页：[Sisyphbaous-DT-Project](https://github.com/Sisyphbaous-DT-Project)
+- 仓库地址：[Sisyphbaous-DT-Project/astrbot_plugin_AstrNa](https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_AstrNa)
+- 作者主页：[Sisyphbaous-DT-Project](https://github.com/Sisyphbaous-DT-Project)
+- 许可证：[MIT License](LICENSE)
+- 更新日志：[CHANGELOG.md](CHANGELOG.md)
 
-许可证：[MIT License](LICENSE)
+## 适合谁
 
-更新日志：[CHANGELOG.md](CHANGELOG.md)
+如果你的 AstrBot 正在使用 QQ / NapCat / aiocqhttp，并且遇到这些问题，AstrNa 可能会有帮助：
 
-## 框架
+- DeepSeek V4 或代理模型偶发 400。
+- 群聊里模型分不清用户身份、群昵称、真实昵称、群身份。
+- Bot 长回复被合并转发或分段插件处理后，后续上下文里看不到自己刚写过的完整内容。
+- AstrBot 自带合并转发节点太长，QQ / NapCat 发送失败。
+- 图片转述没有结合用户当前问题和引用文本。
+- 模型误用 `send_message_to_user`，导致发送前插件无法命中。
+- 希望 Bot 能按需查询当前群成员身份、群主、管理员、群头衔、群等级和生日月日。
 
-AstrNa 采用模块化结构。每个优化功能作为一个独立模块维护，并在配置里对应一个开关，默认关闭。
+AstrNa 的所有功能默认关闭。建议按需打开，不要一次性全开。
 
-## 功能
+## 安装
 
-- 修复 DeepSeek v4 400 报错：开启后，AstrNa 会在 LLM 请求发送前清理异常 assistant 历史，并兼容修复代理模型名下 DeepSeek V4 thinking mode 未回传 `reasoning_content` 导致的 400。
-- 优化身份元数据：开启后，AstrNa 会把 AstrBot 自带身份识别注入的用户信息优化成 JSON 格式，并可选补充当前发言人的群成员身份、群等级、专属头衔和生日月日。
-- 真实昵称模式：开启优化身份元数据后，可以选择追加真实昵称；继续开启仅使用真实昵称后，会优先用真实昵称替代群昵称，取不到时自动回退。
-- 优化合并转发：开启后，AstrNa 会在 AstrBot 自带合并转发已经触发时，把过长的单个转发节点拆成多个较短节点，降低 QQ/NapCat 发送失败概率。
-- 优化超长回复上下文：开启后，AstrNa 会在 Bot 的 LLM 长回复被合并转发或分段插件改写前后，尽量保留本轮回复完整纯文本，让后续对话还能看到 Bot 自己刚刚写过的长内容。
-- AstrBot插件缓存优化：开启后，AstrNa 会观察其他插件对 `system_prompt` 的动态追加，并在确认同一注入位置安全后把完整动态语义块迁移到临时 `extra_user_content_parts`，减少动态提示词对缓存命中的影响。
-- 更好的图像转述：开启后，AstrNa 会在 AstrBot 使用独立图片转述模型时，把用户当前问题和引用消息文本补充给转述模型，让转述模型带着问题看图。
-- 优化send_message_to_user工具：开启后，AstrNa 会把普通聊天里误用 `send_message_to_user` 发送的当前会话纯文本改回普通最终回复，让发送前插件和表情包识别等正常生效。
-- 提供群身份查询工具：开启后，AstrNa 会为 Bot 提供按需查询当前群成员身份、群等级、专属头衔、群主、管理员、群成员生日月日和当前群近期生日列表的工具。
-- 优化回复历史标记：⚠️ 这个功能还在研究中。开启后，AstrNa 会在本轮请求里临时注入中文回复指向说明，帮助模型区分当前发言人、引用消息发送者和被引用 Bot 回复原接收者，并会清理模型误输出的内部标记。若出现认人混乱，请立刻关闭。
+在 AstrBot 插件管理里使用仓库地址安装：
 
-身份元数据模块不会写入会话历史。这个功能依赖 AstrBot 自带的用户识别/身份识别按钮；如果 AstrBot 自带按钮没打开，插件里打开也不会生效。群成员身份识别只补充当前发言人在群里的身份。生日信息注入只会通过 NapCat/aiocqhttp 尝试读取当前发言人或私聊对象的生日月日，不注入年份；查不到或平台隐藏时会自动跳过。
+```text
+https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_AstrNa
+```
 
-优化合并转发模块依赖 AstrBot 自带合并转发功能；如果 AstrBot 原本不触发合并转发，插件里打开也不会生效。
+安装后进入插件配置页，按需要启用对应开关。
 
-优化超长回复上下文模块只处理 Bot 自己的 LLM 回复，不会展开群友发送的合并转发。对已经被分段插件提前直发、最终链路只剩最后一段的场景，AstrNa 会使用本轮 LLM 原始回复文本作为兜底上下文；真实发送到聊天平台的内容不会改变。
+如果安装时报“目录已存在”，通常是 AstrBot 的插件目录里已经残留了同名目录。请先关闭 AstrBot，再检查并删除实例目录下的：
 
-AstrBot插件缓存优化模块只处理可安全识别的纯追加或前置追加。固定不变的提示词会继续保留在 `system_prompt`；动态内容会尽量作为完整语义块迁移，不会只迁移零散变化字符；复杂重写、删除或替换会自动跳过。
+```text
+core/data/plugins/astrbot_plugin_AstrNa
+```
 
-更好的图像转述模块依赖 AstrBot 自带图片转述模型；如果主模型本身支持图片，或 AstrBot 切换整次请求到多模态 fallback provider，插件不会干预。AstrNa 会兼容不同 AstrBot 版本的引用消息处理入口，避免旧版本因参数签名差异报错。
+随后重启 AstrBot 并重新安装。
 
-优化send_message_to_user工具模块只接管普通聊天的当前会话纯文本调用。为保证发送前插件能命中，这个模块会提前关闭本轮流式输出；跨会话主动消息、定时任务、live、图片、文件、语音、视频和 @ 不会接管。
+## 功能总览
 
-提供群身份查询工具模块只查询当前会话所在群，不支持跨群查询。工具只在模型需要时调用，不会主动塞进每轮上下文。生日查询只返回月日，不返回年份；近期生日列表默认查询未来 7 天，模型也可以按用户问题指定天数。
+| 开关 | 默认 | 作用 |
+| --- | --- | --- |
+| 修复 DeepSeek v4 400 报错 | 关闭 | 清理异常 assistant 历史，并补齐 DeepSeek V4 thinking mode 需要的 `reasoning_content` 字段。 |
+| 优化身份元数据 | 关闭 | 把 AstrBot 自带身份识别内容改为稳定 JSON，并可选补充真实昵称、群身份和生日月日。 |
+| 优化合并转发 | 关闭 | 在 AstrBot 自带合并转发已触发时，把过长单节点拆成多个较短节点，降低发送失败概率。 |
+| 优化超长回复上下文 | 关闭 | Bot 长回复被合并转发或分段插件改写后，尽量把完整纯文本保留到后续上下文。 |
+| AstrBot插件缓存优化 | 关闭 | 将可安全识别的动态 system prompt 迁移到临时 extra 内容，减少对 prompt cache 的破坏。 |
+| 更好的图像转述 | 关闭 | 图片转述时补充用户当前问题和引用文本，让转述模型带着问题看图。 |
+| 优化send_message_to_user工具 | 关闭 | 把普通聊天里误用工具发送当前会话纯文本的情况改回普通最终回复。 |
+| 提供群身份查询工具 | 关闭 | 为 Bot 提供查询当前群成员身份、群主、管理员、群头衔、群等级和生日月日的工具。 |
+| 优化回复历史标记 | 关闭 | ⚠️ 研究中。临时注入中文回复指向说明，帮助模型区分当前发言人和被引用回复对象。 |
 
-优化回复历史标记模块只影响开启后的新 LLM 会话历史，不迁移旧历史，也不会改变真实发送到聊天平台的消息内容。它会把回复指向信息作为临时中文说明注入到当前轮请求里，而不是长期写进 assistant 历史正文；旧历史里的内部标记会在本轮请求里临时清理，模型误输出的内部标记也会被移除，避免把标记当成正文学习。
+## 功能说明
+
+### 修复 DeepSeek v4 400 报错
+
+这个开关同时处理两类常见问题：
+
+- 历史里出现空 assistant、纯 reasoning、纯 think 内容块，导致接口 400。
+- 使用代理模型名，例如 `opencode/deepseek-v4-pro` 时，AstrBot 没识别出 DeepSeek V4 thinking mode，导致 assistant 历史缺少 `reasoning_content`。
+
+AstrNa 会在发送请求前做兼容修复，不会改写用户消息正文，也不会影响 `deepseek-chat`、`deepseek-reasoner` 等旧模型。
+
+### 优化身份元数据
+
+这个功能依赖 AstrBot 自带“用户识别/身份识别”已开启。AstrNa 不凭空制造身份信息，只会在 AstrBot 已经注入身份内容时，将它整理为更稳定的 JSON：
+
+```json
+{
+  "user": {
+    "user_id": "1719500341",
+    "nickname": "C2H25NO6",
+    "account_nickname": "账号昵称",
+    "birthday": {
+      "month": "2",
+      "day": "17"
+    }
+  },
+  "group": {
+    "group_id": "953245617",
+    "name": "群名",
+    "member": {
+      "role": "admin",
+      "role_name": "管理员",
+      "level": "12",
+      "title": "专属头衔"
+    }
+  }
+}
+```
+
+可选子功能：
+
+- 真实昵称：补充或替换群昵称。
+- 补充群成员身份：通过 NapCat / aiocqhttp 查询当前发言人的群主、管理员、普通成员、群等级和专属头衔。
+- 注入生日信息：通过 `get_stranger_info` 查询当前发言人或私聊对象的生日月日。
+
+生日只注入月日，不注入年份；查不到时自动跳过。身份元数据会作为临时内容注入，不写入会话历史。
+
+### 优化合并转发
+
+这个功能依赖 AstrBot 自带合并转发已经触发。AstrNa 会把过长的单个转发节点拆成多个较短节点，降低 QQ / NapCat 因单节点过长导致发送失败的概率。
+
+如果 AstrBot 原本没有触发合并转发，打开这个开关也不会强制把普通消息变成合并转发。
+
+### 优化超长回复上下文
+
+当 Bot 写出很长的文章、总结或设定文时，AstrBot 或 outputpro 一类插件可能会把最终发送内容改成合并转发，或者提前直发前几段，只把最后一段留给 AstrBot 继续发送。某些情况下，Bot 后续上下文里看不到自己刚写过的完整内容。
+
+开启后，AstrNa 会尽量保留本轮 LLM 生成的完整纯文本，让后续对话仍能引用这段内容。
+
+安全边界：
+
+- 只处理 Bot 自己的 LLM 回复。
+- 不展开群友发送的合并转发、Forward、Node 或 Nodes。
+- 不改变真实发送到聊天平台的消息内容。
+- 尊重 `_no_save`、tool calls、纯媒体结果、私聊/群聊边界。
+- 过长内容最多保留 20000 字，超过后会截断并标记。
+
+### AstrBot插件缓存优化
+
+部分插件会每轮动态追加 system prompt，导致 prompt cache 很难命中。AstrNa 会观察这些动态内容，如果确认某个注入位置是安全的纯追加或前置追加，就把后续动态语义块迁移到临时 `extra_user_content_parts`。
+
+这个功能采取保守策略：
+
+- 固定不变的提示词继续保留在 `system_prompt`。
+- 动态内容尽量按完整语义块迁移。
+- 复杂重写、删除或替换会自动跳过。
+
+### 更好的图像转述
+
+当主模型不支持图片、AstrBot 使用独立图片转述模型时，AstrNa 会把用户当前问题和引用消息文本补充给转述模型，让图片描述更贴近这次对话。
+
+如果主模型本身支持图片，或 AstrBot 切换整次请求到多模态 fallback provider，AstrNa 不会干预。
+
+### 优化send_message_to_user工具
+
+有些模型会在普通聊天里误调用 `send_message_to_user` 来发送当前会话纯文本，导致发送前插件、表情包识别、分段回复和合并转发等流程无法正常命中。
+
+开启后，AstrNa 会把这种当前会话纯文本调用改回普通最终回复。跨会话主动消息、定时任务、live、图片、文件、语音、视频和 @ 不会被接管。
+
+### 提供群身份查询工具
+
+开启后，AstrNa 会给 Bot 注册按需工具。模型只有在用户问到群身份、群头衔、群等级、群主、管理员、群友生日或近期生日时才需要调用。
+
+当前支持：
+
+- 查询某个群成员的身份、群等级、专属头衔。
+- 查询当前群群主和管理员。
+- 查询某个群成员生日月日。
+- 查询当前群未来一段时间内的生日列表，默认 7 天。
+
+限制：
+
+- 只查询当前会话所在群，不支持跨群。
+- 依赖 NapCat / aiocqhttp 可查询到的数据。
+- 生日只返回月日，不返回年份。
+- 昵称歧义时返回候选，不替模型猜人。
+
+### 优化回复历史标记
+
+⚠️ 这个功能仍在研究中，请谨慎启用。
+
+它会在当前轮请求里临时注入中文回复指向说明，帮助模型区分：
+
+- 当前发言人是谁。
+- 被引用消息是谁发的。
+- 被引用的 Bot 历史回复原本回复给谁。
+- 这次真正应该回复谁。
+
+AstrNa 也会清理旧历史里的内部标记，并移除模型误输出的内部标记，避免污染真实发送内容和后续历史。
+
+如果发现模型开始混淆当前发言人、引用发送者或回复对象，请立刻关闭这个功能。
+
+## 兼容性
+
+AstrNa 主要面向 AstrBot 当前 4.x 版本。当前版本已在本地 AstrBot 源码环境中完成回归验证。
+
+部分能力依赖平台：
+
+- 群成员身份、群等级、专属头衔、生日查询依赖 NapCat / aiocqhttp 可查询到对应信息。
+- DeepSeek V4 400 修复主要作用于 OpenAI compatible provider 路径。
+- 图像转述优化依赖 AstrBot 自带图片转述模型。
+- 合并转发相关优化依赖 AstrBot 或输出插件使用标准 `Node` / `Nodes` 消息组件。
+
+## 验证状态
+
+`1.1.8` 发布前通过以下验证：
+
+```bash
+TMPDIR=/tmp PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q -s
+TMPDIR=/tmp PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ASTRBOT_SOURCE_PATH=/root/projects/tmp/AstrBot python -m pytest -q -s
+ruff check .
+python -m compileall -q .
+git diff --check
+```
+
+## 设计原则
+
+- 不修改 AstrBot Core。
+- 所有能力默认关闭，按需启用。
+- 查询不到或平台不支持时静默跳过，不影响主对话。
+- 尽量只补充 Bot 需要理解上下文的信息，不主动扩大隐私暴露面。
+- 与 AstrBot 原行为保持兼容，插件停用时恢复运行时补丁。
