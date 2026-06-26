@@ -12,6 +12,7 @@ from .modules.forward_nodes import (
 from .modules.image_caption import ImageCaptionModule
 from .modules.group_identity_tools import GroupIdentityToolsModule
 from .modules.identity_metadata import IdentityMetadataModule
+from .modules.long_reply_context import LongReplyContextModule
 from .modules.reply_target_history import ReplyTargetHistoryModule
 from .modules.send_message_to_user import SendMessageToUserModule
 
@@ -31,6 +32,7 @@ DEFAULT_CONFIG = {
     "optimize_send_message_to_user": False,
     "provide_group_identity_tools": False,
     "optimize_reply_target_history": False,
+    "optimize_long_reply_context": False,
 }
 
 
@@ -64,6 +66,7 @@ class AstrNaRuntime:
             context=context,
             logger=logger,
         )
+        self.long_reply_context = LongReplyContextModule(logger=logger)
         self.reply_target_history = ReplyTargetHistoryModule(
             logger=logger,
             kv_store=kv_store,
@@ -82,6 +85,8 @@ class AstrNaRuntime:
             self.send_message_to_user.install()
         if self.config.get("provide_group_identity_tools", False):
             self.group_identity_tools.install()
+        if self.config.get("optimize_long_reply_context", False):
+            self.long_reply_context.install()
 
     async def sanitize_request(self, event: Any, req: Any) -> None:
         if self.config.get("optimize_dynamic_system_prompt", False):
@@ -101,6 +106,11 @@ class AstrNaRuntime:
             self.deepseek_v4_400.sanitize(event, req)
         else:
             self.deepseek_v4_400.terminate()
+
+        if self.config.get("optimize_long_reply_context", False):
+            self.long_reply_context.install()
+        else:
+            self.long_reply_context.terminate()
 
         if self.config.get("optimize_identity_metadata", False):
             account_nickname_display = self.config.get(
@@ -126,6 +136,7 @@ class AstrNaRuntime:
             )
 
     async def terminate(self) -> None:
+        self.long_reply_context.terminate()
         self.forward_nodes.terminate()
         self.dynamic_system_prompt.terminate()
         self.image_caption.terminate()

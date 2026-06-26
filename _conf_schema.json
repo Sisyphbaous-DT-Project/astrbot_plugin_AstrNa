@@ -78,6 +78,12 @@
       "optimize_forward_nodes": true
     }
   },
+  "optimize_long_reply_context": {
+    "type": "bool",
+    "description": "优化超长回复上下文",
+    "hint": "开启后，AstrNa 会在 Bot 的 LLM 回复被合并转发或分段插件改写前后，尽量保留本轮回复的完整纯文本，让后续对话仍能看到 Bot 自己刚刚写过的长内容；只处理 Bot 自己的 LLM 回复，不展开群友发送的合并转发消息。默认关闭。",
+    "default": false
+  },
   "optimize_dynamic_system_prompt": {
     "type": "bool",
     "description": "AstrBot插件缓存优化",
