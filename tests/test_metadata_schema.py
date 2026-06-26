@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "0.1.6"
+    assert metadata["version"] == "0.1.7"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -108,6 +108,7 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         schema["provide_group_identity_tools"]["description"]
         == "提供群身份查询工具"
     )
+    assert "生日" in schema["provide_group_identity_tools"]["hint"]
     assert schema["provide_group_identity_tools"]["default"] is False
     assert schema["optimize_reply_target_history"]["type"] == "bool"
     assert (
@@ -134,3 +135,4 @@ def test_changelog_contains_release_notes():
     assert "## 0.1.4" in changelog
     assert "## 0.1.5" in changelog
     assert "## 0.1.6" in changelog
+    assert "## 0.1.7" in changelog

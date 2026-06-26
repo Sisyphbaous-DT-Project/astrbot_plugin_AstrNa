@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any
 
 from .identity_metadata import (
     ROLE_NAME_MAP,
+    fetch_user_birthday,
     get_event_platform_name,
     put_optional,
     put_required,
@@ -22,8 +25,19 @@ except Exception:  # pragma: no cover
 
 GROUP_MEMBER_TOOL_NAME = "astrna_query_group_member_identity"
 GROUP_MANAGEMENT_TOOL_NAME = "astrna_query_group_management_identity"
+GROUP_MEMBER_BIRTHDAY_TOOL_NAME = "astrna_query_group_member_birthday"
+GROUP_UPCOMING_BIRTHDAYS_TOOL_NAME = "astrna_query_group_upcoming_birthdays"
+GROUP_IDENTITY_TOOL_NAMES = (
+    GROUP_MEMBER_TOOL_NAME,
+    GROUP_MANAGEMENT_TOOL_NAME,
+    GROUP_MEMBER_BIRTHDAY_TOOL_NAME,
+    GROUP_UPCOMING_BIRTHDAYS_TOOL_NAME,
+)
 GROUP_MANAGEMENT_SCOPES = {"all", "owner", "admin"}
 GROUP_MEMBER_CANDIDATE_LIMIT = 8
+GROUP_BIRTHDAY_LOOKUP_CONCURRENCY = 5
+GROUP_UPCOMING_BIRTHDAY_DEFAULT_DAYS = 7
+GROUP_UPCOMING_BIRTHDAY_MAX_DAYS = 366
 QQ_ID_PATTERN = re.compile(r"\d{5,12}")
 
 
@@ -50,6 +64,8 @@ class GroupIdentityToolsModule:
             add_llm_tools(
                 QueryGroupMemberIdentityTool(logger=self.logger),
                 QueryGroupManagementIdentityTool(logger=self.logger),
+                QueryGroupMemberBirthdayTool(logger=self.logger),
+                QueryGroupUpcomingBirthdaysTool(logger=self.logger),
             )
         except Exception as exc:
             self._log(
@@ -68,7 +84,7 @@ class GroupIdentityToolsModule:
             return
         unregister_llm_tool = getattr(self.context, "unregister_llm_tool", None)
         if callable(unregister_llm_tool):
-            for name in (GROUP_MEMBER_TOOL_NAME, GROUP_MANAGEMENT_TOOL_NAME):
+            for name in GROUP_IDENTITY_TOOL_NAMES:
                 try:
                     unregister_llm_tool(name)
                 except Exception as exc:
@@ -151,6 +167,72 @@ if FunctionTool is not None:
                 logger=self.logger,
             )
 
+
+    @dataclass
+    class QueryGroupMemberBirthdayTool(FunctionTool):  # type: ignore[misc]
+        logger: Any = None
+        name: str = GROUP_MEMBER_BIRTHDAY_TOOL_NAME
+        description: str = (
+            "查询当前群内某个成员的生日月日。"
+            "只有用户询问群友生日、某个人生日或群成员生日时才调用。"
+            "只能查询当前会话所在群，不支持跨群查询；不会返回生日年份。"
+        )
+        parameters: dict[str, Any] = field(
+            default_factory=lambda: {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": (
+                            "要查询的成员，可以是 QQ 号、@ 文本、群昵称或账号昵称；"
+                            "留空表示查询本轮发言人。"
+                        ),
+                    },
+                },
+            },
+        )
+
+        async def run(self, event: Any, target: str = "") -> str:
+            return await query_group_member_birthday(
+                event,
+                target=target,
+                logger=self.logger,
+            )
+
+
+    @dataclass
+    class QueryGroupUpcomingBirthdaysTool(FunctionTool):  # type: ignore[misc]
+        logger: Any = None
+        name: str = GROUP_UPCOMING_BIRTHDAYS_TOOL_NAME
+        description: str = (
+            "查询当前群未来一段时间内过生日的成员。"
+            "只有用户询问最近、未来或接下来多少天内有没有群友生日时才调用。"
+            "只能查询当前会话所在群，不支持跨群查询；不会返回生日年份。"
+            "days 默认 7 天，允许 1 到 366 天。"
+        )
+        parameters: dict[str, Any] = field(
+            default_factory=lambda: {
+                "type": "object",
+                "properties": {
+                    "days": {
+                        "type": "integer",
+                        "description": (
+                            "向后查询的天数，包含今天；默认 7，范围 1 到 366。"
+                            "非法输入会按默认 7 天处理。"
+                        ),
+                    },
+                },
+            },
+        )
+
+        async def run(self, event: Any, days: int = 7) -> str:
+            return await query_group_upcoming_birthdays(
+                event,
+                days=days,
+                logger=self.logger,
+            )
+
+
 else:
 
     @dataclass
@@ -217,6 +299,71 @@ else:
             )
 
 
+    @dataclass
+    class QueryGroupMemberBirthdayTool:
+        logger: Any = None
+        name: str = GROUP_MEMBER_BIRTHDAY_TOOL_NAME
+        description: str = (
+            "查询当前群内某个成员的生日月日。"
+            "只有用户询问群友生日、某个人生日或群成员生日时才调用。"
+            "只能查询当前会话所在群，不支持跨群查询；不会返回生日年份。"
+        )
+        parameters: dict[str, Any] = field(
+            default_factory=lambda: {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": (
+                            "要查询的成员，可以是 QQ 号、@ 文本、群昵称或账号昵称；"
+                            "留空表示查询本轮发言人。"
+                        ),
+                    },
+                },
+            },
+        )
+
+        async def run(self, event: Any, target: str = "") -> str:
+            return await query_group_member_birthday(
+                event,
+                target=target,
+                logger=self.logger,
+            )
+
+
+    @dataclass
+    class QueryGroupUpcomingBirthdaysTool:
+        logger: Any = None
+        name: str = GROUP_UPCOMING_BIRTHDAYS_TOOL_NAME
+        description: str = (
+            "查询当前群未来一段时间内过生日的成员。"
+            "只有用户询问最近、未来或接下来多少天内有没有群友生日时才调用。"
+            "只能查询当前会话所在群，不支持跨群查询；不会返回生日年份。"
+            "days 默认 7 天，允许 1 到 366 天。"
+        )
+        parameters: dict[str, Any] = field(
+            default_factory=lambda: {
+                "type": "object",
+                "properties": {
+                    "days": {
+                        "type": "integer",
+                        "description": (
+                            "向后查询的天数，包含今天；默认 7，范围 1 到 366。"
+                            "非法输入会按默认 7 天处理。"
+                        ),
+                    },
+                },
+            },
+        )
+
+        async def run(self, event: Any, days: int = 7) -> str:
+            return await query_group_upcoming_birthdays(
+                event,
+                days=days,
+                logger=self.logger,
+            )
+
+
 async def query_group_member_identity(
     event: Any,
     *,
@@ -227,40 +374,22 @@ async def query_group_member_identity(
     if context.error:
         return format_tool_result({"ok": False, "error": context.error})
 
-    target_text = sanitize_metadata_value(target).strip()
     try:
-        if not target_text:
-            user_id = context.sender_user_id
-            member = await fetch_group_member_info(context, user_id)
-        else:
-            user_id = extract_user_id(target_text)
-            if user_id:
-                member = await fetch_group_member_info(context, user_id)
-            else:
-                member_list = await fetch_group_member_list(context)
-                resolution = resolve_member_by_name(member_list, target_text)
-                if resolution.error:
-                    result: dict[str, Any] = {
-                        "ok": False,
-                        "error": resolution.error,
-                    }
-                    if resolution.candidates:
-                        result["candidates"] = [
-                            build_member_candidate(candidate)
-                            for candidate in resolution.candidates[
-                                :GROUP_MEMBER_CANDIDATE_LIMIT
-                            ]
-                        ]
-                    return format_tool_result(result)
-                member = resolution.member
-                if member is None:
-                    return format_tool_result(
-                        {"ok": False, "error": "member_not_found"},
-                    )
+        resolution = await resolve_member_for_query(context, target)
     except Exception as exc:
         log_query_failure(logger, "member", exc)
         return format_tool_result({"ok": False, "error": "query_failed"})
 
+    if resolution.error:
+        result: dict[str, Any] = {"ok": False, "error": resolution.error}
+        if resolution.candidates:
+            result["candidates"] = [
+                build_member_candidate(candidate)
+                for candidate in resolution.candidates[:GROUP_MEMBER_CANDIDATE_LIMIT]
+            ]
+        return format_tool_result(result)
+
+    member = resolution.member
     result = build_member_result(context, member)
     if result is None:
         return format_tool_result({"ok": False, "error": "member_not_found"})
@@ -308,6 +437,85 @@ async def query_group_management_identity(
             payload for member in admins if (payload := build_member_payload(member))
         ]
     return format_tool_result(result)
+
+
+async def query_group_member_birthday(
+    event: Any,
+    *,
+    target: Any = "",
+    logger: Any | None = None,
+) -> str:
+    context = get_group_query_context(event)
+    if context.error:
+        return format_tool_result({"ok": False, "error": context.error})
+
+    try:
+        resolution = await resolve_member_for_query(context, target)
+    except Exception as exc:
+        log_query_failure(logger, "member_birthday", exc)
+        return format_tool_result({"ok": False, "error": "query_failed"})
+
+    if resolution.error:
+        result: dict[str, Any] = {"ok": False, "error": resolution.error}
+        if resolution.candidates:
+            result["candidates"] = [
+                build_member_candidate(candidate)
+                for candidate in resolution.candidates[:GROUP_MEMBER_CANDIDATE_LIMIT]
+            ]
+        return format_tool_result(result)
+
+    member = resolution.member
+    user = build_member_user_payload(member)
+    if member is None or user is None:
+        return format_tool_result({"ok": False, "error": "member_not_found"})
+
+    birthday = await fetch_member_birthday(context, member, logger=logger)
+    if birthday is None:
+        return format_tool_result({"ok": False, "error": "birthday_not_found"})
+
+    return format_tool_result(
+        {
+            "ok": True,
+            "user": user,
+            "group": build_group_metadata(context, include_name=True),
+            "birthday": birthday,
+        },
+    )
+
+
+async def query_group_upcoming_birthdays(
+    event: Any,
+    *,
+    days: Any = GROUP_UPCOMING_BIRTHDAY_DEFAULT_DAYS,
+    logger: Any | None = None,
+    today: date | None = None,
+) -> str:
+    context = get_group_query_context(event)
+    if context.error:
+        return format_tool_result({"ok": False, "error": context.error})
+
+    normalized_days = normalize_upcoming_days(days)
+    try:
+        members = await fetch_group_member_list(context)
+    except Exception as exc:
+        log_query_failure(logger, "upcoming_birthdays", exc)
+        return format_tool_result({"ok": False, "error": "query_failed"})
+
+    birthdays = await collect_upcoming_birthdays(
+        context,
+        members,
+        normalized_days,
+        today or date.today(),
+        logger=logger,
+    )
+    return format_tool_result(
+        {
+            "ok": True,
+            "group": build_group_metadata(context, include_name=True),
+            "days": normalized_days,
+            "birthdays": birthdays,
+        },
+    )
 
 
 @dataclass(frozen=True)
@@ -383,6 +591,143 @@ async def fetch_group_member_list(context: GroupQueryContext) -> list[dict[str, 
     if not isinstance(members, list):
         return []
     return [member for member in members if isinstance(member, dict)]
+
+
+async def resolve_member_for_query(
+    context: GroupQueryContext,
+    target: Any,
+) -> MemberResolution:
+    target_text = sanitize_metadata_value(target).strip()
+    if not target_text:
+        member = await fetch_group_member_info(context, context.sender_user_id)
+        if member is None:
+            return MemberResolution(error="member_not_found")
+        return MemberResolution(member=member)
+
+    user_id = extract_user_id(target_text)
+    if user_id:
+        member = await fetch_group_member_info(context, user_id)
+        if member is None:
+            return MemberResolution(error="member_not_found")
+        return MemberResolution(member=member)
+
+    member_list = await fetch_group_member_list(context)
+    return resolve_member_by_name(member_list, target_text)
+
+
+async def fetch_member_birthday(
+    context: GroupQueryContext,
+    member: dict[str, Any],
+    *,
+    logger: Any | None = None,
+) -> dict[str, str] | None:
+    user_id = member.get("user_id")
+    if not user_id:
+        return None
+    return await fetch_user_birthday(
+        context.event,
+        user_id=user_id,
+        self_id=context.self_id,
+        logger=logger,
+    )
+
+
+async def collect_upcoming_birthdays(
+    context: GroupQueryContext,
+    members: list[dict[str, Any]],
+    days: int,
+    today: date,
+    *,
+    logger: Any | None = None,
+) -> list[dict[str, Any]]:
+    semaphore = asyncio.Semaphore(GROUP_BIRTHDAY_LOOKUP_CONCURRENCY)
+
+    async def collect_one(member: dict[str, Any]) -> dict[str, Any] | None:
+        user = build_member_user_payload(member)
+        if user is None:
+            return None
+        async with semaphore:
+            birthday = await fetch_member_birthday(context, member, logger=logger)
+        if birthday is None:
+            return None
+
+        days_until = days_until_birthday(birthday, today)
+        if days_until is None or days_until >= days:
+            return None
+
+        return {
+            "user": user,
+            "birthday": birthday,
+            "days_until": days_until,
+        }
+
+    collected = await asyncio.gather(
+        *(collect_one(member) for member in members),
+        return_exceptions=True,
+    )
+    birthdays: list[dict[str, Any]] = []
+    for item in collected:
+        if isinstance(item, Exception):
+            log_query_failure(logger, "upcoming_birthdays_member", item)
+            continue
+        if item is not None:
+            birthdays.append(item)
+
+    birthdays.sort(key=sort_upcoming_birthday_key)
+    return birthdays
+
+
+def normalize_upcoming_days(days: Any) -> int:
+    if isinstance(days, bool):
+        return GROUP_UPCOMING_BIRTHDAY_DEFAULT_DAYS
+    try:
+        number = int(days)
+    except (TypeError, ValueError):
+        return GROUP_UPCOMING_BIRTHDAY_DEFAULT_DAYS
+    if not 1 <= number <= GROUP_UPCOMING_BIRTHDAY_MAX_DAYS:
+        return GROUP_UPCOMING_BIRTHDAY_DEFAULT_DAYS
+    return number
+
+
+def days_until_birthday(birthday: dict[str, str], today: date) -> int | None:
+    try:
+        month = int(birthday["month"])
+        day = int(birthday["day"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    for year in range(today.year, today.year + 5):
+        try:
+            birthday_date = date(year, month, day)
+        except ValueError:
+            continue
+        if birthday_date >= today:
+            return (birthday_date - today).days
+    return None
+
+
+def sort_upcoming_birthday_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    birthday = item.get("birthday")
+    user = item.get("user")
+    month = birthday.get("month", "") if isinstance(birthday, dict) else ""
+    day = birthday.get("day", "") if isinstance(birthday, dict) else ""
+    nickname = user.get("nickname", "") if isinstance(user, dict) else ""
+    user_id = user.get("user_id", "") if isinstance(user, dict) else ""
+    try:
+        month_number = int(month)
+    except (TypeError, ValueError):
+        month_number = 0
+    try:
+        day_number = int(day)
+    except (TypeError, ValueError):
+        day_number = 0
+    return (
+        item.get("days_until", GROUP_UPCOMING_BIRTHDAY_MAX_DAYS + 1),
+        month_number,
+        day_number,
+        nickname,
+        user_id,
+    )
 
 
 def extract_user_id(target: str) -> str | None:
@@ -467,8 +812,25 @@ def build_member_payload(member: dict[str, Any] | None) -> dict[str, Any] | None
     if identity is None:
         return None
 
+    user = build_member_user_payload(member)
+    if user is None:
+        return None
+
+    return {
+        "user": user,
+        "member": identity,
+    }
+
+
+def build_member_user_payload(member: dict[str, Any] | None) -> dict[str, str] | None:
+    if not isinstance(member, dict):
+        return None
+
     user: dict[str, str] = {}
-    put_required(user, "user_id", member.get("user_id"))
+    user_id = sanitize_metadata_value(member.get("user_id"))
+    if not user_id:
+        return None
+    user["user_id"] = user_id
     display_nickname = sanitize_optional_metadata_value(
         member.get("card"),
     ) or sanitize_metadata_value(member.get("nickname"))
@@ -477,10 +839,7 @@ def build_member_payload(member: dict[str, Any] | None) -> dict[str, Any] | None
     if account_nickname and account_nickname != display_nickname:
         user["account_nickname"] = account_nickname
 
-    return {
-        "user": user,
-        "member": identity,
-    }
+    return user
 
 
 def build_member_identity(member: dict[str, Any]) -> dict[str, str] | None:
@@ -515,7 +874,11 @@ def build_member_candidate(member: dict[str, Any]) -> dict[str, str]:
     put_optional(candidate, "nickname", member.get("card") or member.get("nickname"))
     put_optional(candidate, "account_nickname", member.get("nickname"))
     put_optional(candidate, "role", member.get("role"))
-    put_optional(candidate, "role_name", ROLE_NAME_MAP.get(str(member.get("role", ""))))
+    put_optional(
+        candidate,
+        "role_name",
+        ROLE_NAME_MAP.get(str(member.get("role", ""))),
+    )
     return candidate
 
 
