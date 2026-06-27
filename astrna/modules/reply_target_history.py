@@ -446,27 +446,19 @@ class ReplyTargetHistoryModule:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-        try:
-            signature = inspect.signature(original_method)
-            bound = signature.bind_partial(*args, **kwargs)
-        except Exception:  # noqa: BLE001
-            bound = None
+        parsed = parse_save_history_call(original_method, args, kwargs)
+        if parsed is None:
+            return args, kwargs
 
-        if bound is not None and "all_messages" in bound.arguments:
-            all_messages = bound.arguments["all_messages"]
-            event = bound.arguments.get("event")
-            req = bound.arguments.get("req")
-            optimized_messages = await self.optimize_messages_for_history(
-                event,
-                req,
-                all_messages,
-            )
-            if optimized_messages is all_messages:
-                return args, kwargs
-            bound.arguments["all_messages"] = optimized_messages
-            return rebuild_call_from_bound(signature, bound, args, kwargs)
-
-        return args, kwargs
+        event, req, all_messages, setter = parsed
+        optimized_messages = await self.optimize_messages_for_history(
+            event,
+            req,
+            all_messages,
+        )
+        if optimized_messages is all_messages:
+            return args, kwargs
+        return setter(optimized_messages)
 
     async def remember_reply_target(
         self,
@@ -900,6 +892,81 @@ def rebuild_call_from_bound(
         keyword_args.setdefault(key, value)
 
     return tuple(positional_args), keyword_args
+
+
+def parse_save_history_call(
+    original_method: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[Any, Any, Any, Any] | None:
+    event = kwargs.get("event")
+    req = kwargs.get("req")
+    all_messages = kwargs.get("all_messages")
+    signature = None
+    bound = None
+
+    if callable(original_method):
+        try:
+            signature = inspect.signature(original_method)
+            bound = signature.bind_partial(*args, **kwargs)
+        except Exception:  # noqa: BLE001
+            bound = None
+        if bound is not None:
+            event = bound.arguments.get("event", event)
+            req = bound.arguments.get("req", req)
+            all_messages = bound.arguments.get("all_messages", all_messages)
+
+    if event is None and len(args) > 1:
+        event = args[1]
+    if req is None and len(args) > 2:
+        req = args[2]
+    if all_messages is None and len(args) > 4:
+        all_messages = args[4]
+
+    if all_messages is None:
+        return None
+
+    def set_messages(value: Any) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        if "all_messages" in kwargs:
+            updated_kwargs = dict(kwargs)
+            updated_kwargs["all_messages"] = value
+            return args, updated_kwargs
+        if bound is not None and signature is not None:
+            if "all_messages" in bound.arguments:
+                bound.arguments["all_messages"] = value
+                return rebuild_call_from_bound(signature, bound, args, kwargs)
+            for name, parameter in signature.parameters.items():
+                if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+                    wrapped_args = bound.arguments.get(name)
+                    if isinstance(wrapped_args, tuple) and len(wrapped_args) > 4:
+                        updated_wrapped_args = list(wrapped_args)
+                        updated_wrapped_args[4] = value
+                        bound.arguments[name] = tuple(updated_wrapped_args)
+                        return rebuild_call_from_bound(signature, bound, args, kwargs)
+                elif parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                    wrapped_kwargs = bound.arguments.get(name)
+                    if isinstance(wrapped_kwargs, dict) and "all_messages" in wrapped_kwargs:
+                        updated_wrapped_kwargs = dict(wrapped_kwargs)
+                        updated_wrapped_kwargs["all_messages"] = value
+                        bound.arguments[name] = updated_wrapped_kwargs
+                        return rebuild_call_from_bound(signature, bound, args, kwargs)
+        return replace_positional_all_messages(args, kwargs, value)
+
+    return event, req, all_messages, set_messages
+
+
+def replace_positional_all_messages(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    all_messages: Any,
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    if len(args) > 4:
+        updated_args = list(args)
+        updated_args[4] = all_messages
+        return tuple(updated_args), kwargs
+    updated_kwargs = dict(kwargs)
+    updated_kwargs["all_messages"] = all_messages
+    return args, updated_kwargs
 
 
 def find_last_persistable_assistant_message_index(messages: list[Any]) -> int | None:

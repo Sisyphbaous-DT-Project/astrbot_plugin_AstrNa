@@ -90,6 +90,12 @@
     "hint": "开启后，AstrNa 会观察其他插件对 system_prompt 的注入内容；如果同一注入位置连续 3 次注入的动态内容都不同，并且能安全识别为纯追加或前置追加，就会持久化接管该注入位置，把后续完整动态语义块迁移到 extra_user_content_parts，并标记为临时内容，尽量减少动态 system prompt 对 LLM prompt cache 命中的影响。当前采用保守的段落/换行边界识别：固定不变的提示词会继续保留在 system_prompt，拿不准时会整体迁移动态追加内容，避免只迁移零散变化字符；复杂重写、删除或替换只记录日志并跳过。未来会继续改进语义块识别能力。默认关闭。",
     "default": false
   },
+  "optimize_image_history_context": {
+    "type": "bool",
+    "description": "优化图片历史上下文",
+    "hint": "开启后，AstrNa 会在每轮 LLM 请求前清理会话历史里的旧图片 base64，并在 AstrBot 保存历史前阻止新的 data:image/...;base64 图片块落库：旧图片会替换成“[历史图片：已省略原始图像，仅保留占位符]”，普通文本、图片说明和其他上下文保持不变。本轮用户新发图片、当前引用图片仍会照常进入视觉模型或图片转述流程；该功能只处理已进入 conversation history 的历史图片，避免旧图在普通后续对话里反复撑爆 token。默认关闭。",
+    "default": false
+  },
   "optimize_group_chat_context": {
     "type": "bool",
     "description": "群聊上下文优化",

@@ -383,6 +383,34 @@ def test_repeated_install_does_not_stack_patches(internal_module, astr_main_agen
     assert astr_main_agent._process_quote_message is quote_patch
 
 
+def test_reply_target_history_saves_marker_when_installed_outside_existing_wrapper(
+    internal_module,
+):
+    from astrna.modules.image_history_context import ImageHistoryContextModule
+
+    original = internal_module.InternalAgentSubStage._save_to_history
+    image_module = ImageHistoryContextModule(logger=DummyLogger())
+    reply_module = ReplyTargetHistoryModule(logger=DummyLogger(), semantic_enabled=True)
+
+    image_module.install()
+    after_image = internal_module.InternalAgentSubStage._save_to_history
+    reply_module.install()
+    after_reply = internal_module.InternalAgentSubStage._save_to_history
+
+    assert after_image is not original
+    assert after_reply is not after_image
+
+    stage = internal_module.InternalAgentSubStage()
+    run(stage._save_to_history(DummyEvent(), object(), object(), [Message("assistant", "回复")], None))
+
+    assert stage.saved[0]["all_messages"][-1].content == "回复"
+
+    reply_module.terminate()
+    assert internal_module.InternalAgentSubStage._save_to_history is after_image
+    image_module.terminate()
+    assert internal_module.InternalAgentSubStage._save_to_history is original
+
+
 def test_clean_assistant_message_keeps_original_object_when_only_indexing(
     internal_module,
 ):

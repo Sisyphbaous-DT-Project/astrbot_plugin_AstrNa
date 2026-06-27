@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.2.3"
+    assert metadata["version"] == "1.2.4"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -39,6 +39,7 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "forward_node_hard_limit",
         "optimize_long_reply_context",
         "optimize_dynamic_system_prompt",
+        "optimize_image_history_context",
         "optimize_group_chat_context",
         "group_chat_context_compress_provider_id",
         "optimize_image_caption",
@@ -105,6 +106,15 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         == "AstrBot插件缓存优化"
     )
     assert schema["optimize_dynamic_system_prompt"]["default"] is False
+    assert schema["optimize_image_history_context"]["type"] == "bool"
+    assert (
+        schema["optimize_image_history_context"]["description"]
+        == "优化图片历史上下文"
+    )
+    assert schema["optimize_image_history_context"]["default"] is False
+    assert "data:image" in schema["optimize_image_history_context"]["hint"]
+    assert "本轮用户新发图片" in schema["optimize_image_history_context"]["hint"]
+    assert "默认关闭" in schema["optimize_image_history_context"]["hint"]
     assert schema["optimize_group_chat_context"]["type"] == "bool"
     assert schema["optimize_group_chat_context"]["description"] == "群聊上下文优化"
     assert schema["optimize_group_chat_context"]["default"] is False
@@ -227,3 +237,4 @@ def test_changelog_contains_release_notes():
     assert "## 1.2.1" in changelog
     assert "## 1.2.2" in changelog
     assert "## 1.2.3" in changelog
+    assert "## 1.2.4" in changelog

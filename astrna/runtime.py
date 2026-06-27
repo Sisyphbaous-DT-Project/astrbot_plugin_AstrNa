@@ -10,6 +10,7 @@ from .modules.forward_nodes import (
     ForwardNodesModule,
 )
 from .modules.image_caption import ImageCaptionModule
+from .modules.image_history_context import ImageHistoryContextModule
 from .modules.group_identity_tools import GroupIdentityToolsModule
 from .modules.group_chat_context_optimizer import GroupChatContextOptimizerModule
 from .modules.group_sender_concurrency import GroupSenderConcurrencyModule
@@ -31,6 +32,7 @@ DEFAULT_CONFIG = {
     "forward_node_max_length": FORWARD_NODE_MAX_LENGTH_DEFAULT,
     "forward_node_hard_limit": FORWARD_NODE_HARD_LIMIT_DEFAULT,
     "optimize_dynamic_system_prompt": False,
+    "optimize_image_history_context": False,
     "optimize_image_caption": False,
     "optimize_send_message_to_user": False,
     "provide_group_identity_tools": False,
@@ -70,6 +72,7 @@ class AstrNaRuntime:
             logger=logger,
             kv_store=kv_store,
         )
+        self.image_history_context = ImageHistoryContextModule(logger=logger)
         self.image_caption = ImageCaptionModule(logger=logger)
         self.send_message_to_user = SendMessageToUserModule(logger=logger)
         self.group_identity_tools = GroupIdentityToolsModule(
@@ -101,6 +104,8 @@ class AstrNaRuntime:
             self.forward_nodes.install()
         if self.config.get("optimize_dynamic_system_prompt", False):
             self.dynamic_system_prompt.install()
+        if self.config.get("optimize_image_history_context", False):
+            self.image_history_context.install()
         self.reply_target_history.install()
         if self.config.get("fix_deepseek_v4_400", False):
             self.deepseek_v4_400.install()
@@ -118,6 +123,12 @@ class AstrNaRuntime:
             self.group_chat_context_optimizer.install()
 
     async def sanitize_request(self, event: Any, req: Any) -> None:
+        if self.config.get("optimize_image_history_context", False):
+            self.image_history_context.install()
+            self.image_history_context.sanitize_request(req)
+        else:
+            self.image_history_context.terminate()
+
         if self.config.get("optimize_dynamic_system_prompt", False):
             self.dynamic_system_prompt.install()
         if self.config.get("optimize_send_message_to_user", False):
@@ -271,6 +282,7 @@ class AstrNaRuntime:
         self.long_reply_context.terminate()
         self.forward_nodes.terminate()
         self.dynamic_system_prompt.terminate()
+        self.image_history_context.terminate()
         self.image_caption.terminate()
         self.send_message_to_user.terminate()
         self.group_identity_tools.terminate()

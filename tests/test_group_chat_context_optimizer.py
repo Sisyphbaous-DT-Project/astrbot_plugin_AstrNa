@@ -323,6 +323,43 @@ def test_enabled_replaces_original_group_context_with_compressed_text(
     ]
 
 
+def test_compress_prompt_uses_sanitized_image_history_context(
+    astrbot_group_context_modules,
+):
+    from astrna.modules.image_history_context import (
+        IMAGE_HISTORY_PLACEHOLDER,
+        ImageHistoryContextModule,
+    )
+
+    provider = DummyProvider(valid_compressed_text())
+    module = build_module(provider)
+    module.install()
+
+    base64_image = "data:image/jpeg;base64," + "a" * 64
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_group_records(group_context, event)
+    req = DummyReq()
+    req.contexts = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "旧图在这里"},
+                {"type": "image_url", "image_url": {"url": base64_image}},
+            ],
+        },
+    ]
+
+    ImageHistoryContextModule(logger=DummyLogger()).sanitize_request(req)
+    run(group_context.on_req_llm(event, req))
+
+    assert len(provider.calls) == 1
+    prompt = provider.calls[0]["prompt"]
+    assert base64_image not in prompt
+    assert IMAGE_HISTORY_PLACEHOLDER in prompt
+    assert "旧图在这里" in prompt
+
+
 def test_provider_missing_does_not_inject_original_group_context(
     astrbot_group_context_modules,
 ):
