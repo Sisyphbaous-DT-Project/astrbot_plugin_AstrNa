@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.2.1"
+    assert metadata["version"] == "1.2.2"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -39,6 +39,8 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "forward_node_hard_limit",
         "optimize_long_reply_context",
         "optimize_dynamic_system_prompt",
+        "optimize_group_chat_context",
+        "group_chat_context_compress_provider_id",
         "optimize_image_caption",
         "optimize_send_message_to_user",
         "provide_group_identity_tools",
@@ -103,6 +105,23 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         == "AstrBot插件缓存优化"
     )
     assert schema["optimize_dynamic_system_prompt"]["default"] is False
+    assert schema["optimize_group_chat_context"]["type"] == "bool"
+    assert schema["optimize_group_chat_context"]["description"] == "群聊上下文优化"
+    assert schema["optimize_group_chat_context"]["default"] is False
+    assert "回复建议" in schema["optimize_group_chat_context"]["hint"]
+    assert schema["group_chat_context_compress_provider_id"]["type"] == "string"
+    assert (
+        schema["group_chat_context_compress_provider_id"]["description"]
+        == "群聊上下文压缩模型"
+    )
+    assert schema["group_chat_context_compress_provider_id"]["default"] == ""
+    assert schema["group_chat_context_compress_provider_id"]["_special"] == "select_provider"
+    assert schema["group_chat_context_compress_provider_id"]["collapsed"] is True
+    assert schema["group_chat_context_compress_provider_id"]["condition"] == {
+        "optimize_group_chat_context": True,
+    }
+    assert "deepseek-v4-flash" in schema["group_chat_context_compress_provider_id"]["hint"]
+    assert "全部沿用 AstrBot 当前" in schema["group_chat_context_compress_provider_id"]["hint"]
     assert schema["optimize_image_caption"]["type"] == "bool"
     assert schema["optimize_image_caption"]["description"] == "更好的图像转述"
     assert schema["optimize_image_caption"]["default"] is False
@@ -203,3 +222,4 @@ def test_changelog_contains_release_notes():
     assert "## 1.1.8" in changelog
     assert "## 1.1.9" in changelog
     assert "## 1.2.1" in changelog
+    assert "## 1.2.2" in changelog

@@ -11,6 +11,7 @@ from .modules.forward_nodes import (
 )
 from .modules.image_caption import ImageCaptionModule
 from .modules.group_identity_tools import GroupIdentityToolsModule
+from .modules.group_chat_context_optimizer import GroupChatContextOptimizerModule
 from .modules.group_sender_concurrency import GroupSenderConcurrencyModule
 from .modules.identity_metadata import IdentityMetadataModule
 from .modules.issue_assistant import IssueAssistantModule
@@ -36,6 +37,8 @@ DEFAULT_CONFIG = {
     "optimize_reply_target_history": False,
     "optimize_long_reply_context": False,
     "unlock_group_sender_concurrency": False,
+    "optimize_group_chat_context": False,
+    "group_chat_context_compress_provider_id": "",
     "issue_assistant_enabled": False,
     "issue_assistant_devkit_enabled": False,
     "issue_assistant_github_token": "",
@@ -75,6 +78,11 @@ class AstrNaRuntime:
         )
         self.group_sender_concurrency = GroupSenderConcurrencyModule(logger=logger)
         self.long_reply_context = LongReplyContextModule(logger=logger)
+        self.group_chat_context_optimizer = GroupChatContextOptimizerModule(
+            context=context,
+            logger=logger,
+            provider_id=self.config.get("group_chat_context_compress_provider_id", ""),
+        )
         self.issue_assistant = IssueAssistantModule(
             context=context,
             logger=logger,
@@ -106,6 +114,8 @@ class AstrNaRuntime:
             self.long_reply_context.install()
         if self.config.get("unlock_group_sender_concurrency", False):
             self.group_sender_concurrency.install()
+        if self.config.get("optimize_group_chat_context", False):
+            self.group_chat_context_optimizer.install()
 
     async def sanitize_request(self, event: Any, req: Any) -> None:
         if self.config.get("optimize_dynamic_system_prompt", False):
@@ -150,6 +160,14 @@ class AstrNaRuntime:
             self.group_sender_concurrency.install()
         else:
             self.group_sender_concurrency.terminate()
+
+        self.group_chat_context_optimizer.configure(
+            provider_id=self.config.get("group_chat_context_compress_provider_id", ""),
+        )
+        if self.config.get("optimize_group_chat_context", False):
+            self.group_chat_context_optimizer.install()
+        else:
+            self.group_chat_context_optimizer.terminate()
 
         if self.config.get("optimize_identity_metadata", False):
             account_nickname_display = self.config.get(
@@ -249,6 +267,7 @@ class AstrNaRuntime:
     async def terminate(self) -> None:
         await self.issue_assistant.terminate()
         self.group_sender_concurrency.terminate()
+        self.group_chat_context_optimizer.terminate()
         self.long_reply_context.terminate()
         self.forward_nodes.terminate()
         self.dynamic_system_prompt.terminate()
