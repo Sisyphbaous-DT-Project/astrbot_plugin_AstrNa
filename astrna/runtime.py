@@ -13,6 +13,7 @@ from .modules.image_caption import ImageCaptionModule
 from .modules.group_identity_tools import GroupIdentityToolsModule
 from .modules.group_sender_concurrency import GroupSenderConcurrencyModule
 from .modules.identity_metadata import IdentityMetadataModule
+from .modules.issue_assistant import IssueAssistantModule
 from .modules.long_reply_context import LongReplyContextModule
 from .modules.reply_target_history import ReplyTargetHistoryModule
 from .modules.send_message_to_user import SendMessageToUserModule
@@ -35,6 +36,10 @@ DEFAULT_CONFIG = {
     "optimize_reply_target_history": False,
     "optimize_long_reply_context": False,
     "unlock_group_sender_concurrency": False,
+    "issue_assistant_enabled": False,
+    "issue_assistant_devkit_enabled": False,
+    "issue_assistant_github_token": "",
+    "issue_assistant_target_umo": "",
 }
 
 
@@ -70,6 +75,15 @@ class AstrNaRuntime:
         )
         self.group_sender_concurrency = GroupSenderConcurrencyModule(logger=logger)
         self.long_reply_context = LongReplyContextModule(logger=logger)
+        self.issue_assistant = IssueAssistantModule(
+            context=context,
+            logger=logger,
+            kv_store=kv_store,
+            enabled=self.config.get("issue_assistant_enabled", False),
+            devkit_enabled=self.config.get("issue_assistant_devkit_enabled", False),
+            github_token=self.config.get("issue_assistant_github_token", ""),
+            target_umo=self.config.get("issue_assistant_target_umo", ""),
+        )
         self.reply_target_history = ReplyTargetHistoryModule(
             logger=logger,
             kv_store=kv_store,
@@ -99,6 +113,9 @@ class AstrNaRuntime:
         if self.config.get("optimize_send_message_to_user", False):
             self.send_message_to_user.install()
             self.send_message_to_user.prepare_request(event, req)
+
+        self._configure_issue_assistant()
+        await self.issue_assistant.prepare_request(event, req)
 
         self.reply_target_history.set_semantic_enabled(
             self.config.get("optimize_reply_target_history", False),
@@ -157,7 +174,80 @@ class AstrNaRuntime:
                 ),
             )
 
+    async def handle_plugin_error(
+        self,
+        event: Any,
+        plugin_name: str,
+        handler_name: str,
+        error: BaseException,
+        traceback_text: str,
+    ) -> None:
+        self.issue_assistant.configure(
+            enabled=self.config.get("issue_assistant_enabled", False),
+            devkit_enabled=self.config.get("issue_assistant_devkit_enabled", False),
+            github_token=self.config.get("issue_assistant_github_token", ""),
+            target_umo=self.config.get("issue_assistant_target_umo", ""),
+        )
+        await self.issue_assistant.handle_plugin_error(
+            event,
+            plugin_name,
+            handler_name,
+            error,
+            traceback_text,
+        )
+
+    async def issue_latest(self, event: Any) -> str:
+        self._configure_issue_assistant()
+        if not self.config.get("issue_assistant_enabled", False):
+            return "AstrNa 自动报错分析与 Issue 助手尚未开启。"
+        return await self.issue_assistant.command_latest(event)
+
+    async def issue_draft(self, event: Any) -> str:
+        self._configure_issue_assistant()
+        if not self.config.get("issue_assistant_enabled", False):
+            return "AstrNa 自动报错分析与 Issue 助手尚未开启。"
+        return await self.issue_assistant.command_draft(event)
+
+    async def issue_ignore(self, event: Any) -> str:
+        self._configure_issue_assistant()
+        if not self.config.get("issue_assistant_enabled", False):
+            return "AstrNa 自动报错分析与 Issue 助手尚未开启。"
+        return await self.issue_assistant.command_ignore(event)
+
+    async def issue_analyze(self, event: Any) -> str:
+        self._configure_issue_assistant()
+        if not self.config.get("issue_assistant_enabled", False):
+            return "AstrNa 自动报错分析与 Issue 助手尚未开启。"
+        return await self.issue_assistant.command_analyze(event)
+
+    async def issue_edit(self, event: Any, note: str) -> str:
+        self._configure_issue_assistant()
+        if not self.config.get("issue_assistant_enabled", False):
+            return "AstrNa 自动报错分析与 Issue 助手尚未开启。"
+        return await self.issue_assistant.command_edit(event, note)
+
+    async def issue_submit(self, event: Any) -> str:
+        self._configure_issue_assistant()
+        if not self.config.get("issue_assistant_enabled", False):
+            return "AstrNa 自动报错分析与 Issue 助手尚未开启。"
+        return await self.issue_assistant.command_submit(event)
+
+    async def issue_cancel(self, event: Any) -> str:
+        self._configure_issue_assistant()
+        if not self.config.get("issue_assistant_enabled", False):
+            return "AstrNa 自动报错分析与 Issue 助手尚未开启。"
+        return await self.issue_assistant.command_cancel(event)
+
+    def _configure_issue_assistant(self) -> None:
+        self.issue_assistant.configure(
+            enabled=self.config.get("issue_assistant_enabled", False),
+            devkit_enabled=self.config.get("issue_assistant_devkit_enabled", False),
+            github_token=self.config.get("issue_assistant_github_token", ""),
+            target_umo=self.config.get("issue_assistant_target_umo", ""),
+        )
+
     async def terminate(self) -> None:
+        await self.issue_assistant.terminate()
         self.group_sender_concurrency.terminate()
         self.long_reply_context.terminate()
         self.forward_nodes.terminate()

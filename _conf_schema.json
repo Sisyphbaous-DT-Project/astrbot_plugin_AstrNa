@@ -111,7 +111,7 @@
   "optimize_reply_target_history": {
     "type": "bool",
     "description": "优化回复历史标记",
-    "hint": "⚠️ 这个功能仍在研究中，请谨慎启用；如果发现模型混淆当前发言人、引用消息发送者或回复接收者，请立刻关闭。开启后，AstrNa 会在本轮请求里临时注入中文回复指向说明，明确当前发言人、被引用消息发送者，以及被引用 Bot 回复原本回复给谁，帮助模型不要把这些对象混淆。AstrNa 也会在发给模型前临时清理旧历史里的内部标记，并移除模型误输出的内部标记，避免污染真实发送内容和后续历史。真实发送到聊天平台的消息不会改变；旧历史不会被批量迁移，只做本轮请求内清理。默认关闭。",
+    "hint": "开启后，AstrNa 会在本轮请求里临时注入中文回复指向说明，明确当前发言人、被引用消息发送者，以及被引用 Bot 回复原本回复给谁，帮助模型区分群聊里的回复对象。AstrNa 也会在发给模型前临时清理旧历史里的内部标记，并移除模型误输出的内部标记，避免污染真实发送内容和后续历史。真实发送到聊天平台的消息不会改变；旧历史不会被批量迁移，只做本轮请求内清理。默认关闭。",
     "default": false
   },
   "unlock_group_sender_concurrency": {
@@ -119,5 +119,41 @@
     "description": "解锁群聊并发回复（实验性）",
     "hint": "⚠️ 实验性功能，请谨慎启用。AstrBot 默认会让同一个群或私聊里的 LLM 回复一条一条排队；开启后，AstrNa 会把群聊里的排队粒度改成“按群友分别排队”，让同一个群内不同群友可以并发触发 Bot 回复。同一群友连续发消息仍然串行，私聊仍然串行。此功能会调整消息处理时序；与消息防抖、分段回复、合并转发、主动消息或其他可能改写/延迟/取消消息流程的插件同时开启时请格外谨慎，若出现回复顺序、上下文或历史记录异常，请立刻关闭。本功能会尽量保留防抖插件的合并消息和取消旧回复逻辑，但无法保证兼容所有干扰消息流水线的插件。默认关闭。",
     "default": false
+  },
+  "issue_assistant_enabled": {
+    "type": "bool",
+    "description": "自动报错分析与 Issue 助手（实验性）",
+    "hint": "⚠️ 实验性功能，默认关闭。开启后，AstrNa 会在插件处理消息报错时读取已脱敏 traceback，调用当前 LLM 判断是否是真实问题，并在需要时提醒触发本轮消息的用户；后续忽略、源码分析、生成草稿和提交 Issue 都需要触发者或管理员确认。群聊提醒会发送到当前会话，群成员可能都能看到。第一版主要处理 AstrBot on_plugin_error 能捕获的插件报错，Core 级日志会提示用户临时开启 DEBUG/文件日志后补充复现信息。发送给 LLM 和 GitHub Issue 正文的内容都会先脱敏，但提交前仍建议人工检查；脱敏可能遮盖部分有用数字。",
+    "default": false
+  },
+  "issue_assistant_devkit_enabled": {
+    "type": "bool",
+    "description": "提供阅读源码和修改源码的功能",
+    "hint": "开启后，AstrNa 会在自动报错分析与 Issue 助手流程中提供源码辅助分析入口。请先在插件市场搜索并安装并启用弥亚开发工具箱至少 2.6.0 版本；推荐先把维护者配置为 AstrBot 管理员，弥亚开发工具箱保持默认工具组全开通常即可使用。若使用者不是 AstrBot 管理员，需要在弥亚开发工具箱 allowed_ids 中额外放行该用户；若开启了弥亚开发工具箱分群配置，请确认当前群聊或私聊没有禁用 safe_read、rg_search、code_explore、code_pack、git_diff、test_runner、safe_edit 等源码阅读、搜索、测试和安全编辑工具。AstrNa 只负责流程协调，不绕过弥亚开发工具箱的权限和安全编辑机制；如果需要修改源码，必须由目标用户或管理员明确确认后，再交给弥亚开发工具箱的安全编辑工具处理。默认关闭。",
+    "default": false,
+    "collapsed": true,
+    "condition": {
+      "issue_assistant_enabled": true
+    }
+  },
+  "issue_assistant_target_umo": {
+    "type": "string",
+    "description": "Issue 助手通知/处理 UMO",
+    "hint": "建议优先填写维护者私聊 UMO，也可以填写管理群 UMO；可用 AstrBot 的 /sid 指令获取，格式类似 aiocqhttp:FriendMessage:QQ号 或 aiocqhttp:GroupMessage:群号。配置后，AstrNa 检测到插件报错时会把提醒发送到这个绑定会话，并把待处理 Issue 流程绑定到这里；普通群聊里不会突然发送报错提醒。后续 /astrna issue 命令和自然语言 Issue 工具默认只能在这个 UMO 中处理，AstrBot 管理员可兜底处理。若使用管理群 UMO，进入源码辅助分析流程后，该管理群后续对话可能临时附带源码分析提示，处理完请及时 draft、ignore 或 cancel。留空时 AstrNa 只记录和分析报错，不主动发送提醒，避免打扰原聊天群。",
+    "default": "",
+    "collapsed": true,
+    "condition": {
+      "issue_assistant_enabled": true
+    }
+  },
+  "issue_assistant_github_token": {
+    "type": "string",
+    "description": "GitHub API Token",
+    "hint": "可选。留空时只能生成 Issue 草稿，不能自动提交。建议使用 GitHub Fine-grained Personal Access Token：GitHub Settings -> Developer settings -> Personal access tokens -> Fine-grained tokens，只给目标仓库 Issues: Read and write；若需要读取私有仓库 Issue 模板，再给 Contents: Read。AstrNa 不会把 Token 发送给 LLM，也不会写入 Issue 内容；AstrNa 自身日志会尽量脱敏，但 AstrBot Core 原始报错日志取决于 AstrBot。",
+    "default": "",
+    "collapsed": true,
+    "condition": {
+      "issue_assistant_enabled": true
+    }
   }
 }

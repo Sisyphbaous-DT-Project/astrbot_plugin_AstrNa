@@ -2,8 +2,14 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
+from astrbot.core.star.filter.command import GreedyStr
 
 from .astrna.runtime import AstrNaRuntime
+
+try:
+    from astrbot.core.message.message_event_result import MessageChain
+except Exception:  # pragma: no cover
+    MessageChain = None  # type: ignore[assignment]
 
 
 class AstrNa(Star):
@@ -25,6 +31,71 @@ class AstrNa(Star):
         req: ProviderRequest,
     ) -> None:
         await self.runtime.sanitize_request(event, req)
+
+    @filter.on_plugin_error(priority=1000)
+    async def analyze_plugin_error(
+        self,
+        event: AstrMessageEvent,
+        plugin_name: str,
+        handler_name: str,
+        error: BaseException,
+        traceback_text: str,
+    ) -> None:
+        await self.runtime.handle_plugin_error(
+            event,
+            plugin_name,
+            handler_name,
+            error,
+            traceback_text,
+        )
+
+    @filter.command("astrna issue latest")
+    @filter.command("astrna_issue_latest")
+    async def issue_latest(self, event: AstrMessageEvent) -> None:
+        """查看 AstrNa 最近一次报错分析。"""
+        await self._send_text(event, await self.runtime.issue_latest(event))
+
+    @filter.command("astrna issue draft")
+    @filter.command("astrna_issue_draft")
+    async def issue_draft(self, event: AstrMessageEvent) -> None:
+        """生成或查看 AstrNa Issue 草稿。"""
+        await self._send_text(event, await self.runtime.issue_draft(event))
+
+    @filter.command("astrna issue ignore")
+    @filter.command("astrna_issue_ignore")
+    async def issue_ignore(self, event: AstrMessageEvent) -> None:
+        """忽略 AstrNa 最近一次报错。"""
+        await self._send_text(event, await self.runtime.issue_ignore(event))
+
+    @filter.command("astrna issue analyze")
+    @filter.command("astrna_issue_analyze")
+    async def issue_analyze(self, event: AstrMessageEvent) -> None:
+        """调用源码辅助分析流程。"""
+        await self._send_text(event, await self.runtime.issue_analyze(event))
+
+    @filter.command("astrna issue edit")
+    @filter.command("astrna_issue_edit")
+    async def issue_edit(self, event: AstrMessageEvent, note: GreedyStr) -> None:
+        """为 AstrNa Issue 草稿追加补充说明。"""
+        await self._send_text(event, await self.runtime.issue_edit(event, str(note)))
+
+    @filter.command("astrna issue submit")
+    @filter.command("astrna_issue_submit")
+    async def issue_submit(self, event: AstrMessageEvent) -> None:
+        """确认提交 AstrNa Issue 草稿。"""
+        await self._send_text(event, await self.runtime.issue_submit(event))
+
+    @filter.command("astrna issue cancel")
+    @filter.command("astrna_issue_cancel")
+    async def issue_cancel(self, event: AstrMessageEvent) -> None:
+        """丢弃 AstrNa Issue 草稿。"""
+        await self._send_text(event, await self.runtime.issue_cancel(event))
+
+    async def _send_text(self, event: AstrMessageEvent, text: str) -> None:
+        if MessageChain is None:
+            await event.send(text)  # type: ignore[arg-type]
+            return
+        await event.send(MessageChain().message(text))
 
     async def terminate(self) -> None:
         """插件停用时调用。"""

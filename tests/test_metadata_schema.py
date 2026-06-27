@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.1.9"
+    assert metadata["version"] == "1.2.1"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -44,6 +44,10 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "provide_group_identity_tools",
         "optimize_reply_target_history",
         "unlock_group_sender_concurrency",
+        "issue_assistant_enabled",
+        "issue_assistant_devkit_enabled",
+        "issue_assistant_target_umo",
+        "issue_assistant_github_token",
     ]
     assert schema["fix_deepseek_v4_400"]["type"] == "bool"
     assert schema["fix_deepseek_v4_400"]["default"] is False
@@ -129,6 +133,52 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
     assert "⚠️" in schema["unlock_group_sender_concurrency"]["hint"]
     assert "防抖" in schema["unlock_group_sender_concurrency"]["hint"]
     assert schema["unlock_group_sender_concurrency"]["default"] is False
+    assert schema["issue_assistant_enabled"]["type"] == "bool"
+    assert (
+        schema["issue_assistant_enabled"]["description"]
+        == "自动报错分析与 Issue 助手（实验性）"
+    )
+    assert schema["issue_assistant_enabled"]["default"] is False
+    assert "DEBUG" in schema["issue_assistant_enabled"]["hint"]
+    assert schema["issue_assistant_devkit_enabled"]["type"] == "bool"
+    assert (
+        schema["issue_assistant_devkit_enabled"]["description"]
+        == "提供阅读源码和修改源码的功能"
+    )
+    assert schema["issue_assistant_devkit_enabled"]["default"] is False
+    assert schema["issue_assistant_devkit_enabled"]["collapsed"] is True
+    assert schema["issue_assistant_devkit_enabled"]["condition"] == {
+        "issue_assistant_enabled": True,
+    }
+    assert "弥亚开发工具箱至少 2.6.0" in schema["issue_assistant_devkit_enabled"]["hint"]
+    assert "AstrBot 管理员" in schema["issue_assistant_devkit_enabled"]["hint"]
+    assert "allowed_ids" in schema["issue_assistant_devkit_enabled"]["hint"]
+    assert "分群配置" in schema["issue_assistant_devkit_enabled"]["hint"]
+    assert "safe_read" in schema["issue_assistant_devkit_enabled"]["hint"]
+    assert "safe_edit" in schema["issue_assistant_devkit_enabled"]["hint"]
+    assert "github.com" not in schema["issue_assistant_devkit_enabled"]["hint"].lower()
+    assert schema["issue_assistant_target_umo"]["type"] == "string"
+    assert (
+        schema["issue_assistant_target_umo"]["description"]
+        == "Issue 助手通知/处理 UMO"
+    )
+    assert schema["issue_assistant_target_umo"]["default"] == ""
+    assert schema["issue_assistant_target_umo"]["collapsed"] is True
+    assert schema["issue_assistant_target_umo"]["condition"] == {
+        "issue_assistant_enabled": True,
+    }
+    assert "aiocqhttp:FriendMessage" in schema["issue_assistant_target_umo"]["hint"]
+    assert "/sid" in schema["issue_assistant_target_umo"]["hint"]
+    assert "优先填写维护者私聊" in schema["issue_assistant_target_umo"]["hint"]
+    assert "源码辅助分析流程" in schema["issue_assistant_target_umo"]["hint"]
+    assert "普通群聊里不会突然发送报错提醒" in schema["issue_assistant_target_umo"]["hint"]
+    assert schema["issue_assistant_github_token"]["type"] == "string"
+    assert schema["issue_assistant_github_token"]["default"] == ""
+    assert schema["issue_assistant_github_token"]["collapsed"] is True
+    assert schema["issue_assistant_github_token"]["condition"] == {
+        "issue_assistant_enabled": True,
+    }
+    assert "Issues: Read and write" in schema["issue_assistant_github_token"]["hint"]
 
 
 def test_changelog_contains_release_notes():
@@ -152,3 +202,4 @@ def test_changelog_contains_release_notes():
     assert "## 0.1.8" in changelog
     assert "## 1.1.8" in changelog
     assert "## 1.1.9" in changelog
+    assert "## 1.2.1" in changelog

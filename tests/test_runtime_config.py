@@ -23,6 +23,10 @@ def test_merge_config_keeps_defaults_for_missing_values():
         "provide_group_identity_tools": False,
         "optimize_reply_target_history": False,
         "unlock_group_sender_concurrency": False,
+        "issue_assistant_enabled": False,
+        "issue_assistant_devkit_enabled": False,
+        "issue_assistant_github_token": "",
+        "issue_assistant_target_umo": "",
     }
 
 
@@ -45,6 +49,10 @@ def test_merge_config_can_enable_modules():
             "provide_group_identity_tools": True,
             "optimize_reply_target_history": True,
             "unlock_group_sender_concurrency": True,
+            "issue_assistant_enabled": True,
+            "issue_assistant_devkit_enabled": True,
+            "issue_assistant_github_token": "github_pat_secret",
+            "issue_assistant_target_umo": "aiocqhttp:PrivateMessage:1719500341",
         }
     )
 
@@ -65,6 +73,10 @@ def test_merge_config_can_enable_modules():
         "provide_group_identity_tools": True,
         "optimize_reply_target_history": True,
         "unlock_group_sender_concurrency": True,
+        "issue_assistant_enabled": True,
+        "issue_assistant_devkit_enabled": True,
+        "issue_assistant_github_token": "github_pat_secret",
+        "issue_assistant_target_umo": "aiocqhttp:PrivateMessage:1719500341",
     }
 
 

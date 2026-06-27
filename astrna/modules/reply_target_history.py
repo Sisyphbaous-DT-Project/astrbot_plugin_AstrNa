@@ -291,12 +291,12 @@ class ReplyTargetHistoryModule:
     def _install_save_history_patch(self) -> bool:
         internal_stage_cls = load_internal_stage_cls()
         if internal_stage_cls is None:
-            self._log("warning", "AstrNa 未找到历史保存入口，跳过优化回复历史标记。")
+            self._log("debug", "AstrNa 未找到历史保存入口，跳过优化回复历史标记。")
             return False
 
         original = getattr(internal_stage_cls, "_save_to_history", None)
         if not callable(original):
-            self._log("warning", "AstrNa 未找到 _save_to_history，跳过优化回复历史标记。")
+            self._log("debug", "AstrNa 未找到 _save_to_history，跳过优化回复历史标记。")
             return False
 
         module_cls = type(self)
@@ -331,13 +331,13 @@ class ReplyTargetHistoryModule:
     def _install_response_patch(self) -> bool:
         runner_cls = load_tool_loop_runner_cls()
         if runner_cls is None:
-            self._log("warning", "AstrNa 未找到 LLM 最终回复入口，跳过回复标记净化。")
+            self._log("debug", "AstrNa 未找到 LLM 最终回复入口，跳过回复标记净化。")
             return False
 
         original = getattr(runner_cls, "_complete_with_assistant_response", None)
         if not callable(original):
             self._log(
-                "warning",
+                "debug",
                 "AstrNa 未找到 _complete_with_assistant_response，跳过回复标记净化。",
             )
             return False
@@ -403,12 +403,12 @@ class ReplyTargetHistoryModule:
     def _install_quote_message_patch(self) -> bool:
         astr_main_agent = load_astr_main_agent()
         if astr_main_agent is None:
-            self._log("warning", "AstrNa 未找到主对话模块，跳过引用消息历史标记。")
+            self._log("debug", "AstrNa 未找到主对话模块，跳过引用消息历史标记。")
             return False
 
         original = getattr(astr_main_agent, "_process_quote_message", None)
         if not callable(original):
-            self._log("warning", "AstrNa 未找到引用消息入口，跳过引用消息历史标记。")
+            self._log("debug", "AstrNa 未找到引用消息入口，跳过引用消息历史标记。")
             return False
 
         module_cls = type(self)
