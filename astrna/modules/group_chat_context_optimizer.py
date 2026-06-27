@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import re
 import uuid
 from typing import Any
@@ -10,6 +9,13 @@ from typing import Any
 GROUP_CONTEXT_COMPRESS_TIMEOUT_SECONDS = 45
 GROUP_CONTEXT_HEADER_MARKER = "--- BEGIN CONTEXT---"
 GROUP_CONTEXT_FOOTER_MARKER = "--- END CONTEXT ---"
+GROUP_CONTEXT_BLOCK_HEADER = (
+    "<system_reminder>"
+    "You are in a group chat. "
+    "Belows are recent rolling group chat context:\n"
+    f"{GROUP_CONTEXT_HEADER_MARKER}\n"
+)
+GROUP_CONTEXT_BLOCK_FOOTER = f"\n{GROUP_CONTEXT_FOOTER_MARKER}\n</system_reminder>"
 ASTRNA_GROUP_CONTEXT_TITLE = "AstrNa 群聊上下文筛选"
 OUTPUT_REQUIRED_MARKERS = ("相关原文", "简短摘要", "说明")
 OUTPUT_DISCLAIMER_MARKERS = (
@@ -92,7 +98,6 @@ class GroupChatContextOptimizerModule:
                     return await original_on_req_llm(group_context_self, event, req)
                 return await active_module.optimize_on_req_llm(
                     group_context_self,
-                    original_on_req_llm,
                     event,
                     req,
                 )
@@ -109,7 +114,7 @@ class GroupChatContextOptimizerModule:
         elif not self._empty_provider_logged:
             self._log(
                 "info",
-                "AstrNa 已启用群聊上下文优化，但尚未选择压缩模型，将回退原始群聊上下文。",
+                "AstrNa 已启用群聊上下文优化，但尚未选择压缩模型，本轮不会注入原始群聊流水账。",
             )
             self._empty_provider_logged = True
         return True
@@ -137,29 +142,19 @@ class GroupChatContextOptimizerModule:
     async def optimize_on_req_llm(
         self,
         group_context: Any,
-        original_on_req_llm: Any,
         event: Any,
         req: Any,
     ) -> Any:
-        parts = ensure_extra_user_content_parts(req)
-        before_len = len(parts)
-
-        result = original_on_req_llm(group_context, event, req)
-        if inspect.isawaitable(result):
-            result = await result
-
-        parts = ensure_extra_user_content_parts(req)
-        appended = find_appended_group_context_part(parts, before_len)
-        if appended is None:
-            return result
-
-        part_index, original_group_context = appended
-        if not original_group_context.strip():
-            return result
+        original_group_context = await self.build_rolling_group_context(
+            group_context,
+            event,
+        )
+        if not original_group_context:
+            return None
 
         provider = self.resolve_compress_provider(group_context)
         if provider is None:
-            return result
+            return None
 
         prompt = build_compression_prompt(
             current_message=extract_current_message(event, req),
@@ -168,19 +163,77 @@ class GroupChatContextOptimizerModule:
         )
         compressed = await self.compress_with_provider(provider, prompt)
         if not is_valid_compression_output(compressed):
-            return result
+            return None
 
-        replace_extra_part_text(
-            parts,
-            part_index,
-            build_injected_context_text(compressed),
+        ensure_extra_user_content_parts(req).append(
+            create_temp_text_part(build_injected_context_text(compressed)),
         )
         self._log(
             "debug",
             "AstrNa 已压缩群聊上下文: session=%s",
             getattr(event, "unified_msg_origin", ""),
         )
-        return result
+        return None
+
+    async def build_rolling_group_context(
+        self,
+        group_context: Any,
+        event: Any,
+    ) -> str:
+        umo = getattr(event, "unified_msg_origin", "")
+        record_id = get_event_extra(event, "_group_context_record_id", None)
+        prompt_idx = get_event_extra(event, "_group_context_raw_idx", -1)
+        if not isinstance(record_id, str) and (
+            not isinstance(prompt_idx, int) or prompt_idx < 0
+        ):
+            return ""
+
+        lock_getter = getattr(group_context, "_get_lock", None)
+        if callable(lock_getter):
+            lock = lock_getter(umo)
+        else:
+            lock = None
+
+        async def read_records() -> str:
+            return self._read_rolling_group_context_locked(
+                group_context,
+                umo,
+                record_id,
+                prompt_idx,
+            )
+
+        if lock is None:
+            return await read_records()
+
+        async with lock:
+            return await read_records()
+
+    def _read_rolling_group_context_locked(
+        self,
+        group_context: Any,
+        umo: str,
+        record_id: Any,
+        prompt_idx: Any,
+    ) -> str:
+        raw_records = getattr(group_context, "raw_records", None)
+        records = raw_records.get(umo) if hasattr(raw_records, "get") else None
+        if not records:
+            return ""
+
+        raw_list = list(records)
+        record_ids_map = getattr(group_context, "_record_ids", None)
+        record_ids = record_ids_map.get(umo) if hasattr(record_ids_map, "get") else None
+        id_list = list(record_ids) if record_ids else []
+        if isinstance(record_id, str) and record_id in id_list:
+            prompt_idx = id_list.index(record_id)
+
+        if not isinstance(prompt_idx, int) or prompt_idx < 0 or prompt_idx >= len(raw_list):
+            return ""
+
+        records_to_inject = raw_list[:prompt_idx]
+        if not records_to_inject:
+            return ""
+        return format_group_history_block(records_to_inject)
 
     def resolve_compress_provider(self, group_context: Any) -> Any | None:
         provider_id = self.provider_id
@@ -220,7 +273,11 @@ class GroupChatContextOptimizerModule:
                 timeout=GROUP_CONTEXT_COMPRESS_TIMEOUT_SECONDS,
             )
         except Exception as exc:  # noqa: BLE001
-            self._log("debug", "AstrNa 群聊上下文压缩失败，已回退原始上下文: %s", exc)
+            self._log(
+                "debug",
+                "AstrNa 群聊上下文压缩失败，本轮不注入原始群聊流水账: %s",
+                exc,
+            )
             return ""
         return str(getattr(response, "completion_text", "") or "").strip()
 
@@ -238,51 +295,28 @@ def ensure_extra_user_content_parts(req: Any) -> list[Any]:
     return parts
 
 
-def find_appended_group_context_part(
-    parts: list[Any],
-    before_len: int,
-) -> tuple[int, str] | None:
-    if before_len < 0 or before_len >= len(parts):
-        return None
-
-    for idx in range(before_len, len(parts)):
-        text = get_part_text(parts[idx])
-        if looks_like_group_context_block(text):
-            return idx, text
-    return None
+def format_group_history_block(records: list[str]) -> str:
+    return GROUP_CONTEXT_BLOCK_HEADER + "\n".join(records) + GROUP_CONTEXT_BLOCK_FOOTER
 
 
-def looks_like_group_context_block(text: str) -> bool:
-    return (
-        bool(text)
-        and GROUP_CONTEXT_HEADER_MARKER in text
-        and GROUP_CONTEXT_FOOTER_MARKER in text
-    )
+def get_event_extra(event: Any, key: str, default: Any = None) -> Any:
+    getter = getattr(event, "get_extra", None)
+    if callable(getter):
+        try:
+            return getter(key, default)
+        except TypeError:
+            try:
+                value = getter(key)
+            except Exception:  # noqa: BLE001
+                return default
+            return default if value is None else value
+        except Exception:  # noqa: BLE001
+            return default
 
-
-def get_part_text(part: Any) -> str:
-    if isinstance(part, dict):
-        text = part.get("text")
-    else:
-        text = getattr(part, "text", None)
-    return text if isinstance(text, str) else ""
-
-
-def replace_extra_part_text(parts: list[Any], index: int, text: str) -> None:
-    part = parts[index]
-    if isinstance(part, dict):
-        copied = dict(part)
-        copied["text"] = text
-        copied["_no_save"] = True
-        copied["_is_temp"] = True
-        parts[index] = copied
-        return
-
-    try:
-        setattr(part, "text", text)
-        mark_part_as_temp(part)
-    except Exception:  # noqa: BLE001
-        parts[index] = create_temp_text_part(text)
+    extra = getattr(event, "extra", None)
+    if isinstance(extra, dict):
+        return extra.get(key, default)
+    return default
 
 
 def create_temp_text_part(text: str) -> Any:
@@ -398,7 +432,7 @@ def build_compression_prompt(
         f"{current_message}\n\n"
         "主会话最近历史（已经由 AstrBot 按当前设置准备）：\n"
         f"{main_history}\n\n"
-        "AstrBot 群聊上下文流水账（已经由 AstrBot 按当前群聊上下文设置准备）：\n"
+        "AstrBot 最近群聊滚动窗口（记录条数沿用 AstrBot 当前群聊上下文设置）：\n"
         f"{group_context}\n\n"
         "请只输出：\n"
         "相关原文摘录：\n"

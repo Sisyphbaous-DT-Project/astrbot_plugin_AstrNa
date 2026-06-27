@@ -93,13 +93,13 @@
   "optimize_group_chat_context": {
     "type": "bool",
     "description": "群聊上下文优化",
-    "hint": "开启后，AstrNa 会在 AstrBot 自带群聊上下文感知已经启用时，先调用一个已配置的聊天模型，把 AstrBot 按当前设置准备好的主会话最近历史、群聊流水账和当前待回复消息筛选成“相关原文摘录 + 简短摘要”，再作为临时 extra_user_content_parts 内容给主模型看。这个压缩模型只负责筛选上下文，不负责生成回复建议；失败、未选择模型或群聊上下文不存在时会自动回退 AstrBot 原始群聊流水账。默认关闭。",
+    "hint": "开启后，AstrNa 会在 AstrBot 自带群聊上下文感知已经启用时，先调用一个已配置的聊天模型，把 AstrBot 按当前设置准备好的主会话最近历史、最近群聊滚动窗口和当前待回复消息筛选成“相关原文摘录 + 简短摘要”，再作为临时 extra_user_content_parts 内容给主模型看。AstrBot 原生逻辑会在每次 LLM 请求后移除已注入的群聊记录，group_message_max_cnt 只是缓存上限，不代表每次固定注入 N 条；AstrNa 会复用 AstrBot 自己维护的最近 N 条群聊缓存，N 完全沿用 AstrBot 当前设置，不额外配置。这个压缩模型只负责筛选上下文，不负责生成回复建议；失败、未选择模型或群聊上下文不存在时不会把原始群聊流水账交给主模型，避免 token 爆炸。默认关闭。",
     "default": false
   },
   "group_chat_context_compress_provider_id": {
     "type": "string",
     "description": "群聊上下文压缩模型",
-    "hint": "请选择 AstrBot 中已经配置好的聊天模型供应商，推荐使用 deepseek-v4-flash 这类便宜快速的小模型。该模型只用于筛选群聊相关上下文和生成简短摘要，不是主对话模型；AstrNa 不会额外设置群聊记录条数或历史轮数，全部沿用 AstrBot 当前群聊上下文和会话历史设置。留空时自动回退原始群聊上下文。",
+    "hint": "请选择 AstrBot 中已经配置好的聊天模型供应商，推荐使用 deepseek-v4-flash 这类便宜快速的小模型。该模型只用于读取主会话最近历史、群聊最近滚动窗口和当前消息，筛选群聊相关上下文并生成简短摘要，不是主对话模型；AstrNa 不会额外设置群聊记录条数或历史轮数，全部沿用 AstrBot 当前群聊上下文和会话历史设置。留空时不会注入原始群聊流水账。",
     "_special": "select_provider",
     "default": "",
     "collapsed": true,

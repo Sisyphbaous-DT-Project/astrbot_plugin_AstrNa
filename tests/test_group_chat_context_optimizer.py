@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections import defaultdict, deque
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -11,11 +12,8 @@ from astrna.modules.group_chat_context_optimizer import (
     GroupChatContextOptimizerModule,
     build_compression_prompt,
     create_temp_text_part,
-    find_appended_group_context_part,
     format_contexts,
     is_valid_compression_output,
-    looks_like_group_context_block,
-    replace_extra_part_text,
 )
 
 
@@ -48,12 +46,53 @@ class TextPart:
 class DummyGroupChatContext:
     def __init__(self):
         self.calls = []
+        self._locks = {}
+        self.raw_records = defaultdict(deque)
+        self._record_ids = defaultdict(deque)
+
+    def _get_lock(self, umo):
+        lock = self._locks.get(umo)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[umo] = lock
+        return lock
 
     async def on_req_llm(self, event, req):
         self.calls.append((event, req))
-        if event.get_message_type() != "GROUP_MESSAGE":
+        umo = event.unified_msg_origin
+        record_id = event.get_extra("_group_context_record_id", None)
+        prompt_idx = event.get_extra("_group_context_raw_idx", -1)
+        if not isinstance(record_id, str) and (
+            not isinstance(prompt_idx, int) or prompt_idx < 0
+        ):
             return
-        req.extra_user_content_parts.append(TextPart(GROUP_CONTEXT_TEXT))
+
+        async with self._get_lock(umo):
+            records = self.raw_records.get(umo)
+            if not records:
+                return
+
+            raw_list = list(records)
+            id_list = list(self._record_ids.get(umo, deque()))
+            if isinstance(record_id, str) and record_id in id_list:
+                prompt_idx = id_list.index(record_id)
+            if prompt_idx >= len(raw_list):
+                return
+
+            records_to_inject = raw_list[:prompt_idx]
+            remaining = raw_list[prompt_idx + 1 :]
+            remaining_ids = id_list[prompt_idx + 1 :] if id_list else []
+            records.clear()
+            records.extend(remaining)
+            if id_list:
+                record_ids = self._record_ids[umo]
+                record_ids.clear()
+                record_ids.extend(remaining_ids)
+
+        if records_to_inject:
+            req.extra_user_content_parts.append(
+                TextPart(format_group_history_block(records_to_inject)),
+            )
 
 
 class DummyResponse:
@@ -114,9 +153,16 @@ class DummyEvent:
         self.unified_msg_origin = "aiocqhttp:GroupMessage:123456"
         self.message_type = message_type
         self.message_str = "小明刚才说了什么？"
+        self.extra = {}
 
     def get_message_type(self):
         return self.message_type
+
+    def get_extra(self, key, default=None):
+        return self.extra.get(key, default)
+
+    def set_extra(self, key, value):
+        self.extra[key] = value
 
 
 @pytest.fixture(autouse=True)
@@ -177,6 +223,32 @@ def build_module(provider=None, *, provider_id="compress-1"):
     )
 
 
+def format_group_history_block(records):
+    return (
+        "<system_reminder>You are in a group chat. Belows are group chat context "
+        "after your last reply:\n--- BEGIN CONTEXT---\n"
+        + "\n".join(records)
+        + "\n--- END CONTEXT ---\n</system_reminder>"
+    )
+
+
+def seed_group_records(group_context, event, *, include_followup=False):
+    records = [
+        "[小明/12:00:00]:  今天晚上打游戏吗？",
+        "[小红/12:01:00]:  我想先写作业。",
+        "[用户/12:02:00]:  小明刚才说了什么？",
+    ]
+    ids = ["record-1", "record-2", "record-current"]
+    if include_followup:
+        records.append("[小蓝/12:03:00]:  我也想打游戏。")
+        ids.append("record-followup")
+    group_context.raw_records[event.unified_msg_origin] = deque(records)
+    group_context._record_ids[event.unified_msg_origin] = deque(ids)
+    event.set_extra("_group_context_record_id", "record-current")
+    event.set_extra("_group_context_raw_idx", 2)
+    return records, ids
+
+
 def test_default_runtime_config_keeps_module_disabled(fakes):
     runtime = fakes.build_runtime({})
 
@@ -218,10 +290,12 @@ def test_enabled_replaces_original_group_context_with_compressed_text(
     module.install()
 
     group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_group_records(group_context, event)
     req = DummyReq()
     req.extra_user_content_parts.append(TextPart("其他临时内容"))
 
-    run(group_context.on_req_llm(DummyEvent(), req))
+    run(group_context.on_req_llm(event, req))
 
     assert len(req.extra_user_content_parts) == 2
     assert req.extra_user_content_parts[0].text == "其他临时内容"
@@ -242,24 +316,31 @@ def test_enabled_replaces_original_group_context_with_compressed_text(
     assert "之前我们聊了游戏" in call["prompt"]
     assert "[小明/12:00:00]" in call["prompt"]
     assert "小明刚才说了什么" in call["prompt"]
+    assert list(group_context.raw_records[event.unified_msg_origin]) == [
+        "[小明/12:00:00]:  今天晚上打游戏吗？",
+        "[小红/12:01:00]:  我想先写作业。",
+        "[用户/12:02:00]:  小明刚才说了什么？",
+    ]
 
 
-def test_provider_missing_falls_back_to_original_group_context(
+def test_provider_missing_does_not_inject_original_group_context(
     astrbot_group_context_modules,
 ):
     module = build_module(provider=None, provider_id="missing")
     module.install()
 
     group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_group_records(group_context, event)
     req = DummyReq()
 
-    run(group_context.on_req_llm(DummyEvent(), req))
+    run(group_context.on_req_llm(event, req))
 
-    assert len(req.extra_user_content_parts) == 1
-    assert req.extra_user_content_parts[0].text == GROUP_CONTEXT_TEXT
+    assert req.extra_user_content_parts == []
+    assert list(group_context.raw_records[event.unified_msg_origin])
 
 
-def test_provider_failure_falls_back_to_original_group_context(
+def test_provider_failure_does_not_inject_original_group_context(
     astrbot_group_context_modules,
 ):
     provider = DummyProvider(valid_compressed_text(), fail=True)
@@ -267,11 +348,15 @@ def test_provider_failure_falls_back_to_original_group_context(
     module.install()
 
     group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_group_records(group_context, event)
     req = DummyReq()
 
-    run(group_context.on_req_llm(DummyEvent(), req))
+    run(group_context.on_req_llm(event, req))
 
-    assert req.extra_user_content_parts[-1].text == GROUP_CONTEXT_TEXT
+    assert req.extra_user_content_parts == []
+    assert len(provider.calls) == 1
+    assert list(group_context.raw_records[event.unified_msg_origin])
 
 
 @pytest.mark.parametrize(
@@ -283,7 +368,7 @@ def test_provider_failure_falls_back_to_original_group_context(
         "相关原文摘录：\n- a\n\n简短摘要：\na\n\n建议回复：你好",
     ],
 )
-def test_invalid_output_falls_back_to_original_group_context(
+def test_invalid_output_does_not_inject_original_group_context(
     astrbot_group_context_modules,
     text,
 ):
@@ -292,11 +377,13 @@ def test_invalid_output_falls_back_to_original_group_context(
     module.install()
 
     group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_group_records(group_context, event)
     req = DummyReq()
 
-    run(group_context.on_req_llm(DummyEvent(), req))
+    run(group_context.on_req_llm(event, req))
 
-    assert req.extra_user_content_parts[-1].text == GROUP_CONTEXT_TEXT
+    assert req.extra_user_content_parts == []
 
 
 def test_private_chat_keeps_original_behavior_and_does_not_call_provider(
@@ -339,13 +426,60 @@ def test_original_group_context_absent_does_not_inject_anything(monkeypatch):
     assert provider.calls == []
 
 
-def test_helper_detects_only_appended_group_context_part():
-    parts = [TextPart("其他"), TextPart(GROUP_CONTEXT_TEXT)]
+def test_enabled_uses_rolling_records_after_previous_llm_request(
+    astrbot_group_context_modules,
+):
+    provider = DummyProvider(valid_compressed_text())
+    module = build_module(provider)
+    module.install()
 
-    assert find_appended_group_context_part(parts, 1) == (1, GROUP_CONTEXT_TEXT)
-    assert find_appended_group_context_part(parts, 2) is None
-    assert looks_like_group_context_block(GROUP_CONTEXT_TEXT) is True
-    assert looks_like_group_context_block("普通 extra") is False
+    group_context = astrbot_group_context_modules.group_context_cls()
+    first_event = DummyEvent()
+    seed_group_records(group_context, first_event, include_followup=True)
+    first_req = DummyReq()
+
+    run(group_context.on_req_llm(first_event, first_req))
+
+    second_event = DummyEvent()
+    second_event.set_extra("_group_context_record_id", "record-followup")
+    second_event.set_extra("_group_context_raw_idx", 3)
+    second_req = DummyReq()
+
+    run(group_context.on_req_llm(second_event, second_req))
+
+    assert len(provider.calls) == 2
+    second_prompt = provider.calls[1]["prompt"]
+    assert "[小明/12:00:00]" in second_prompt
+    assert "[小红/12:01:00]" in second_prompt
+    assert "[用户/12:02:00]" in second_prompt
+    assert "[小蓝/12:03:00]" not in second_prompt
+    assert list(group_context.raw_records[first_event.unified_msg_origin]) == [
+        "[小明/12:00:00]:  今天晚上打游戏吗？",
+        "[小红/12:01:00]:  我想先写作业。",
+        "[用户/12:02:00]:  小明刚才说了什么？",
+        "[小蓝/12:03:00]:  我也想打游戏。",
+    ]
+
+
+def test_original_behavior_is_restored_after_terminate_and_consumes_records(
+    astrbot_group_context_modules,
+):
+    module = build_module(DummyProvider(valid_compressed_text()))
+    module.install()
+    module.terminate()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_group_records(group_context, event, include_followup=True)
+    req = DummyReq()
+
+    run(group_context.on_req_llm(event, req))
+
+    assert len(req.extra_user_content_parts) == 1
+    assert req.extra_user_content_parts[0].text == GROUP_CONTEXT_TEXT
+    assert list(group_context.raw_records[event.unified_msg_origin]) == [
+        "[小蓝/12:03:00]:  我也想打游戏。",
+    ]
 
 
 def test_prompt_uses_existing_contexts_without_hardcoded_turn_or_record_limits():
@@ -413,14 +547,6 @@ def test_output_validation_requires_relevant_quotes_and_summary():
         )
         is False
     )
-
-
-def test_replace_dict_part_marks_as_temp():
-    parts = [{"type": "text", "text": GROUP_CONTEXT_TEXT}]
-
-    replace_extra_part_text(parts, 0, "压缩后")
-
-    assert parts == [{"type": "text", "text": "压缩后", "_no_save": True, "_is_temp": True}]
 
 
 def test_create_temp_text_part_sets_no_save_when_textpart_is_available(

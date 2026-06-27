@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.2.2"
+    assert metadata["version"] == "1.2.3"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -109,6 +109,8 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
     assert schema["optimize_group_chat_context"]["description"] == "群聊上下文优化"
     assert schema["optimize_group_chat_context"]["default"] is False
     assert "回复建议" in schema["optimize_group_chat_context"]["hint"]
+    assert "group_message_max_cnt" in schema["optimize_group_chat_context"]["hint"]
+    assert "不会把原始群聊流水账交给主模型" in schema["optimize_group_chat_context"]["hint"]
     assert schema["group_chat_context_compress_provider_id"]["type"] == "string"
     assert (
         schema["group_chat_context_compress_provider_id"]["description"]
@@ -122,6 +124,7 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
     }
     assert "deepseek-v4-flash" in schema["group_chat_context_compress_provider_id"]["hint"]
     assert "全部沿用 AstrBot 当前" in schema["group_chat_context_compress_provider_id"]["hint"]
+    assert "主会话最近历史" in schema["group_chat_context_compress_provider_id"]["hint"]
     assert schema["optimize_image_caption"]["type"] == "bool"
     assert schema["optimize_image_caption"]["description"] == "更好的图像转述"
     assert schema["optimize_image_caption"]["default"] is False
@@ -223,3 +226,4 @@ def test_changelog_contains_release_notes():
     assert "## 1.1.9" in changelog
     assert "## 1.2.1" in changelog
     assert "## 1.2.2" in changelog
+    assert "## 1.2.3" in changelog
