@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.2.6"
+    assert metadata["version"] == "1.2.7"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -40,6 +40,7 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "optimize_long_reply_context",
         "optimize_dynamic_system_prompt",
         "optimize_image_history_context",
+        "optimize_quoted_image_input",
         "optimize_group_chat_context",
         "group_chat_context_compress_provider_id",
         "optimize_image_caption",
@@ -115,6 +116,16 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
     assert "data:image" in schema["optimize_image_history_context"]["hint"]
     assert "本轮用户新发图片" in schema["optimize_image_history_context"]["hint"]
     assert "默认关闭" in schema["optimize_image_history_context"]["hint"]
+    assert schema["optimize_quoted_image_input"]["type"] == "bool"
+    assert (
+        schema["optimize_quoted_image_input"]["description"]
+        == "优化引用图片视觉输入"
+    )
+    assert schema["optimize_quoted_image_input"]["default"] is False
+    assert "Reply" in schema["optimize_quoted_image_input"]["hint"]
+    assert "req.image_urls" in schema["optimize_quoted_image_input"]["hint"]
+    assert "不展开群友合并转发内部图片" in schema["optimize_quoted_image_input"]["hint"]
+    assert "默认关闭" in schema["optimize_quoted_image_input"]["hint"]
     assert schema["optimize_group_chat_context"]["type"] == "bool"
     assert schema["optimize_group_chat_context"]["description"] == "群聊上下文优化"
     assert schema["optimize_group_chat_context"]["default"] is False
@@ -246,5 +257,6 @@ def test_changelog_contains_release_notes():
     assert "## 1.2.2" in changelog
     assert "## 1.2.3" in changelog
     assert "## 1.2.6" in changelog
+    assert "## 1.2.7" in changelog
     assert "## 1.2.5" in changelog
     assert "## 1.2.4" in changelog

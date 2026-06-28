@@ -17,6 +17,7 @@ from .modules.group_sender_concurrency import GroupSenderConcurrencyModule
 from .modules.identity_metadata import IdentityMetadataModule
 from .modules.issue_assistant import IssueAssistantModule
 from .modules.long_reply_context import LongReplyContextModule
+from .modules.quoted_image_input import QuotedImageInputModule
 from .modules.reply_target_history import ReplyTargetHistoryModule
 from .modules.send_message_to_user import SendMessageToUserModule
 
@@ -33,14 +34,15 @@ DEFAULT_CONFIG = {
     "forward_node_hard_limit": FORWARD_NODE_HARD_LIMIT_DEFAULT,
     "optimize_dynamic_system_prompt": False,
     "optimize_image_history_context": False,
+    "optimize_quoted_image_input": False,
+    "optimize_group_chat_context": False,
+    "group_chat_context_compress_provider_id": "",
     "optimize_image_caption": False,
     "optimize_send_message_to_user": False,
     "provide_group_identity_tools": False,
     "optimize_reply_target_history": False,
     "optimize_long_reply_context": False,
     "unlock_group_sender_concurrency": False,
-    "optimize_group_chat_context": False,
-    "group_chat_context_compress_provider_id": "",
     "issue_assistant_enabled": False,
     "issue_assistant_devkit_enabled": False,
     "issue_assistant_github_token": "",
@@ -73,6 +75,7 @@ class AstrNaRuntime:
             kv_store=kv_store,
         )
         self.image_history_context = ImageHistoryContextModule(logger=logger)
+        self.quoted_image_input = QuotedImageInputModule(logger=logger)
         self.image_caption = ImageCaptionModule(logger=logger)
         self.send_message_to_user = SendMessageToUserModule(logger=logger)
         self.group_identity_tools = GroupIdentityToolsModule(
@@ -128,6 +131,9 @@ class AstrNaRuntime:
             self.image_history_context.sanitize_request(req)
         else:
             self.image_history_context.terminate()
+
+        if self.config.get("optimize_quoted_image_input", False):
+            await self.quoted_image_input.optimize(event, req)
 
         if self.config.get("optimize_dynamic_system_prompt", False):
             self.dynamic_system_prompt.install()
