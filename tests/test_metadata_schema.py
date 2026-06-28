@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.2.4"
+    assert metadata["version"] == "1.2.5"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -135,6 +135,8 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
     assert "deepseek-v4-flash" in schema["group_chat_context_compress_provider_id"]["hint"]
     assert "全部沿用 AstrBot 当前" in schema["group_chat_context_compress_provider_id"]["hint"]
     assert "主会话最近历史" in schema["group_chat_context_compress_provider_id"]["hint"]
+    assert "提示词缓存" in schema["group_chat_context_compress_provider_id"]["hint"]
+    assert "成本低" in schema["group_chat_context_compress_provider_id"]["hint"]
     assert schema["optimize_image_caption"]["type"] == "bool"
     assert schema["optimize_image_caption"]["description"] == "更好的图像转述"
     assert schema["optimize_image_caption"]["default"] is False
@@ -237,4 +239,5 @@ def test_changelog_contains_release_notes():
     assert "## 1.2.1" in changelog
     assert "## 1.2.2" in changelog
     assert "## 1.2.3" in changelog
+    assert "## 1.2.5" in changelog
     assert "## 1.2.4" in changelog

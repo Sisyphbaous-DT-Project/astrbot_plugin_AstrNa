@@ -597,4 +597,4 @@ def test_create_temp_text_part_sets_no_save_when_textpart_is_available(
 
 
 def test_timeout_constant_is_reasonable():
-    assert GROUP_CONTEXT_COMPRESS_TIMEOUT_SECONDS == 45
+    assert GROUP_CONTEXT_COMPRESS_TIMEOUT_SECONDS == 300
