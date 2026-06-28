@@ -99,7 +99,7 @@
   "optimize_quoted_image_input": {
     "type": "bool",
     "description": "优化引用图片视觉输入",
-    "hint": "开启后，AstrNa 会在每轮 LLM 请求前检查当前消息里的 Reply 引用组件；如果主动回复、第三方插件或其他自建 ProviderRequest 的流程漏传了当前引用图片，AstrNa 会调用 AstrBot 自带引用图片解析逻辑，把解析出的图片去重追加到本轮 req.image_urls，并额外注入一条不写入历史的临时说明。只补当前消息引用的图片，不恢复历史图片，不展开群友合并转发内部图片，也不改 req.prompt、req.contexts 或 conversation.history。AstrBot 原生已经补过引用图的普通场景不会重复加图；开启后可能增加本轮图片 token。默认关闭。",
+    "hint": "开启后，AstrNa 会在每轮 LLM 请求前检查当前消息里的 Reply 引用组件；如果主动回复、第三方插件或其他自建 ProviderRequest 的流程漏传了当前引用图片，AstrNa 会调用 AstrBot 自带引用图片解析逻辑，把解析出的图片去重追加到本轮 req.image_urls，并额外注入一条不写入历史的临时说明。NapCat / aiocqhttp 场景下如果 AstrBot 解析器只识别 bot.api.call_action，而当前事件只有 bot.call_action，AstrNa 会做兼容兜底。只补当前消息引用的图片，不恢复历史图片，不展开群友合并转发内部图片，也不改 req.prompt、req.contexts 或 conversation.history。AstrBot 原生已经补过引用图的普通场景不会重复加图；开启后可能增加本轮图片 token。默认关闭。",
     "default": false
   },
   "optimize_group_chat_context": {

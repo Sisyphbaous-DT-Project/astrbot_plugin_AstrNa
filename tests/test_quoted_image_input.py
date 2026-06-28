@@ -44,9 +44,14 @@ class DummyMessageObj:
 
 
 class DummyEvent:
-    def __init__(self, message):
+    def __init__(self, message, *, bot=None):
         self.message_obj = DummyMessageObj(message)
         self.unified_msg_origin = "aiocqhttp:GroupMessage:123"
+        if bot is not None:
+            self.bot = bot
+
+    def get_group_id(self):
+        return "123"
 
 
 class DummyRequest:
@@ -71,6 +76,38 @@ async def fake_extract(event, reply, settings=None):
     return [f"file://{reply.id}.jpg"]
 
 
+async def fake_extract_via_api(event, reply, settings=None):
+    payload = await event.bot.api.call_action("get_msg", message_id=reply.id)
+    return [payload["message"][0]["data"]["url"]]
+
+
+async def fake_extract_via_optional_api(event, reply, settings=None):
+    api = getattr(getattr(event, "bot", None), "api", None)
+    call_action = getattr(api, "call_action", None)
+    if not callable(call_action):
+        return []
+    payload = await call_action("get_msg", message_id=reply.id)
+    return [payload["message"][0]["data"]["url"]]
+
+
+class DirectCallActionBot:
+    def __init__(self):
+        self.calls = []
+
+    async def call_action(self, action, **params):
+        self.calls.append((action, params))
+        return {"message": [{"type": "image", "data": {"url": "https://img/a.jpg"}}]}
+
+
+class ApiCallAction:
+    def __init__(self):
+        self.calls = []
+
+    async def call_action(self, action, **params):
+        self.calls.append((action, params))
+        return {"message": [{"type": "image", "data": {"url": "https://img/api.jpg"}}]}
+
+
 def test_module_appends_current_quoted_images(monkeypatch):
     from astrna.modules import quoted_image_input
 
@@ -85,6 +122,64 @@ def test_module_appends_current_quoted_images(monkeypatch):
     part = req.extra_user_content_parts[0]
     assert part.text == QUOTED_IMAGE_INPUT_NOTICE.format(count=1)
     assert getattr(part, "_no_save", False) is True
+    assert module.logger.debugs[-1][1] == 1
+
+
+def test_aiocqhttp_direct_call_action_is_exposed_as_api(monkeypatch):
+    from astrna.modules import quoted_image_input
+
+    monkeypatch.setattr(
+        quoted_image_input,
+        "extract_quoted_message_images",
+        fake_extract_via_api,
+    )
+    bot = DirectCallActionBot()
+    module = QuotedImageInputModule(logger=DummyLogger())
+    req = DummyRequest(image_urls=[])
+
+    run(module.optimize(DummyEvent([Reply("a")], bot=bot), req))
+
+    assert req.image_urls == ["https://img/a.jpg"]
+    assert bot.calls == [("get_msg", {"message_id": "a"})]
+    assert not hasattr(bot, "api")
+
+
+def test_existing_api_call_action_is_used_without_proxy(monkeypatch):
+    from astrna.modules import quoted_image_input
+
+    monkeypatch.setattr(
+        quoted_image_input,
+        "extract_quoted_message_images",
+        fake_extract_via_api,
+    )
+    api = ApiCallAction()
+    bot = SimpleNamespace(api=api)
+    module = QuotedImageInputModule(logger=DummyLogger())
+    req = DummyRequest(image_urls=[])
+
+    run(module.optimize(DummyEvent([Reply("a")], bot=bot), req))
+
+    assert req.image_urls == ["https://img/api.jpg"]
+    assert api.calls == [("get_msg", {"message_id": "a"})]
+
+
+def test_missing_call_action_skips_without_breaking(monkeypatch):
+    from astrna.modules import quoted_image_input
+
+    monkeypatch.setattr(
+        quoted_image_input,
+        "extract_quoted_message_images",
+        fake_extract_via_optional_api,
+    )
+    logger = DummyLogger()
+    module = QuotedImageInputModule(logger=logger)
+    req = DummyRequest(image_urls=[])
+
+    run(module.optimize(DummyEvent([Reply("a")], bot=SimpleNamespace()), req))
+
+    assert req.image_urls == []
+    assert req.extra_user_content_parts == []
+    assert logger.debugs[0][0].startswith("AstrNa 发现当前消息含 Reply")
 
 
 def test_runtime_default_disabled_does_not_append(fakes, monkeypatch):

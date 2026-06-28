@@ -1,5 +1,11 @@
 # 更新日志
 
+## 1.2.8
+
+- 修复 NapCat / aiocqhttp 下引用图片视觉输入优化可能拿不到图片的问题：当 AstrBot 引用图解析器只识别 `bot.api.call_action`，而当前事件只有 `bot.call_action` 时，AstrNa 会提供轻量兼容代理。
+- 该修复不修改 AstrBot Core、不 monkeypatch 原 event，只在 AstrNa 解析当前 Reply 引用图片时生效；当前直接发图、历史图片清理、小模型压缩和图像转述逻辑保持不变。
+- 增加引用图补齐诊断日志：成功补图会记录追加数量，发现 Reply 但没有图片时记录 debug，便于排查过期引用或平台未返回图片的情况。
+
 ## 1.2.7
 
 - 新增优化引用图片视觉输入：主动回复、影芯或其他第三方插件通过 `event.request_llm()` 自建请求时，如果当前 `Reply` 引用图片没有进入 `req.image_urls`，AstrNa 会在请求层调用 AstrBot 自带引用图解析并去重补齐。

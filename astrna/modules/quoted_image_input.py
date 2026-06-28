@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 try:
@@ -65,11 +66,12 @@ class QuotedImageInputModule:
         existing_refs = set(normalize_and_dedupe_strings(image_urls))
         appended_refs: list[str] = []
         settings = build_current_reply_image_settings()
+        extractor_event = build_extractor_event(event)
 
         for reply in replies:
             try:
                 extracted_refs = await extract_quoted_message_images(  # type: ignore[misc]
-                    event,
+                    extractor_event,
                     reply,
                     settings=settings,
                 )
@@ -80,6 +82,13 @@ class QuotedImageInputModule:
                     exc,
                 )
                 continue
+
+            if not extracted_refs:
+                self._log(
+                    "debug",
+                    "AstrNa 发现当前消息含 Reply，但未从引用消息中提取到图片。reply_id=%s",
+                    getattr(reply, "id", None),
+                )
 
             for image_ref in normalize_and_dedupe_strings(extracted_refs):
                 if image_ref in existing_refs:
@@ -93,6 +102,11 @@ class QuotedImageInputModule:
                 create_temp_text_part(
                     QUOTED_IMAGE_INPUT_NOTICE.format(count=len(appended_refs)),
                 ),
+            )
+            self._log(
+                "debug",
+                "AstrNa 已补齐当前引用图片视觉输入，共追加 %d 张图片。",
+                len(appended_refs),
             )
 
     def _log(self, level: str, *args: Any) -> None:
@@ -137,6 +151,42 @@ def build_current_reply_image_settings() -> Any:
         )
     except Exception:  # noqa: BLE001
         return None
+
+
+def build_extractor_event(event: Any) -> Any:
+    """为 aiocqhttp/NapCat 事件补齐 AstrBot 引用图解析器期望的 bot.api。"""
+    bot = getattr(event, "bot", None)
+    if bot is None:
+        return event
+
+    api = getattr(bot, "api", None)
+    api_call_action = getattr(api, "call_action", None)
+    if callable(api_call_action):
+        return event
+
+    bot_call_action = getattr(bot, "call_action", None)
+    if not callable(bot_call_action):
+        return event
+
+    return _EventProxy(event, _BotProxy(bot, bot_call_action))
+
+
+class _EventProxy:
+    def __init__(self, event: Any, bot: Any):
+        self._event = event
+        self.bot = bot
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._event, name)
+
+
+class _BotProxy:
+    def __init__(self, bot: Any, call_action: Any):
+        self._bot = bot
+        self.api = SimpleNamespace(call_action=call_action)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._bot, name)
 
 
 def ensure_image_urls(req: Any) -> list[Any]:
