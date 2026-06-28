@@ -14,6 +14,7 @@ from astrna.modules.group_chat_context_optimizer import (
     create_temp_text_part,
     format_contexts,
     is_valid_compression_output,
+    truncate_contexts_by_turns,
 )
 
 
@@ -114,11 +115,15 @@ class DummyProvider:
 
 
 class DummyContext:
-    def __init__(self, providers=None):
+    def __init__(self, providers=None, *, provider_settings=None):
         self.providers = providers or {}
+        self.provider_settings = provider_settings or {}
 
     def get_provider_by_id(self, provider_id):
         return self.providers.get(provider_id)
+
+    def get_config(self, umo=None):
+        return {"provider_settings": self.provider_settings}
 
 
 class DummyLogger:
@@ -215,9 +220,12 @@ def valid_compressed_text():
     )
 
 
-def build_module(provider=None, *, provider_id="compress-1"):
+def build_module(provider=None, *, provider_id="compress-1", provider_settings=None):
     return GroupChatContextOptimizerModule(
-        context=DummyContext({provider_id: provider} if provider else {}),
+        context=DummyContext(
+            {provider_id: provider} if provider else {},
+            provider_settings=provider_settings,
+        ),
         logger=DummyLogger(),
         provider_id=provider_id,
     )
@@ -358,6 +366,244 @@ def test_compress_prompt_uses_sanitized_image_history_context(
     assert base64_image not in prompt
     assert IMAGE_HISTORY_PLACEHOLDER in prompt
     assert "旧图在这里" in prompt
+
+
+def build_long_contexts(turns=95):
+    contexts = []
+    for index in range(turns):
+        contexts.append({"role": "user", "content": f"history-{index:03d}-user"})
+        contexts.append(
+            {"role": "assistant", "content": f"history-{index:03d}-assistant"},
+        )
+    return contexts
+
+
+def test_compress_prompt_pretrims_main_history_by_astrbot_turn_settings(
+    astrbot_group_context_modules,
+):
+    provider = DummyProvider(valid_compressed_text())
+    module = build_module(
+        provider,
+        provider_settings={
+            "max_context_length": 30,
+            "dequeue_context_length": 15,
+        },
+    )
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_group_records(group_context, event)
+    req = DummyReq()
+    req.contexts = build_long_contexts()
+    original_contexts = list(req.contexts)
+
+    run(group_context.on_req_llm(event, req))
+
+    assert len(provider.calls) == 1
+    prompt = provider.calls[0]["prompt"]
+    assert "history-000-user" not in prompt
+    assert "history-078-user" not in prompt
+    assert "history-079-user" in prompt
+    assert "history-094-assistant" in prompt
+    assert prompt.count("history-") == 32
+    assert req.contexts == original_contexts
+    assert req.contexts is not original_contexts
+    assert len(req.contexts) == 190
+
+
+def test_compress_prompt_keeps_all_main_history_when_astrbot_turn_limit_disabled(
+    astrbot_group_context_modules,
+):
+    provider = DummyProvider(valid_compressed_text())
+    module = build_module(
+        provider,
+        provider_settings={
+            "max_context_length": -1,
+            "dequeue_context_length": 15,
+        },
+    )
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_group_records(group_context, event)
+    req = DummyReq()
+    req.contexts = build_long_contexts(turns=20)
+
+    run(group_context.on_req_llm(event, req))
+
+    prompt = provider.calls[0]["prompt"]
+    assert "history-000-user" in prompt
+    assert "history-019-assistant" in prompt
+    assert prompt.count("history-") == 40
+
+
+@pytest.mark.parametrize(
+    "provider_settings",
+    [
+        {},
+        {"max_context_length": "bad", "dequeue_context_length": 15},
+        {"max_context_length": 0, "dequeue_context_length": 15},
+        {"max_context_length": True, "dequeue_context_length": 15},
+    ],
+)
+def test_compress_prompt_invalid_turn_settings_fall_back_without_crashing(
+    astrbot_group_context_modules,
+    provider_settings,
+):
+    provider = DummyProvider(valid_compressed_text())
+    module = build_module(provider, provider_settings=provider_settings)
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_group_records(group_context, event)
+    req = DummyReq()
+    req.contexts = build_long_contexts(turns=20)
+
+    run(group_context.on_req_llm(event, req))
+
+    prompt = provider.calls[0]["prompt"]
+    assert "history-000-user" in prompt
+    assert "history-019-assistant" in prompt
+
+
+def test_compress_prompt_non_list_contexts_fall_back_without_crashing(
+    astrbot_group_context_modules,
+):
+    provider = DummyProvider(valid_compressed_text())
+    module = build_module(
+        provider,
+        provider_settings={
+            "max_context_length": 30,
+            "dequeue_context_length": 15,
+        },
+    )
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_group_records(group_context, event)
+    req = DummyReq()
+    req.contexts = "not-a-list"
+
+    run(group_context.on_req_llm(event, req))
+
+    assert len(provider.calls) == 1
+    assert "（无主会话历史）" in provider.calls[0]["prompt"]
+
+
+def test_compress_prompt_pretrim_keeps_system_and_first_user_when_tail_has_no_user(
+    astrbot_group_context_modules,
+):
+    provider = DummyProvider(valid_compressed_text())
+    module = build_module(
+        provider,
+        provider_settings={
+            "max_context_length": 1,
+            "dequeue_context_length": 1,
+        },
+    )
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_group_records(group_context, event)
+    req = DummyReq()
+    req.contexts = [
+        {"role": "system", "content": "system-anchor"},
+        {"role": "user", "content": "first-user-anchor"},
+        {"role": "assistant", "content": "old-assistant"},
+        {"role": "user", "content": "old-user"},
+        {"role": "assistant", "content": "tail-assistant-a"},
+        {"role": "assistant", "content": "tail-assistant-b"},
+    ]
+
+    run(group_context.on_req_llm(event, req))
+
+    prompt = provider.calls[0]["prompt"]
+    assert "system-anchor" in prompt
+    assert "first-user-anchor" in prompt
+    assert "old-user" not in prompt
+    assert "tail-assistant-a" in prompt
+    assert "tail-assistant-b" in prompt
+
+
+def test_pretrim_keeps_valid_tool_pairs_and_drops_orphan_tool_messages():
+    contexts = [
+        {"role": "user", "content": "old-user"},
+        {"role": "assistant", "content": "old-assistant"},
+        {"role": "user", "content": "tool-query"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": "{}"},
+                },
+            ],
+        },
+        {"role": "tool", "content": "tool-result", "tool_call_id": "call-1"},
+        {"role": "assistant", "content": "tool-final"},
+        {"role": "tool", "content": "orphan-tool", "tool_call_id": "missing"},
+        {"role": "assistant", "content": "latest-assistant"},
+    ]
+
+    trimmed = truncate_contexts_by_turns(
+        contexts,
+        keep_most_recent_turns=3,
+        drop_turns=1,
+    )
+
+    assert [item["role"] for item in trimmed] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "assistant",
+    ]
+    assert "old-user" not in format_contexts(trimmed)
+    assert "tool-query" in format_contexts(trimmed)
+    assert "tool-result" in format_contexts(trimmed)
+    assert "orphan-tool" not in format_contexts(trimmed)
+
+
+def test_compress_prompt_uses_group_context_config_when_runtime_config_fails(
+    astrbot_group_context_modules,
+):
+    class BrokenConfigContext(DummyContext):
+        def get_config(self, umo=None):
+            raise RuntimeError("config unavailable")
+
+    provider = DummyProvider(valid_compressed_text())
+    module = GroupChatContextOptimizerModule(
+        context=BrokenConfigContext({"compress-1": provider}),
+        logger=DummyLogger(),
+        provider_id="compress-1",
+    )
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    group_context.context = DummyContext(
+        provider_settings={
+            "max_context_length": 30,
+            "dequeue_context_length": 15,
+        },
+    )
+    event = DummyEvent()
+    seed_group_records(group_context, event)
+    req = DummyReq()
+    req.contexts = build_long_contexts()
+
+    run(group_context.on_req_llm(event, req))
+
+    prompt = provider.calls[0]["prompt"]
+    assert "history-000-user" not in prompt
+    assert "history-079-user" in prompt
+    assert prompt.count("history-") == 32
 
 
 def test_provider_missing_does_not_inject_original_group_context(
@@ -537,7 +783,7 @@ def test_prompt_uses_existing_contexts_without_hardcoded_turn_or_record_limits()
     assert "第二轮" in prompt
     assert "第三轮" in prompt
     assert "第四轮" in prompt
-    assert "已经由 AstrBot 按当前设置准备" in prompt
+    assert "已按 AstrBot 当前上下文轮次设置预裁剪" in prompt
     assert "group_message_max_cnt" not in prompt
     assert "300" not in prompt
     assert "保留几轮" not in prompt

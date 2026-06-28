@@ -158,7 +158,9 @@ class GroupChatContextOptimizerModule:
 
         prompt = build_compression_prompt(
             current_message=extract_current_message(event, req),
-            main_history=format_contexts(getattr(req, "contexts", None)),
+            main_history=format_contexts(
+                self.prepare_main_history_contexts(group_context, event, req),
+            ),
             group_context=original_group_context,
         )
         compressed = await self.compress_with_provider(provider, prompt)
@@ -173,6 +175,44 @@ class GroupChatContextOptimizerModule:
             "AstrNa 已压缩群聊上下文: session=%s",
             getattr(event, "unified_msg_origin", ""),
         )
+        return None
+
+    def prepare_main_history_contexts(
+        self,
+        group_context: Any,
+        event: Any,
+        req: Any,
+    ) -> Any:
+        contexts = getattr(req, "contexts", None)
+        if not isinstance(contexts, list):
+            return contexts
+
+        settings = self.resolve_provider_settings(group_context, event)
+        truncation = parse_context_truncation_settings(settings)
+        if truncation is None:
+            return contexts
+
+        max_context_length, dequeue_context_length = truncation
+        trimmed = truncate_contexts_by_turns(
+            list(contexts),
+            keep_most_recent_turns=max_context_length,
+            drop_turns=dequeue_context_length,
+        )
+        if len(trimmed) != len(contexts):
+            self._log(
+                "debug",
+                "AstrNa 已按 AstrBot 当前上下文轮次设置预裁剪压缩模型主会话历史: before=%s, after=%s",
+                len(contexts),
+                len(trimmed),
+            )
+        return trimmed
+
+    def resolve_provider_settings(self, group_context: Any, event: Any) -> Any:
+        for context in (self.context, getattr(group_context, "context", None)):
+            config = get_context_config(context, event)
+            settings = get_config_value(config, "provider_settings", None)
+            if settings is not None:
+                return settings
         return None
 
     async def build_rolling_group_context(
@@ -413,6 +453,186 @@ def format_context_content(content: Any) -> str:
     return "".join(parts).strip()
 
 
+def get_context_tool_calls(item: Any) -> Any:
+    if isinstance(item, dict):
+        return item.get("tool_calls")
+    return getattr(item, "tool_calls", None)
+
+
+def parse_context_truncation_settings(settings: Any) -> tuple[int, int] | None:
+    max_context_length = parse_int_setting(
+        get_config_value(settings, "max_context_length", None),
+    )
+    if max_context_length is None:
+        return None
+    if max_context_length == -1:
+        return -1, 1
+    if max_context_length <= 0:
+        return None
+
+    dequeue_context_length = parse_int_setting(
+        get_config_value(settings, "dequeue_context_length", 1),
+    )
+    if dequeue_context_length is None:
+        dequeue_context_length = 1
+    dequeue_context_length = min(max(1, dequeue_context_length), max_context_length - 1)
+    if dequeue_context_length <= 0:
+        dequeue_context_length = 1
+    return max_context_length, dequeue_context_length
+
+
+def parse_int_setting(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def truncate_contexts_by_turns(
+    contexts: list[Any],
+    *,
+    keep_most_recent_turns: int,
+    drop_turns: int = 1,
+) -> list[Any]:
+    if keep_most_recent_turns == -1:
+        return contexts
+
+    system_messages, non_system_messages = split_system_rest(contexts)
+    if len(non_system_messages) // 2 <= keep_most_recent_turns:
+        return contexts
+
+    num_to_keep = keep_most_recent_turns - drop_turns + 1
+    if num_to_keep <= 0:
+        truncated_contexts = []
+    else:
+        truncated_contexts = non_system_messages[-num_to_keep * 2 :]
+
+    first_user_index = next(
+        (
+            index
+            for index, item in enumerate(truncated_contexts)
+            if get_context_role(item) == "user"
+        ),
+        None,
+    )
+    if first_user_index is not None and first_user_index > 0:
+        truncated_contexts = truncated_contexts[first_user_index:]
+
+    result = ensure_first_user_message(
+        system_messages,
+        truncated_contexts,
+        contexts,
+    )
+    return fix_context_tool_message_pairs(result)
+
+
+def split_system_rest(contexts: list[Any]) -> tuple[list[Any], list[Any]]:
+    first_non_system = 0
+    for index, item in enumerate(contexts):
+        if get_context_role(item) != "system":
+            first_non_system = index
+            break
+    return contexts[:first_non_system], contexts[first_non_system:]
+
+
+def ensure_first_user_message(
+    system_messages: list[Any],
+    truncated_contexts: list[Any],
+    original_contexts: list[Any],
+) -> list[Any]:
+    if truncated_contexts and get_context_role(truncated_contexts[0]) == "user":
+        return [*system_messages, *truncated_contexts]
+
+    first_user = next(
+        (item for item in original_contexts if get_context_role(item) == "user"),
+        None,
+    )
+    if first_user is None:
+        return [*system_messages, *truncated_contexts]
+    return [*system_messages, first_user, *truncated_contexts]
+
+
+def fix_context_tool_message_pairs(contexts: list[Any]) -> list[Any]:
+    fixed_contexts: list[Any] = []
+    pending_assistant: Any | None = None
+    pending_tools: list[Any] = []
+
+    def flush_pending_if_valid() -> None:
+        nonlocal pending_assistant, pending_tools
+        if pending_assistant is not None and pending_tools:
+            fixed_contexts.append(pending_assistant)
+            fixed_contexts.extend(pending_tools)
+        pending_assistant = None
+        pending_tools = []
+
+    for item in contexts:
+        role = get_context_role(item)
+        if role == "tool":
+            if pending_assistant is not None:
+                pending_tools.append(item)
+            continue
+
+        if role == "assistant" and has_context_tool_calls(item):
+            flush_pending_if_valid()
+            pending_assistant = item
+            continue
+
+        flush_pending_if_valid()
+        fixed_contexts.append(item)
+
+    flush_pending_if_valid()
+    return fixed_contexts
+
+
+def has_context_tool_calls(item: Any) -> bool:
+    tool_calls = get_context_tool_calls(item)
+    return isinstance(tool_calls, list) and len(tool_calls) > 0
+
+
+def get_context_config(context: Any, event: Any) -> Any:
+    get_config = getattr(context, "get_config", None)
+    if not callable(get_config):
+        return None
+
+    umo = getattr(event, "unified_msg_origin", None)
+    if umo:
+        try:
+            return get_config(umo=umo)
+        except TypeError:
+            pass
+        except Exception:  # noqa: BLE001
+            return None
+
+    try:
+        return get_config()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def get_config_value(source: Any, key: str, default: Any = None) -> Any:
+    if source is None:
+        return default
+    if isinstance(source, dict):
+        return source.get(key, default)
+
+    getter = getattr(source, "get", None)
+    if callable(getter):
+        try:
+            return getter(key, default)
+        except TypeError:
+            try:
+                value = getter(key)
+            except Exception:  # noqa: BLE001
+                return default
+            return default if value is None else value
+        except Exception:  # noqa: BLE001
+            return default
+
+    return getattr(source, key, default)
+
+
 def build_compression_prompt(
     *,
     current_message: str,
@@ -430,7 +650,7 @@ def build_compression_prompt(
         "5. 说明小节必须写明：这里只是上下文筛选，不是回复建议。\n\n"
         "当前待回复消息：\n"
         f"{current_message}\n\n"
-        "主会话最近历史（已经由 AstrBot 按当前设置准备）：\n"
+        "主会话最近历史（已按 AstrBot 当前上下文轮次设置预裁剪）：\n"
         f"{main_history}\n\n"
         "AstrBot 最近群聊滚动窗口（记录条数沿用 AstrBot 当前群聊上下文设置）：\n"
         f"{group_context}\n\n"
