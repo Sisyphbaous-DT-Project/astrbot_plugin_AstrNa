@@ -1,5 +1,11 @@
 # 更新日志
 
+## 1.2.9
+
+- 修复当前 Reply 引用图片补齐仍可能不稳定的问题：当引用组件里只有 NapCat / aiocqhttp 的本地临时图片路径，且该路径已经失效时，AstrNa 会丢弃这条死路径，并通过 `get_msg` / `get_image` 等 OneBot 接口重新解析可用图片。
+- 增强 OneBot 兼容兜底：支持 `message_id` / `id` 两类取消息参数，并尝试 `get_file`、`get_group_file_url`、`get_private_file_url` 解析文件型图片引用。
+- 该修复只处理当前消息 Reply 相关图片，不影响普通直接发图、历史图片清理、小模型群聊上下文压缩、图像转述和会话历史。
+
 ## 1.2.8
 
 - 修复 NapCat / aiocqhttp 下引用图片视觉输入优化可能拿不到图片的问题：当 AstrBot 引用图解析器只识别 `bot.api.call_action`，而当前事件只有 `bot.call_action` 时，AstrNa 会提供轻量兼容代理。
