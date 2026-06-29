@@ -131,6 +131,54 @@
     "hint": "开启后，AstrNa 会在普通聊天中拦截模型误调用 send_message_to_user 发送当前会话纯文本的情况，把这段文本改为普通最终回复，让发送前插件、表情包识别、分段回复、合并转发等正常生效。为保证这些发送前插件能命中，本模块会在普通聊天里提前关闭本轮流式输出；跨会话主动消息、定时任务、live、图片/文件/语音/视频/@ 等非纯文本消息不会接管，仍走 AstrBot 原逻辑。默认关闭。",
     "default": false
   },
+  "output_length_limit_enabled": {
+    "type": "bool",
+    "description": "输出字数限制",
+    "hint": "开启后，AstrNa 会在普通 LLM 最终文本回复过长时，调用你选择的清洗模型按人格提示词和主模型思考内容重写成短回复，再把清洗结果放回 AstrBot 正常发送链，让输出增强、分段、合并转发、表情包等发送前插件继续生效。为了避免长文先流式发出，开启后非白名单会话会提前关闭本轮流式输出；Live Mode 会保留流式并跳过限制。默认关闭。",
+    "default": false
+  },
+  "output_length_limit_whitelist_umos": {
+    "type": "string",
+    "description": "输出限制白名单 UMO",
+    "hint": "一行一个或用逗号、分号分隔；命中的会话不会关闭流式，也不会限制输出。适合放行写作群、管理群或需要长回复的私聊。可用 AstrBot 的 /sid 指令获取 UMO。默认留空。",
+    "default": "",
+    "collapsed": true,
+    "condition": {
+      "output_length_limit_enabled": true
+    }
+  },
+  "output_length_limit_max_chars": {
+    "type": "int",
+    "description": "最多输出字数",
+    "hint": "超过这个字符数才会触发清洗。按字符数计算，中文、英文、标点、emoji 和换行都算；默认 50。清洗模型输出不会二次限制，如果清洗模型未配置、不可用、异常或输出为空，则会硬截断到这个长度。",
+    "default": 50,
+    "collapsed": true,
+    "condition": {
+      "output_length_limit_enabled": true
+    }
+  },
+  "output_length_limit_provider_id": {
+    "type": "string",
+    "description": "输出清洗模型",
+    "hint": "请选择 AstrBot 中已经配置好的聊天模型供应商，推荐使用便宜快速的小模型。该模型只在主模型最终文本超过限制时调用，用于识别提示词注入、模型流口水、重复长篇或无关内容，并按人格提示词、主模型思考内容和原始输出提取原意、改写短回复；调用使用临时 session，不写入会话历史。留空时会直接硬截断。",
+    "_special": "select_provider",
+    "default": "",
+    "collapsed": true,
+    "condition": {
+      "output_length_limit_enabled": true
+    }
+  },
+  "output_length_limit_persona_id": {
+    "type": "string",
+    "description": "输出清洗参考人格",
+    "hint": "可选。选择 AstrBot 人格后，清洗模型会参考该人格提示词改写短回复；留空时使用本轮实际 system prompt，更贴近当前会话的真实人格设置。",
+    "_special": "select_persona",
+    "default": "",
+    "collapsed": true,
+    "condition": {
+      "output_length_limit_enabled": true
+    }
+  },
   "provide_group_identity_tools": {
     "type": "bool",
     "description": "提供群身份查询工具",

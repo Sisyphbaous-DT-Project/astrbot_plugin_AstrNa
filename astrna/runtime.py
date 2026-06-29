@@ -17,6 +17,10 @@ from .modules.group_sender_concurrency import GroupSenderConcurrencyModule
 from .modules.identity_metadata import IdentityMetadataModule
 from .modules.issue_assistant import IssueAssistantModule
 from .modules.long_reply_context import LongReplyContextModule
+from .modules.output_length_limiter import (
+    DEFAULT_OUTPUT_LENGTH_LIMIT,
+    OutputLengthLimiterModule,
+)
 from .modules.quoted_image_input import QuotedImageInputModule
 from .modules.reply_target_history import ReplyTargetHistoryModule
 from .modules.send_message_to_user import SendMessageToUserModule
@@ -39,6 +43,11 @@ DEFAULT_CONFIG = {
     "group_chat_context_compress_provider_id": "",
     "optimize_image_caption": False,
     "optimize_send_message_to_user": False,
+    "output_length_limit_enabled": False,
+    "output_length_limit_whitelist_umos": "",
+    "output_length_limit_max_chars": DEFAULT_OUTPUT_LENGTH_LIMIT,
+    "output_length_limit_provider_id": "",
+    "output_length_limit_persona_id": "",
     "provide_group_identity_tools": False,
     "optimize_reply_target_history": False,
     "optimize_long_reply_context": False,
@@ -78,6 +87,17 @@ class AstrNaRuntime:
         self.quoted_image_input = QuotedImageInputModule(logger=logger)
         self.image_caption = ImageCaptionModule(logger=logger)
         self.send_message_to_user = SendMessageToUserModule(logger=logger)
+        self.output_length_limiter = OutputLengthLimiterModule(
+            context=context,
+            logger=logger,
+            whitelist_umos=self.config.get("output_length_limit_whitelist_umos", ""),
+            max_chars=self.config.get(
+                "output_length_limit_max_chars",
+                DEFAULT_OUTPUT_LENGTH_LIMIT,
+            ),
+            provider_id=self.config.get("output_length_limit_provider_id", ""),
+            persona_id=self.config.get("output_length_limit_persona_id", ""),
+        )
         self.group_identity_tools = GroupIdentityToolsModule(
             context=context,
             logger=logger,
@@ -118,6 +138,8 @@ class AstrNaRuntime:
             self.image_caption.install()
         if self.config.get("optimize_send_message_to_user", False):
             self.send_message_to_user.install()
+        if self.config.get("output_length_limit_enabled", False):
+            self.output_length_limiter.install()
         if self.config.get("provide_group_identity_tools", False):
             self.group_identity_tools.install()
         if self.config.get("optimize_long_reply_context", False):
@@ -142,6 +164,19 @@ class AstrNaRuntime:
         if self.config.get("optimize_send_message_to_user", False):
             self.send_message_to_user.install()
             self.send_message_to_user.prepare_request(event, req)
+        if self.config.get("output_length_limit_enabled", False):
+            self.output_length_limiter.configure(
+                whitelist_umos=self.config.get("output_length_limit_whitelist_umos", ""),
+                max_chars=self.config.get(
+                    "output_length_limit_max_chars",
+                    DEFAULT_OUTPUT_LENGTH_LIMIT,
+                ),
+                provider_id=self.config.get("output_length_limit_provider_id", ""),
+                persona_id=self.config.get("output_length_limit_persona_id", ""),
+            )
+            self.output_length_limiter.install()
+        else:
+            self.output_length_limiter.terminate()
 
         self._configure_issue_assistant()
         await self.issue_assistant.prepare_request(event, req)
@@ -302,6 +337,7 @@ class AstrNaRuntime:
         self.image_history_context.terminate()
         self.image_caption.terminate()
         self.send_message_to_user.terminate()
+        self.output_length_limiter.terminate()
         self.group_identity_tools.terminate()
         self.reply_target_history.terminate()
         self.deepseek_v4_400.terminate()

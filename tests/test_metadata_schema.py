@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.3.1"
+    assert metadata["version"] == "1.3.2"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -45,6 +45,11 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "group_chat_context_compress_provider_id",
         "optimize_image_caption",
         "optimize_send_message_to_user",
+        "output_length_limit_enabled",
+        "output_length_limit_whitelist_umos",
+        "output_length_limit_max_chars",
+        "output_length_limit_provider_id",
+        "output_length_limit_persona_id",
         "provide_group_identity_tools",
         "optimize_reply_target_history",
         "unlock_group_sender_concurrency",
@@ -171,6 +176,50 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         == "优化send_message_to_user工具"
     )
     assert schema["optimize_send_message_to_user"]["default"] is False
+    assert schema["output_length_limit_enabled"]["type"] == "bool"
+    assert schema["output_length_limit_enabled"]["description"] == "输出字数限制"
+    assert schema["output_length_limit_enabled"]["default"] is False
+    assert "正常发送链" in schema["output_length_limit_enabled"]["hint"]
+    assert "关闭本轮流式输出" in schema["output_length_limit_enabled"]["hint"]
+    assert "Live Mode" in schema["output_length_limit_enabled"]["hint"]
+    assert schema["output_length_limit_whitelist_umos"]["type"] == "string"
+    assert (
+        schema["output_length_limit_whitelist_umos"]["description"]
+        == "输出限制白名单 UMO"
+    )
+    assert schema["output_length_limit_whitelist_umos"]["default"] == ""
+    assert schema["output_length_limit_whitelist_umos"]["collapsed"] is True
+    assert schema["output_length_limit_whitelist_umos"]["condition"] == {
+        "output_length_limit_enabled": True,
+    }
+    assert "/sid" in schema["output_length_limit_whitelist_umos"]["hint"]
+    assert schema["output_length_limit_max_chars"]["type"] == "int"
+    assert schema["output_length_limit_max_chars"]["description"] == "最多输出字数"
+    assert schema["output_length_limit_max_chars"]["default"] == 50
+    assert schema["output_length_limit_max_chars"]["collapsed"] is True
+    assert schema["output_length_limit_max_chars"]["condition"] == {
+        "output_length_limit_enabled": True,
+    }
+    assert "不会二次限制" in schema["output_length_limit_max_chars"]["hint"]
+    assert schema["output_length_limit_provider_id"]["type"] == "string"
+    assert schema["output_length_limit_provider_id"]["description"] == "输出清洗模型"
+    assert schema["output_length_limit_provider_id"]["default"] == ""
+    assert schema["output_length_limit_provider_id"]["_special"] == "select_provider"
+    assert schema["output_length_limit_provider_id"]["collapsed"] is True
+    assert schema["output_length_limit_provider_id"]["condition"] == {
+        "output_length_limit_enabled": True,
+    }
+    assert "流口水" in schema["output_length_limit_provider_id"]["hint"]
+    assert "临时 session" in schema["output_length_limit_provider_id"]["hint"]
+    assert schema["output_length_limit_persona_id"]["type"] == "string"
+    assert schema["output_length_limit_persona_id"]["description"] == "输出清洗参考人格"
+    assert schema["output_length_limit_persona_id"]["default"] == ""
+    assert schema["output_length_limit_persona_id"]["_special"] == "select_persona"
+    assert schema["output_length_limit_persona_id"]["collapsed"] is True
+    assert schema["output_length_limit_persona_id"]["condition"] == {
+        "output_length_limit_enabled": True,
+    }
+    assert "本轮实际 system prompt" in schema["output_length_limit_persona_id"]["hint"]
     assert schema["provide_group_identity_tools"]["type"] == "bool"
     assert (
         schema["provide_group_identity_tools"]["description"]
@@ -269,5 +318,6 @@ def test_changelog_contains_release_notes():
     assert "## 1.2.8" in changelog
     assert "## 1.2.9" in changelog
     assert "## 1.3.1" in changelog
+    assert "## 1.3.2" in changelog
     assert "## 1.2.5" in changelog
     assert "## 1.2.4" in changelog
