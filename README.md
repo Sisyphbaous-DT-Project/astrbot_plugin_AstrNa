@@ -2,6 +2,9 @@
 
 AstrNa 是一款面向 AstrBot 的优化插件，目标是在不修改 AstrBot Core 的前提下，通过可独立开关的运行时补丁，改善上下文、发送链路、身份元数据、工具调用和部分模型兼容问题。
 
+> 💌 售后：`777879783`
+> 有问题请加，清漪也会蹦出来一起捣鼓。
+
 🎉 AstrNa 正式版已经发布。当前正式版：`1.3.1`
 
 - 仓库地址：[Sisyphbaous-DT-Project/astrbot_plugin_AstrNa](https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_AstrNa)
