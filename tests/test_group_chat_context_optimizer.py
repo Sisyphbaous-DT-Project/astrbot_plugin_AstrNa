@@ -9,6 +9,7 @@ import pytest
 
 from astrna.modules.group_chat_context_optimizer import (
     GROUP_CONTEXT_COMPRESS_TIMEOUT_SECONDS,
+    GROUP_CONTEXT_PERSISTENCE_KEY,
     GroupChatContextOptimizerModule,
     build_compression_prompt,
     create_temp_text_part,
@@ -47,6 +48,8 @@ class TextPart:
 class DummyGroupChatContext:
     def __init__(self):
         self.calls = []
+        self.handle_calls = []
+        self.remove_calls = []
         self._locks = {}
         self.raw_records = defaultdict(deque)
         self._record_ids = defaultdict(deque)
@@ -57,6 +60,36 @@ class DummyGroupChatContext:
             lock = asyncio.Lock()
             self._locks[umo] = lock
         return lock
+
+    def cfg(self, event):
+        return {"group_message_max_cnt": getattr(event, "group_message_max_cnt", 300)}
+
+    async def handle_message(self, event):
+        self.handle_calls.append(event)
+        umo = event.unified_msg_origin
+        async with self._get_lock(umo):
+            records = self.raw_records[umo]
+            record_ids = self._record_ids[umo]
+            record_id = f"handled-{len(records)}"
+            records.append(f"[群友/{len(records):02d}:00:00]:  记录{len(records)}")
+            record_ids.append(record_id)
+            max_cnt = self.cfg(event)["group_message_max_cnt"]
+            while len(records) > max_cnt:
+                records.popleft()
+            while len(record_ids) > len(records):
+                record_ids.popleft()
+            event.set_extra("_group_context_record_id", record_id)
+            event.set_extra("_group_context_raw_idx", len(records) - 1)
+
+    async def remove_session(self, event):
+        self.remove_calls.append(event)
+        umo = event.unified_msg_origin
+        async with self._get_lock(umo):
+            count = len(self.raw_records.get(umo, deque()))
+            self.raw_records.pop(umo, None)
+            self._record_ids.pop(umo, None)
+        self._locks.pop(umo, None)
+        return count
 
     async def on_req_llm(self, event, req):
         self.calls.append((event, req))
@@ -140,6 +173,29 @@ class DummyLogger:
 
     def debug(self, *args):
         self.debugs.append(args)
+
+
+class DummyKVStore:
+    def __init__(self, initial=None, *, fail_get=False, fail_put=False, fail_delete=False):
+        self.data = dict(initial or {})
+        self.fail_get = fail_get
+        self.fail_put = fail_put
+        self.fail_delete = fail_delete
+
+    async def get_kv_data(self, key, default):
+        if self.fail_get:
+            raise RuntimeError("get failed")
+        return self.data.get(key, default)
+
+    async def put_kv_data(self, key, value):
+        if self.fail_put:
+            raise RuntimeError("put failed")
+        self.data[key] = value
+
+    async def delete_kv_data(self, key):
+        if self.fail_delete:
+            raise RuntimeError("delete failed")
+        self.data.pop(key, None)
 
 
 class DummyReq:
@@ -228,6 +284,24 @@ def build_module(provider=None, *, provider_id="compress-1", provider_settings=N
         ),
         logger=DummyLogger(),
         provider_id=provider_id,
+    )
+
+
+def build_module_with_kv(
+    provider=None,
+    *,
+    provider_id="compress-1",
+    provider_settings=None,
+    kv_store=None,
+):
+    return GroupChatContextOptimizerModule(
+        context=DummyContext(
+            {provider_id: provider} if provider else {},
+            provider_settings=provider_settings,
+        ),
+        logger=DummyLogger(),
+        provider_id=provider_id,
+        kv_store=kv_store,
     )
 
 
@@ -742,6 +816,188 @@ def test_enabled_uses_rolling_records_after_previous_llm_request(
         "[用户/12:02:00]:  小明刚才说了什么？",
         "[小蓝/12:03:00]:  我也想打游戏。",
     ]
+
+
+def test_handle_message_persists_group_context_with_astrbot_window_limit(
+    astrbot_group_context_modules,
+):
+    kv_store = DummyKVStore()
+    module = build_module_with_kv(
+        DummyProvider(valid_compressed_text()),
+        kv_store=kv_store,
+    )
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    event.group_message_max_cnt = 2
+
+    run(group_context.handle_message(event))
+    run(group_context.handle_message(event))
+    run(group_context.handle_message(event))
+
+    state = kv_store.data[GROUP_CONTEXT_PERSISTENCE_KEY]
+    session = state["sessions"][event.unified_msg_origin]
+    assert session["records"] == [
+        "[群友/01:00:00]:  记录1",
+        "[群友/02:00:00]:  记录2",
+    ]
+    assert session["record_ids"] == ["handled-1", "handled-2"]
+    assert isinstance(session["updated_at"], int)
+
+
+def test_missing_marker_uses_existing_rolling_window_for_active_reply_trigger(
+    astrbot_group_context_modules,
+):
+    provider = DummyProvider(valid_compressed_text())
+    module = build_module(provider)
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_group_records(group_context, event)
+    event.extra.clear()
+    req = DummyReq()
+
+    run(group_context.on_req_llm(event, req))
+
+    assert len(provider.calls) == 1
+    prompt = provider.calls[0]["prompt"]
+    assert "[小明/12:00:00]" in prompt
+    assert "[小红/12:01:00]" in prompt
+    assert "[用户/12:02:00]" in prompt
+    assert "AstrNa 群聊上下文筛选" in req.extra_user_content_parts[0].text
+
+
+def test_restart_restore_from_kv_allows_missing_marker_compression(
+    astrbot_group_context_modules,
+):
+    kv_store = DummyKVStore(
+        {
+            GROUP_CONTEXT_PERSISTENCE_KEY: {
+                "version": 1,
+                "sessions": {
+                    "aiocqhttp:GroupMessage:123456": {
+                        "records": [
+                            "[小明/12:00:00]:  今天晚上打游戏吗？",
+                            "[小红/12:01:00]:  我想先写作业。",
+                        ],
+                        "record_ids": ["record-1", "record-2"],
+                        "updated_at": 1,
+                    },
+                },
+            },
+        },
+    )
+    provider = DummyProvider(valid_compressed_text())
+    module = build_module_with_kv(provider, kv_store=kv_store)
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    req = DummyReq()
+
+    run(group_context.on_req_llm(event, req))
+
+    assert len(provider.calls) == 1
+    assert list(group_context.raw_records[event.unified_msg_origin]) == [
+        "[小明/12:00:00]:  今天晚上打游戏吗？",
+        "[小红/12:01:00]:  我想先写作业。",
+    ]
+    prompt = provider.calls[0]["prompt"]
+    assert "[小明/12:00:00]" in prompt
+    assert "[小红/12:01:00]" in prompt
+
+
+def test_marker_path_after_restore_excludes_current_message(
+    astrbot_group_context_modules,
+):
+    kv_store = DummyKVStore(
+        {
+            GROUP_CONTEXT_PERSISTENCE_KEY: {
+                "version": 1,
+                "sessions": {
+                    "aiocqhttp:GroupMessage:123456": {
+                        "records": [
+                            "[小明/12:00:00]:  今天晚上打游戏吗？",
+                            "[用户/12:02:00]:  小明刚才说了什么？",
+                        ],
+                        "record_ids": ["record-1", "record-current"],
+                        "updated_at": 1,
+                    },
+                },
+            },
+        },
+    )
+    provider = DummyProvider(valid_compressed_text())
+    module = build_module_with_kv(provider, kv_store=kv_store)
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    event.set_extra("_group_context_record_id", "record-current")
+    event.set_extra("_group_context_raw_idx", 1)
+    req = DummyReq()
+
+    run(group_context.on_req_llm(event, req))
+
+    prompt = provider.calls[0]["prompt"]
+    assert "[小明/12:00:00]" in prompt
+    assert "[用户/12:02:00]" not in prompt
+
+
+def test_remove_session_deletes_persisted_group_context(
+    astrbot_group_context_modules,
+):
+    kv_store = DummyKVStore(
+        {
+            GROUP_CONTEXT_PERSISTENCE_KEY: {
+                "version": 1,
+                "sessions": {
+                    "aiocqhttp:GroupMessage:123456": {
+                        "records": ["[小明/12:00:00]:  旧记录"],
+                        "record_ids": ["record-1"],
+                        "updated_at": 1,
+                    },
+                },
+            },
+        },
+    )
+    module = build_module_with_kv(
+        DummyProvider(valid_compressed_text()),
+        kv_store=kv_store,
+    )
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+
+    assert run(group_context.remove_session(event)) == 0
+
+    assert kv_store.data[GROUP_CONTEXT_PERSISTENCE_KEY]["sessions"] == {}
+
+
+def test_persistence_failures_do_not_break_llm_request(
+    astrbot_group_context_modules,
+):
+    provider = DummyProvider(valid_compressed_text())
+    module = build_module_with_kv(
+        provider,
+        kv_store=DummyKVStore(fail_get=True, fail_put=True),
+    )
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_group_records(group_context, event)
+    event.extra.clear()
+    req = DummyReq()
+
+    run(group_context.handle_message(event))
+    run(group_context.on_req_llm(event, req))
+
+    assert len(provider.calls) == 1
+    assert module.logger.debugs
 
 
 def test_original_behavior_is_restored_after_terminate_and_consumes_records(

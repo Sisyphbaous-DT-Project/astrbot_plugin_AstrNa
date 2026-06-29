@@ -2,7 +2,7 @@
 
 AstrNa 是一款面向 AstrBot 的优化插件，目标是在不修改 AstrBot Core 的前提下，通过可独立开关的运行时补丁，改善上下文、发送链路、身份元数据、工具调用和部分模型兼容问题。
 
-🎉 AstrNa 正式版已经发布。当前正式版：`1.2.9`
+🎉 AstrNa 正式版已经发布。当前正式版：`1.3.1`
 
 - 仓库地址：[Sisyphbaous-DT-Project/astrbot_plugin_AstrNa](https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_AstrNa)
 - 作者主页：[Sisyphbaous-DT-Project](https://github.com/Sisyphbaous-DT-Project)
@@ -170,7 +170,9 @@ AstrBot 原生主流程会把当前消息里的图片和引用图片整理进 `r
 
 这个功能依赖 AstrBot 自带“群聊上下文感知”已经启用。AstrBot 原生的 `group_message_max_cnt` 是群聊记录缓存上限，不代表每次都会固定注入这么多条；原生逻辑会在每次 LLM 请求后移除已经注入过的群聊记录。
 
-开启后，AstrNa 会复用 AstrBot 自己维护的最近 N 条群聊缓存作为滚动窗口，N 仍完全沿用 AstrBot 当前 `group_message_max_cnt` 设置。AstrNa 不额外设置群聊记录条数，也不额外设置主会话历史轮数，而是把这些内容交给压缩模型筛选：
+开启后，AstrNa 会复用 AstrBot 自己维护的最近 N 条群聊缓存作为滚动窗口，N 仍完全沿用 AstrBot 当前 `group_message_max_cnt` 设置。AstrNa 不额外设置群聊记录条数，也不额外设置主会话历史轮数；同时会持久保存最近群聊文本到 AstrBot 插件 KV，重启后仍可用于小模型筛选。影芯、主动回复或第三方插件提前触发 `request_llm()`，导致 AstrBot 还没给当前事件打群聊上下文标记时，AstrNa 会尽量使用已保存或已记录的滚动窗口继续压缩。
+
+这些内容会交给压缩模型筛选：
 
 - 按 AstrBot 当前上下文轮次设置预裁剪后的主会话最近历史。
 - AstrBot 最近 N 条群聊滚动窗口。
@@ -179,6 +181,8 @@ AstrBot 原生主流程会把当前消息里的图片和引用图片整理进 `r
 AstrNa 会先调用你在子项中选择的聊天模型供应商，让它只做“相关上下文筛选 + 简短摘要”，然后把筛选结果作为临时内容注入给主模型。推荐选择 `deepseek-v4-flash` 这类便宜快速的小模型。主会话最近历史只提供给压缩模型用于判断相关性，不会被 AstrNa 额外重复注入给主模型；传给压缩模型的这份历史副本也会沿用 AstrBot 当前 `max_context_length` 和 `dequeue_context_length` 规则预裁剪，不会把截断前完整 conversation history 全量交给小模型。主模型自己的正式上下文截断仍由 AstrBot 原生链路处理。
 
 需要注意的是，压缩用的小模型每轮都会读取变化的当前消息、主会话最近历史和群聊滚动窗口，提示词缓存通常很难命中，甚至可能基本失效；因此它应当优先选择成本低、速度快的模型，而不是昂贵的主力模型。
+
+另一个需要注意的点是：开启该功能后，AstrNa 会持久保存最近群聊文本用于重启恢复。
 
 小模型输出会明确包含：
 
@@ -307,7 +311,7 @@ AstrNa 主要面向 AstrBot 当前 4.x 版本。当前版本已在本地 AstrBot
 
 ## 验证状态
 
-`1.2.9` 发布前通过以下验证：
+`1.3.1` 发布前通过以下验证：
 
 ```bash
 TMPDIR=/tmp PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q -s

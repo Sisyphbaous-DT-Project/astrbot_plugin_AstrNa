@@ -88,7 +88,9 @@ class AstrNaRuntime:
             context=context,
             logger=logger,
             provider_id=self.config.get("group_chat_context_compress_provider_id", ""),
+            kv_store=kv_store,
         )
+        self._configure_group_context_persist_callback()
         self.issue_assistant = IssueAssistantModule(
             context=context,
             logger=logger,
@@ -181,6 +183,7 @@ class AstrNaRuntime:
         self.group_chat_context_optimizer.configure(
             provider_id=self.config.get("group_chat_context_compress_provider_id", ""),
         )
+        self._configure_group_context_persist_callback()
         if self.config.get("optimize_group_chat_context", False):
             self.group_chat_context_optimizer.install()
         else:
@@ -280,6 +283,14 @@ class AstrNaRuntime:
             github_token=self.config.get("issue_assistant_github_token", ""),
             target_umo=self.config.get("issue_assistant_target_umo", ""),
         )
+
+    def _configure_group_context_persist_callback(self) -> None:
+        if self.config.get("optimize_group_chat_context", False):
+            self.long_reply_context.group_context_persist_callback = (
+                self.group_chat_context_optimizer.persist_group_context
+            )
+        else:
+            self.long_reply_context.group_context_persist_callback = None
 
     async def terminate(self) -> None:
         await self.issue_assistant.terminate()

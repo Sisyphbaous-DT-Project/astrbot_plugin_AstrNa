@@ -96,3 +96,25 @@ def test_merge_config_supports_old_identity_metadata_key():
     config = merge_config({"identity_metadata": True})
 
     assert config["optimize_identity_metadata"] is True
+
+
+def test_long_reply_group_context_persist_callback_follows_optimizer_switch(fakes):
+    disabled_runtime = fakes.build_runtime(
+        {
+            "optimize_long_reply_context": True,
+            "optimize_group_chat_context": False,
+        },
+    )
+    assert disabled_runtime.long_reply_context.group_context_persist_callback is None
+
+    enabled_runtime = fakes.build_runtime(
+        {
+            "optimize_long_reply_context": True,
+            "optimize_group_chat_context": True,
+            "group_chat_context_compress_provider_id": "compress-provider",
+        },
+    )
+    assert (
+        enabled_runtime.long_reply_context.group_context_persist_callback
+        == enabled_runtime.group_chat_context_optimizer.persist_group_context
+    )

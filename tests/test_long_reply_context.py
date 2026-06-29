@@ -418,6 +418,15 @@ def test_enabled_runtime_installs_patch_and_terminate_restores(fakes, astrbot_mo
     assert astrbot_modules.respond_cls.process is original_respond
 
 
+def test_terminate_clears_group_context_persist_callback():
+    module = LongReplyContextModule(logger=DummyLogger())
+    module.group_context_persist_callback = lambda group_context, event: None
+
+    module.terminate()
+
+    assert module.group_context_persist_callback is None
+
+
 def test_install_is_idempotent(astrbot_modules):
     module = LongReplyContextModule(logger=DummyLogger())
     assert module.install() is True

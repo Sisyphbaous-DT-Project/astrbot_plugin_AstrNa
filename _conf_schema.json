@@ -105,7 +105,7 @@
   "optimize_group_chat_context": {
     "type": "bool",
     "description": "群聊上下文优化",
-    "hint": "开启后，AstrNa 会在 AstrBot 自带群聊上下文感知已经启用时，先调用一个已配置的聊天模型，把主会话最近历史、最近群聊滚动窗口和当前待回复消息筛选成“相关原文摘录 + 简短摘要”，再作为临时 extra_user_content_parts 内容给主模型看。主会话最近历史会按 AstrBot 当前 max_context_length/dequeue_context_length 规则预裁剪，不会把截断前完整 conversation history 全量交给压缩模型；群聊滚动窗口数量仍完全沿用 AstrBot 当前 group_message_max_cnt。AstrBot 原生逻辑会在每次 LLM 请求后移除已注入的群聊记录，group_message_max_cnt 只是缓存上限，不代表每次固定注入 N 条；AstrNa 会复用 AstrBot 自己维护的最近 N 条群聊缓存，不额外配置。这个压缩模型只负责筛选上下文，不负责生成回复建议；失败、未选择模型或群聊上下文不存在时不会把原始群聊流水账交给主模型，避免 token 爆炸。默认关闭。",
+    "hint": "开启后，AstrNa 会在 AstrBot 自带群聊上下文感知已经启用时，先调用一个已配置的聊天模型，把主会话最近历史、最近群聊滚动窗口和当前待回复消息筛选成“相关原文摘录 + 简短摘要”，再作为临时 extra_user_content_parts 内容给主模型看。主会话最近历史会按 AstrBot 当前 max_context_length/dequeue_context_length 规则预裁剪，不会把截断前完整 conversation history 全量交给压缩模型；群聊滚动窗口数量仍完全沿用 AstrBot 当前 group_message_max_cnt。AstrBot 原生逻辑会在每次 LLM 请求后移除已注入的群聊记录，group_message_max_cnt 只是缓存上限，不代表每次固定注入 N 条；AstrNa 会复用 AstrBot 自己维护的最近 N 条群聊缓存，并持久保存最近群聊文本到 AstrBot 插件 KV，重启后仍可用于小模型筛选。主动回复或第三方插件提前触发 request_llm、导致 AstrBot 还没给当前事件打群聊上下文标记时，AstrNa 会尽量使用已保存/已记录的滚动窗口进行压缩。这个压缩模型只负责筛选上下文，不负责生成回复建议；失败、未选择模型或群聊上下文不存在时不会把原始群聊流水账交给主模型，避免 token 爆炸。默认关闭。",
     "default": false
   },
   "group_chat_context_compress_provider_id": {

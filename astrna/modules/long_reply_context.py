@@ -44,6 +44,7 @@ class LongReplyContextModule:
         self.logger = logger
         self._installed = False
         self._pending: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self.group_context_persist_callback: Any = None
 
     def install(self) -> bool:
         if self._installed and type(self)._active_module is self:
@@ -66,6 +67,7 @@ class LongReplyContextModule:
             module_cls.restore_patch()
         self._installed = False
         self._pending.clear()
+        self.group_context_persist_callback = None
 
     @classmethod
     def restore_patch(cls) -> None:
@@ -467,6 +469,13 @@ class LongReplyContextModule:
                         record_ids.popleft()
                 except Exception:  # noqa: BLE001
                     pass
+
+        persist_callback = self.group_context_persist_callback
+        if callable(persist_callback):
+            try:
+                await persist_callback(group_chat_context, event)
+            except Exception as exc:  # noqa: BLE001
+                self._log("debug", "AstrNa 持久化 Bot 群聊上下文记录失败: %s", exc)
 
     def _find_pending_for_event(self, event: Any) -> tuple[str | None, dict[str, Any] | None]:
         umo = sanitize_key_part(getattr(event, "unified_msg_origin", None))
