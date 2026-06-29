@@ -5,6 +5,7 @@ import re
 import time
 import uuid
 from collections import deque
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -12,6 +13,7 @@ GROUP_CONTEXT_COMPRESS_TIMEOUT_SECONDS = 300
 GROUP_CONTEXT_PERSISTENCE_KEY = "group_chat_context_optimizer_state_v1"
 GROUP_CONTEXT_PERSISTENCE_VERSION = 1
 GROUP_CONTEXT_MAX_PERSISTED_SESSIONS = 128
+GROUP_CONTEXT_FALLBACK_RECENT_RECORDS = 15
 GROUP_CONTEXT_HEADER_MARKER = "--- BEGIN CONTEXT---"
 GROUP_CONTEXT_FOOTER_MARKER = "--- END CONTEXT ---"
 GROUP_CONTEXT_BLOCK_HEADER = (
@@ -22,6 +24,7 @@ GROUP_CONTEXT_BLOCK_HEADER = (
 )
 GROUP_CONTEXT_BLOCK_FOOTER = f"\n{GROUP_CONTEXT_FOOTER_MARKER}\n</system_reminder>"
 ASTRNA_GROUP_CONTEXT_TITLE = "AstrNa 群聊上下文筛选"
+ASTRNA_GROUP_CONTEXT_FALLBACK_TITLE = "AstrNa 最近群聊兜底上下文"
 OUTPUT_REQUIRED_MARKERS = ("相关原文", "简短摘要", "说明")
 OUTPUT_DISCLAIMER_MARKERS = (
     "不是回复建议",
@@ -37,8 +40,13 @@ REPLY_SUGGESTION_PATTERN = re.compile(
 )
 
 
+@dataclass(slots=True)
+class RollingGroupContextSelection:
+    records: list[str]
+
+
 class GroupChatContextOptimizerModule:
-    """用小模型筛选 AstrBot 群聊上下文流水账，降低主模型额外上下文噪声。"""
+    """用最近群聊兜底和小模型筛选降低主模型额外上下文噪声。"""
 
     _group_chat_context_cls: type | None = None
     _original_on_req_llm: Any = None
@@ -176,7 +184,7 @@ class GroupChatContextOptimizerModule:
         elif not self._empty_provider_logged:
             self._log(
                 "info",
-                "AstrNa 已启用群聊上下文优化，但尚未选择压缩模型，本轮不会注入原始群聊流水账。",
+                "AstrNa 已启用群聊上下文优化，但尚未选择压缩模型，本轮仅注入最近群聊兜底上下文。",
             )
             self._empty_provider_logged = True
         return True
@@ -225,12 +233,17 @@ class GroupChatContextOptimizerModule:
         event: Any,
         req: Any,
     ) -> Any:
-        original_group_context = await self.build_rolling_group_context(
+        group_selection = await self.build_rolling_group_context_selection(
             group_context,
             event,
         )
-        if not original_group_context:
+        if not group_selection.records:
             return None
+
+        fallback_records = group_selection.records[-GROUP_CONTEXT_FALLBACK_RECENT_RECORDS:]
+        ensure_extra_user_content_parts(req).append(
+            create_temp_text_part(build_fallback_context_text(fallback_records)),
+        )
 
         provider = self.resolve_compress_provider(group_context)
         if provider is None:
@@ -241,7 +254,7 @@ class GroupChatContextOptimizerModule:
             main_history=format_contexts(
                 self.prepare_main_history_contexts(group_context, event, req),
             ),
-            group_context=original_group_context,
+            group_context=format_group_history_block(group_selection.records),
         )
         compressed = await self.compress_with_provider(provider, prompt)
         if not is_valid_compression_output(compressed):
@@ -484,6 +497,19 @@ class GroupChatContextOptimizerModule:
         group_context: Any,
         event: Any,
     ) -> str:
+        selection = await self.build_rolling_group_context_selection(
+            group_context,
+            event,
+        )
+        if not selection.records:
+            return ""
+        return format_group_history_block(selection.records)
+
+    async def build_rolling_group_context_selection(
+        self,
+        group_context: Any,
+        event: Any,
+    ) -> RollingGroupContextSelection:
         umo = getattr(event, "unified_msg_origin", "")
         await self.restore_group_context(group_context, event)
         record_id = get_event_extra(event, "_group_context_record_id", None)
@@ -495,8 +521,8 @@ class GroupChatContextOptimizerModule:
         else:
             lock = None
 
-        async def read_records() -> str:
-            return self._read_rolling_group_context_locked(
+        async def read_records() -> list[str]:
+            return self._read_rolling_group_context_records_locked(
                 group_context,
                 umo,
                 record_id,
@@ -504,10 +530,10 @@ class GroupChatContextOptimizerModule:
             )
 
         if lock is None:
-            return await read_records()
+            return RollingGroupContextSelection(await read_records())
 
         async with lock:
-            return await read_records()
+            return RollingGroupContextSelection(await read_records())
 
     def _read_rolling_group_context_locked(
         self,
@@ -516,10 +542,27 @@ class GroupChatContextOptimizerModule:
         record_id: Any,
         prompt_idx: Any,
     ) -> str:
+        records = self._read_rolling_group_context_records_locked(
+            group_context,
+            umo,
+            record_id,
+            prompt_idx,
+        )
+        if not records:
+            return ""
+        return format_group_history_block(records)
+
+    def _read_rolling_group_context_records_locked(
+        self,
+        group_context: Any,
+        umo: str,
+        record_id: Any,
+        prompt_idx: Any,
+    ) -> list[str]:
         raw_records = getattr(group_context, "raw_records", None)
         records = raw_records.get(umo) if hasattr(raw_records, "get") else None
         if not records:
-            return ""
+            return []
 
         raw_list = list(records)
         record_ids_map = getattr(group_context, "_record_ids", None)
@@ -530,18 +573,18 @@ class GroupChatContextOptimizerModule:
             isinstance(prompt_idx, int) and prompt_idx >= 0
         )
         if not has_marker:
-            return format_group_history_block(raw_list)
+            return raw_list
 
         if isinstance(record_id, str) and record_id in id_list:
             prompt_idx = id_list.index(record_id)
 
         if not isinstance(prompt_idx, int) or prompt_idx < 0 or prompt_idx >= len(raw_list):
-            return ""
+            return []
 
         records_to_inject = raw_list[:prompt_idx]
         if not records_to_inject:
-            return ""
-        return format_group_history_block(records_to_inject)
+            return []
+        return records_to_inject
 
     def resolve_compress_provider(self, group_context: Any) -> Any | None:
         provider_id = self.provider_id
@@ -982,13 +1025,17 @@ def build_compression_prompt(
 ) -> str:
     return (
         "你是 AstrNa 群聊上下文筛选器。你的任务不是回复用户，而是从给定上下文里"
-        "找出和本次需要回复的消息相关的群聊内容。\n\n"
+        "找出和本次需要回复的消息相关的群聊内容，并梳理清楚群聊发言之间的关系。\n\n"
         "严格要求：\n"
         "1. 不要生成给用户的回复，不要给出回复建议。\n"
-        "2. 相关内容请尽量保留原文、发言人和时间；拿不准时可以多筛几条。\n"
-        "3. 如果没有明显相关原文，也要说明没有找到明显相关原文，并给出群聊简短摘要。\n"
-        "4. 输出必须使用下面三个小节标题：相关原文摘录、简短摘要、说明。\n"
-        "5. 说明小节必须写明：这里只是上下文筛选，不是回复建议。\n\n"
+        "2. 请优先关注群聊滚动窗口里最近 10-20 条消息，但必须完整阅读全部群聊上下文，再综合判断哪些内容和当前待回复消息相关，不要只局限在最近 10-20 条。\n"
+        "3. 相关内容请尽量保留原文、发言人和时间；拿不准时可以多筛几条。\n"
+        "4. 每条相关原文都要尽量写清楚：是谁发的、这句话是在回复谁/引用谁/接谁的话、和当前待回复消息有什么关系。\n"
+        "5. 如果记录里出现 Quote、At、DIRECTED AT YOU 等标记，请结合这些标记解释回复对象或引用关系。\n"
+        "6. 简短摘要必须讲清楚当前群友在群里主要聊的话题是什么，包括最近这段群聊围绕哪些主题展开、话题是否发生转移、哪些人围绕哪个话题发言。\n"
+        "7. 如果没有明显相关原文，也要说明没有找到明显相关原文，但仍要总结当前群友正在聊的话题。\n"
+        "8. 输出必须使用下面三个小节标题：相关原文摘录、简短摘要、说明。\n"
+        "9. 说明小节必须写明：这里只是上下文筛选，不是回复建议。\n\n"
         "当前待回复消息：\n"
         f"{current_message}\n\n"
         "主会话最近历史（已按 AstrBot 当前上下文轮次设置预裁剪）：\n"
@@ -997,9 +1044,12 @@ def build_compression_prompt(
         f"{group_context}\n\n"
         "请只输出：\n"
         "相关原文摘录：\n"
-        "- ...\n\n"
+        "- 原文：...\n"
+        "  关系：谁发的；在回复谁/引用谁/接谁的话。\n"
+        "  相关原因：这条消息为什么和当前待回复消息有关。\n\n"
         "简短摘要：\n"
-        "...\n\n"
+        "当前群友主要在聊：...\n"
+        "话题脉络：...\n\n"
         "说明：\n"
         "这里只是上下文筛选，不是回复建议。"
     )
@@ -1026,6 +1076,21 @@ def build_injected_context_text(compressed_text: str) -> str:
         "以下内容来自当前群聊聊天内容中与本次回复相关的消息，已经由压缩模型筛选。"
         "这里只是上下文筛选，不是回复建议。\n\n"
         f"{text}\n"
+        "</system_reminder>"
+    )
+
+
+def build_fallback_context_text(records: list[str]) -> str:
+    recent_count = len(records)
+    joined_records = "\n".join(records)
+    return (
+        "<system_reminder>\n"
+        f"{ASTRNA_GROUP_CONTEXT_FALLBACK_TITLE}：\n"
+        f"以下是当前群聊最近的 {recent_count} 条消息，作为压缩模型筛选之外的兜底上下文。"
+        "这些内容只是群聊事实背景，不是回复建议；请结合当前用户消息自行判断相关性。\n"
+        "--- BEGIN RECENT GROUP MESSAGES ---\n"
+        f"{joined_records}\n"
+        "--- END RECENT GROUP MESSAGES ---\n"
         "</system_reminder>"
     )
 

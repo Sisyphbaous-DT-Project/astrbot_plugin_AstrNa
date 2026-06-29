@@ -9,6 +9,7 @@ import pytest
 
 from astrna.modules.group_chat_context_optimizer import (
     GROUP_CONTEXT_COMPRESS_TIMEOUT_SECONDS,
+    GROUP_CONTEXT_FALLBACK_RECENT_RECORDS,
     GROUP_CONTEXT_PERSISTENCE_KEY,
     GroupChatContextOptimizerModule,
     build_compression_prompt,
@@ -331,6 +332,20 @@ def seed_group_records(group_context, event, *, include_followup=False):
     return records, ids
 
 
+def seed_many_group_records(group_context, event, count=25, *, current_index=None):
+    records = [
+        f"[群友{index:02d}/12:{index:02d}:00]:  测试记录{index:02d}"
+        for index in range(count)
+    ]
+    ids = [f"record-{index:02d}" for index in range(count)]
+    group_context.raw_records[event.unified_msg_origin] = deque(records)
+    group_context._record_ids[event.unified_msg_origin] = deque(ids)
+    if current_index is not None:
+        event.set_extra("_group_context_record_id", ids[current_index])
+        event.set_extra("_group_context_raw_idx", current_index)
+    return records, ids
+
+
 def test_default_runtime_config_keeps_module_disabled(fakes):
     runtime = fakes.build_runtime({})
 
@@ -379,15 +394,22 @@ def test_enabled_replaces_original_group_context_with_compressed_text(
 
     run(group_context.on_req_llm(event, req))
 
-    assert len(req.extra_user_content_parts) == 2
+    assert len(req.extra_user_content_parts) == 3
     assert req.extra_user_content_parts[0].text == "其他临时内容"
-    optimized_text = req.extra_user_content_parts[1].text
+    fallback_text = req.extra_user_content_parts[1].text
+    assert "AstrNa 最近群聊兜底上下文" in fallback_text
+    assert "[小明/12:00:00]" in fallback_text
+    assert "[小红/12:01:00]" in fallback_text
+    assert "[用户/12:02:00]" not in fallback_text
+    assert "不是回复建议" in fallback_text
+    assert getattr(req.extra_user_content_parts[1], "_no_save", False) is True
+    optimized_text = req.extra_user_content_parts[2].text
     assert "AstrNa 群聊上下文筛选" in optimized_text
     assert "相关原文摘录" in optimized_text
     assert "简短摘要" in optimized_text
     assert "这里只是上下文筛选，不是回复建议" in optimized_text
     assert GROUP_CONTEXT_TEXT not in optimized_text
-    assert getattr(req.extra_user_content_parts[1], "_no_save", False) is True
+    assert getattr(req.extra_user_content_parts[2], "_no_save", False) is True
 
     assert len(provider.calls) == 1
     call = provider.calls[0]
@@ -689,12 +711,15 @@ def test_provider_missing_does_not_inject_original_group_context(
     group_context = astrbot_group_context_modules.group_context_cls()
     event = DummyEvent()
     seed_group_records(group_context, event)
+    raw_before = list(group_context.raw_records[event.unified_msg_origin])
     req = DummyReq()
 
     run(group_context.on_req_llm(event, req))
 
-    assert req.extra_user_content_parts == []
-    assert list(group_context.raw_records[event.unified_msg_origin])
+    assert len(req.extra_user_content_parts) == 1
+    assert "AstrNa 最近群聊兜底上下文" in req.extra_user_content_parts[0].text
+    assert GROUP_CONTEXT_TEXT not in req.extra_user_content_parts[0].text
+    assert list(group_context.raw_records[event.unified_msg_origin]) == raw_before
 
 
 def test_provider_failure_does_not_inject_original_group_context(
@@ -707,13 +732,16 @@ def test_provider_failure_does_not_inject_original_group_context(
     group_context = astrbot_group_context_modules.group_context_cls()
     event = DummyEvent()
     seed_group_records(group_context, event)
+    raw_before = list(group_context.raw_records[event.unified_msg_origin])
     req = DummyReq()
 
     run(group_context.on_req_llm(event, req))
 
-    assert req.extra_user_content_parts == []
+    assert len(req.extra_user_content_parts) == 1
+    assert "AstrNa 最近群聊兜底上下文" in req.extra_user_content_parts[0].text
+    assert "AstrNa 群聊上下文筛选" not in req.extra_user_content_parts[0].text
     assert len(provider.calls) == 1
-    assert list(group_context.raw_records[event.unified_msg_origin])
+    assert list(group_context.raw_records[event.unified_msg_origin]) == raw_before
 
 
 @pytest.mark.parametrize(
@@ -736,11 +764,80 @@ def test_invalid_output_does_not_inject_original_group_context(
     group_context = astrbot_group_context_modules.group_context_cls()
     event = DummyEvent()
     seed_group_records(group_context, event)
+    raw_before = list(group_context.raw_records[event.unified_msg_origin])
     req = DummyReq()
 
     run(group_context.on_req_llm(event, req))
 
-    assert req.extra_user_content_parts == []
+    assert len(req.extra_user_content_parts) == 1
+    assert "AstrNa 最近群聊兜底上下文" in req.extra_user_content_parts[0].text
+    assert "AstrNa 群聊上下文筛选" not in req.extra_user_content_parts[0].text
+    assert list(group_context.raw_records[event.unified_msg_origin]) == raw_before
+
+
+def test_fallback_context_only_injects_latest_15_candidate_records(
+    astrbot_group_context_modules,
+):
+    provider = DummyProvider("")
+    module = build_module(provider)
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_many_group_records(group_context, event, count=25)
+    req = DummyReq()
+
+    run(group_context.on_req_llm(event, req))
+
+    assert len(req.extra_user_content_parts) == 1
+    fallback_text = req.extra_user_content_parts[0].text
+    assert f"最近的 {GROUP_CONTEXT_FALLBACK_RECENT_RECORDS} 条消息" in fallback_text
+    assert "测试记录00" not in fallback_text
+    assert "测试记录09" not in fallback_text
+    assert "测试记录10" in fallback_text
+    assert "测试记录24" in fallback_text
+    assert getattr(req.extra_user_content_parts[0], "_no_save", False) is True
+
+
+def test_fallback_context_uses_all_records_when_candidates_less_than_15(
+    astrbot_group_context_modules,
+):
+    module = build_module(provider=None, provider_id="missing")
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_many_group_records(group_context, event, count=4)
+    req = DummyReq()
+
+    run(group_context.on_req_llm(event, req))
+
+    fallback_text = req.extra_user_content_parts[0].text
+    assert "最近的 4 条消息" in fallback_text
+    assert "测试记录00" in fallback_text
+    assert "测试记录03" in fallback_text
+
+
+def test_marker_path_fallback_excludes_current_trigger_message(
+    astrbot_group_context_modules,
+):
+    provider = DummyProvider(valid_compressed_text())
+    module = build_module(provider)
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_many_group_records(group_context, event, count=20, current_index=18)
+    req = DummyReq()
+
+    run(group_context.on_req_llm(event, req))
+
+    fallback_text = req.extra_user_content_parts[0].text
+    prompt = provider.calls[0]["prompt"]
+    assert "测试记录18" not in fallback_text
+    assert "测试记录18" not in prompt
+    assert "测试记录17" in fallback_text
+    assert "测试记录19" not in fallback_text
 
 
 def test_private_chat_keeps_original_behavior_and_does_not_call_provider(
@@ -866,7 +963,8 @@ def test_missing_marker_uses_existing_rolling_window_for_active_reply_trigger(
     assert "[小明/12:00:00]" in prompt
     assert "[小红/12:01:00]" in prompt
     assert "[用户/12:02:00]" in prompt
-    assert "AstrNa 群聊上下文筛选" in req.extra_user_content_parts[0].text
+    assert "AstrNa 最近群聊兜底上下文" in req.extra_user_content_parts[0].text
+    assert "AstrNa 群聊上下文筛选" in req.extra_user_content_parts[1].text
 
 
 def test_restart_restore_from_kv_allows_missing_marker_compression(
@@ -944,6 +1042,9 @@ def test_marker_path_after_restore_excludes_current_message(
     prompt = provider.calls[0]["prompt"]
     assert "[小明/12:00:00]" in prompt
     assert "[用户/12:02:00]" not in prompt
+    fallback_text = req.extra_user_content_parts[0].text
+    assert "[小明/12:00:00]" in fallback_text
+    assert "[用户/12:02:00]" not in fallback_text
 
 
 def test_remove_session_deletes_persisted_group_context(
@@ -1040,6 +1141,16 @@ def test_prompt_uses_existing_contexts_without_hardcoded_turn_or_record_limits()
     assert "第三轮" in prompt
     assert "第四轮" in prompt
     assert "已按 AstrBot 当前上下文轮次设置预裁剪" in prompt
+    assert "优先关注群聊滚动窗口里最近 10-20 条消息" in prompt
+    assert "必须完整阅读全部群聊上下文" in prompt
+    assert "不要只局限在最近 10-20 条" in prompt
+    assert "是谁发的" in prompt
+    assert "在回复谁/引用谁/接谁的话" in prompt
+    assert "相关原因" in prompt
+    assert "当前群友在群里主要聊的话题是什么" in prompt
+    assert "哪些人围绕哪个话题发言" in prompt
+    assert "当前群友主要在聊" in prompt
+    assert "话题脉络" in prompt
     assert "group_message_max_cnt" not in prompt
     assert "300" not in prompt
     assert "保留几轮" not in prompt
