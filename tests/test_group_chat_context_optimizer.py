@@ -211,14 +211,41 @@ class DummyReq:
 
 
 class DummyEvent:
-    def __init__(self, *, message_type="GROUP_MESSAGE"):
+    def __init__(
+        self,
+        *,
+        message_type="GROUP_MESSAGE",
+        sender_id="current-user",
+        sender_name="当前群友",
+        group_id="123456",
+        group_name="测试群",
+        message_str="小明刚才说了什么？",
+    ):
         self.unified_msg_origin = "aiocqhttp:GroupMessage:123456"
         self.message_type = message_type
-        self.message_str = "小明刚才说了什么？"
+        self.message_str = message_str
         self.extra = {}
+        self.sender_id = sender_id
+        self.sender_name = sender_name
+        self.group_id = group_id
+        self.group_name = group_name
+        self.message_obj = SimpleNamespace(
+            sender=SimpleNamespace(user_id=sender_id, nickname=sender_name),
+            group_id=group_id,
+            group=SimpleNamespace(group_name=group_name),
+        )
 
     def get_message_type(self):
         return self.message_type
+
+    def get_sender_id(self):
+        return self.sender_id
+
+    def get_sender_name(self):
+        return self.sender_name
+
+    def get_group_id(self):
+        return self.group_id
 
     def get_extra(self, key, default=None):
         return self.extra.get(key, default)
@@ -272,6 +299,21 @@ def valid_compressed_text():
         "- [小明/12:00:00]: 今天晚上打游戏吗？\n\n"
         "简短摘要：\n"
         "群里刚才主要在聊晚上是否打游戏，小红提到想先写作业。\n\n"
+        "说明：\n"
+        "这里只是上下文筛选，不是回复建议。"
+    )
+
+
+def compressed_text_with_distinct_topic_source():
+    return (
+        "相关原文摘录：\n"
+        "- 当前触发者：笨蛋老哥（用户 ID：1719500341），当前消息是“你干过哪些既遂和未遂的事情”。\n"
+        "- 原文：[唤然/15:05:29]: 其实我最近有个问题很疑惑，犯罪既遂和犯罪未遂的区别是什么\n"
+        "  关系：唤然是历史话题源头，不是当前触发者。\n"
+        "  相关原因：当前消息承接了唤然之前提出的既遂/未遂话题。\n\n"
+        "简短摘要：\n"
+        "当前群友主要在聊：唤然之前提出犯罪既遂和未遂的区别，笨蛋老哥现在接着这个话题调侃 bot。\n"
+        "话题脉络：唤然先问法律概念，笨蛋老哥随后把这个概念转成对 bot 的玩笑提问。\n\n"
         "说明：\n"
         "这里只是上下文筛选，不是回复建议。"
     )
@@ -398,6 +440,10 @@ def test_enabled_replaces_original_group_context_with_compressed_text(
     assert req.extra_user_content_parts[0].text == "其他临时内容"
     fallback_text = req.extra_user_content_parts[1].text
     assert "AstrNa 最近群聊兜底上下文" in fallback_text
+    assert "当前触发者昵称：当前群友" in fallback_text
+    assert "当前触发者用户 ID：current-user" in fallback_text
+    assert "当前消息原文：小明刚才说了什么？" in fallback_text
+    assert "不要把下面历史消息的发送者误当成本轮当前触发者" in fallback_text
     assert "[小明/12:00:00]" in fallback_text
     assert "[小红/12:01:00]" in fallback_text
     assert "[用户/12:02:00]" not in fallback_text
@@ -405,6 +451,8 @@ def test_enabled_replaces_original_group_context_with_compressed_text(
     assert getattr(req.extra_user_content_parts[1], "_no_save", False) is True
     optimized_text = req.extra_user_content_parts[2].text
     assert "AstrNa 群聊上下文筛选" in optimized_text
+    assert "当前触发者昵称：当前群友" in optimized_text
+    assert "不要把筛选出的历史话题发起人误当成本轮发言人" in optimized_text
     assert "相关原文摘录" in optimized_text
     assert "简短摘要" in optimized_text
     assert "这里只是上下文筛选，不是回复建议" in optimized_text
@@ -418,6 +466,11 @@ def test_enabled_replaces_original_group_context_with_compressed_text(
     assert call["session_id"].startswith("astrna_group_context_")
     assert call["session_id"] != req.session_id
     assert "之前我们聊了游戏" in call["prompt"]
+    assert "当前触发消息身份与内容" in call["prompt"]
+    assert "当前触发者昵称：当前群友" in call["prompt"]
+    assert "当前触发者用户 ID：current-user" in call["prompt"]
+    assert "当前群名：测试群" in call["prompt"]
+    assert "当前消息原文：小明刚才说了什么？" in call["prompt"]
     assert "[小明/12:00:00]" in call["prompt"]
     assert "小明刚才说了什么" in call["prompt"]
     assert list(group_context.raw_records[event.unified_msg_origin]) == [
@@ -840,6 +893,58 @@ def test_marker_path_fallback_excludes_current_trigger_message(
     assert "测试记录19" not in fallback_text
 
 
+def test_current_sender_identity_disambiguates_topic_source_from_trigger_sender(
+    astrbot_group_context_modules,
+):
+    provider = DummyProvider(compressed_text_with_distinct_topic_source())
+    module = build_module(provider)
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent(
+        sender_id="1719500341",
+        sender_name="笨蛋老哥",
+        group_id="777879783",
+        group_name="AstrNa售后",
+        message_str="你干过哪些既遂和未遂的事情",
+    )
+    req = DummyReq()
+    req.prompt = "你干过哪些既遂和未遂的事情"
+    records = [
+        "[唤然/15:05:29]: 其实我最近有个问题很疑惑，犯罪既遂和犯罪未遂的区别是什么",
+        "[笨蛋老哥/15:22:10]: 你干过哪些既遂和未遂的事情",
+    ]
+    ids = ["topic-source", "record-current"]
+    group_context.raw_records[event.unified_msg_origin] = deque(records)
+    group_context._record_ids[event.unified_msg_origin] = deque(ids)
+    event.set_extra("_group_context_record_id", "record-current")
+    event.set_extra("_group_context_raw_idx", 1)
+
+    run(group_context.on_req_llm(event, req))
+
+    fallback_text = req.extra_user_content_parts[0].text
+    prompt = provider.calls[0]["prompt"]
+    optimized_text = req.extra_user_content_parts[1].text
+
+    assert "当前触发者昵称：笨蛋老哥" in fallback_text
+    assert "当前触发者用户 ID：1719500341" in fallback_text
+    assert "当前群名：AstrNa售后" in fallback_text
+    assert "当前消息原文：你干过哪些既遂和未遂的事情" in fallback_text
+    assert "唤然/15:05:29" in fallback_text
+    assert "笨蛋老哥/15:22:10" not in fallback_text
+
+    assert "当前触发者昵称：笨蛋老哥" in prompt
+    assert "当前触发者用户 ID：1719500341" in prompt
+    assert "当前触发者才是本轮需要回复的人" in prompt
+    assert "历史话题发起人" in prompt
+    assert "不能因为某个历史话题由别人发起，就把当前消息误判成那个人发的" in prompt
+    assert "不确定承接对象" in prompt
+
+    assert "当前触发者昵称：笨蛋老哥" in optimized_text
+    assert "唤然" in optimized_text
+    assert "唤然是历史话题源头，不是当前触发者" in optimized_text
+
+
 def test_private_chat_keeps_original_behavior_and_does_not_call_provider(
     astrbot_group_context_modules,
 ):
@@ -1131,7 +1236,12 @@ def test_prompt_uses_existing_contexts_without_hardcoded_turn_or_record_limits()
     ]
     formatted = format_contexts(contexts)
     prompt = build_compression_prompt(
-        current_message="当前消息",
+        current_message_info=(
+            "当前触发者就是本轮需要回复的人，不要把历史话题发起人、被引用消息发送者或相关消息发送者误判成当前触发者。\n"
+            "- 当前触发者昵称：当前群友\n"
+            "- 当前触发者用户 ID：current-user\n"
+            "- 当前消息原文：当前消息"
+        ),
         main_history=formatted,
         group_context=GROUP_CONTEXT_TEXT,
     )
@@ -1144,9 +1254,15 @@ def test_prompt_uses_existing_contexts_without_hardcoded_turn_or_record_limits()
     assert "优先关注群聊滚动窗口里最近 10-20 条消息" in prompt
     assert "必须完整阅读全部群聊上下文" in prompt
     assert "不要只局限在最近 10-20 条" in prompt
+    assert "当前触发消息身份与内容" in prompt
+    assert "当前触发者昵称：当前群友" in prompt
+    assert "当前触发者才是本轮需要回复的人" in prompt
+    assert "历史话题发起人" in prompt
+    assert "不要猜成某个群友" in prompt
     assert "是谁发的" in prompt
     assert "在回复谁/引用谁/接谁的话" in prompt
     assert "相关原因" in prompt
+    assert "当前触发者：" in prompt
     assert "当前群友在群里主要聊的话题是什么" in prompt
     assert "哪些人围绕哪个话题发言" in prompt
     assert "当前群友主要在聊" in prompt

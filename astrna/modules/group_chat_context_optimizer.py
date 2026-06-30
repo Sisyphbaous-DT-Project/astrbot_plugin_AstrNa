@@ -45,6 +45,16 @@ class RollingGroupContextSelection:
     records: list[str]
 
 
+@dataclass(slots=True)
+class CurrentMessageIdentity:
+    message: str
+    sender_id: str
+    sender_name: str
+    group_id: str
+    group_name: str
+    unified_msg_origin: str
+
+
 class GroupChatContextOptimizerModule:
     """用最近群聊兜底和小模型筛选降低主模型额外上下文噪声。"""
 
@@ -240,9 +250,15 @@ class GroupChatContextOptimizerModule:
         if not group_selection.records:
             return None
 
+        current_identity = build_current_message_identity(event, req)
         fallback_records = group_selection.records[-GROUP_CONTEXT_FALLBACK_RECENT_RECORDS:]
         ensure_extra_user_content_parts(req).append(
-            create_temp_text_part(build_fallback_context_text(fallback_records)),
+            create_temp_text_part(
+                build_fallback_context_text(
+                    fallback_records,
+                    current_identity=current_identity,
+                ),
+            ),
         )
 
         provider = self.resolve_compress_provider(group_context)
@@ -250,7 +266,7 @@ class GroupChatContextOptimizerModule:
             return None
 
         prompt = build_compression_prompt(
-            current_message=extract_current_message(event, req),
+            current_message_info=format_current_message_identity(current_identity),
             main_history=format_contexts(
                 self.prepare_main_history_contexts(group_context, event, req),
             ),
@@ -261,7 +277,12 @@ class GroupChatContextOptimizerModule:
             return None
 
         ensure_extra_user_content_parts(req).append(
-            create_temp_text_part(build_injected_context_text(compressed)),
+            create_temp_text_part(
+                build_injected_context_text(
+                    compressed,
+                    current_identity=current_identity,
+                ),
+            ),
         )
         self._log(
             "debug",
@@ -715,6 +736,87 @@ def extract_current_message(event: Any, req: Any) -> str:
     return "（当前待回复消息为空或只有媒体内容）"
 
 
+def build_current_message_identity(event: Any, req: Any) -> CurrentMessageIdentity:
+    return CurrentMessageIdentity(
+        message=extract_current_message(event, req),
+        sender_id=extract_event_value(
+            event,
+            "get_sender_id",
+            ("message_obj", "sender", "user_id"),
+            ("message_obj", "sender_id"),
+        ),
+        sender_name=extract_event_value(
+            event,
+            "get_sender_name",
+            ("message_obj", "sender", "nickname"),
+            ("message_obj", "sender_name"),
+        ),
+        group_id=extract_event_value(
+            event,
+            "get_group_id",
+            ("message_obj", "group_id"),
+        ),
+        group_name=extract_event_value(
+            event,
+            None,
+            ("message_obj", "group", "group_name"),
+            ("message_obj", "group_name"),
+        ),
+        unified_msg_origin=sanitize_text_value(
+            getattr(event, "unified_msg_origin", None),
+        ),
+    )
+
+
+def extract_event_value(
+    event: Any,
+    method_name: str | None,
+    *paths: tuple[str, ...],
+) -> str:
+    if method_name:
+        method = getattr(event, method_name, None)
+        if callable(method):
+            try:
+                value = method()
+            except Exception:  # noqa: BLE001
+                value = None
+            text = sanitize_text_value(value)
+            if text:
+                return text
+
+    for path in paths:
+        value = event
+        for attr in path:
+            value = getattr(value, attr, None)
+            if value is None:
+                break
+        text = sanitize_text_value(value)
+        if text:
+            return text
+    return ""
+
+
+def sanitize_text_value(value: Any) -> str:
+    text = str(value or "").strip()
+    return text
+
+
+def format_current_message_identity(identity: CurrentMessageIdentity) -> str:
+    lines = [
+        "当前触发者就是本轮需要回复的人，不要把历史话题发起人、被引用消息发送者或相关消息发送者误判成当前触发者。",
+        f"- 当前触发者昵称：{identity.sender_name or '未知'}",
+        f"- 当前触发者用户 ID：{identity.sender_id or '未知'}",
+    ]
+    if identity.group_id:
+        lines.append(f"- 当前群号：{identity.group_id}")
+    if identity.group_name:
+        lines.append(f"- 当前群名：{identity.group_name}")
+    if identity.unified_msg_origin:
+        lines.append(f"- 当前 UMO：{identity.unified_msg_origin}")
+    lines.append(f"- 当前消息原文：{identity.message}")
+    return "\n".join(lines)
+
+
 def format_contexts(contexts: Any) -> str:
     if not isinstance(contexts, list) or not contexts:
         return "（无主会话历史）"
@@ -1019,7 +1121,7 @@ def get_config_value(source: Any, key: str, default: Any = None) -> Any:
 
 def build_compression_prompt(
     *,
-    current_message: str,
+    current_message_info: str,
     main_history: str,
     group_context: str,
 ) -> str:
@@ -1029,21 +1131,25 @@ def build_compression_prompt(
         "严格要求：\n"
         "1. 不要生成给用户的回复，不要给出回复建议。\n"
         "2. 请优先关注群聊滚动窗口里最近 10-20 条消息，但必须完整阅读全部群聊上下文，再综合判断哪些内容和当前待回复消息相关，不要只局限在最近 10-20 条。\n"
-        "3. 相关内容请尽量保留原文、发言人和时间；拿不准时可以多筛几条。\n"
-        "4. 每条相关原文都要尽量写清楚：是谁发的、这句话是在回复谁/引用谁/接谁的话、和当前待回复消息有什么关系。\n"
-        "5. 如果记录里出现 Quote、At、DIRECTED AT YOU 等标记，请结合这些标记解释回复对象或引用关系。\n"
-        "6. 简短摘要必须讲清楚当前群友在群里主要聊的话题是什么，包括最近这段群聊围绕哪些主题展开、话题是否发生转移、哪些人围绕哪个话题发言。\n"
-        "7. 如果没有明显相关原文，也要说明没有找到明显相关原文，但仍要总结当前群友正在聊的话题。\n"
-        "8. 输出必须使用下面三个小节标题：相关原文摘录、简短摘要、说明。\n"
-        "9. 说明小节必须写明：这里只是上下文筛选，不是回复建议。\n\n"
-        "当前待回复消息：\n"
-        f"{current_message}\n\n"
+        "3. 必须把“当前触发者”和“历史相关消息的发送者/话题源头”分开。当前触发者才是本轮需要回复的人，不能因为某个历史话题由别人发起，就把当前消息误判成那个人发的。\n"
+        "4. 相关内容请尽量保留原文、发言人和时间；拿不准时可以多筛几条。\n"
+        "5. 每条相关原文都要尽量写清楚：是谁发的、这句话是在回复谁/引用谁/接谁的话、和当前待回复消息有什么关系。\n"
+        "6. 如果记录里出现 Quote、At、DIRECTED AT YOU 等标记，请结合这些标记解释回复对象或引用关系。\n"
+        "7. 简短摘要必须讲清楚当前群友在群里主要聊的话题是什么，包括最近这段群聊围绕哪些主题展开、话题是否发生转移、哪些人围绕哪个话题发言。\n"
+        "8. 如果没有明显相关原文，也要说明没有找到明显相关原文，但仍要总结当前群友正在聊的话题。\n"
+        "9. 输出必须使用下面三个小节标题：相关原文摘录、简短摘要、说明。\n"
+        "10. 相关原文摘录中必须写明：当前触发者是谁；每条相关历史消息是谁发的；当前消息是在承接谁的话题，或没有明确承接关系。\n"
+        "11. 如果无法判断当前消息承接谁的话题，请明确写“不确定承接对象”，不要猜成某个群友。\n"
+        "12. 说明小节必须写明：这里只是上下文筛选，不是回复建议。\n\n"
+        "当前触发消息身份与内容：\n"
+        f"{current_message_info}\n\n"
         "主会话最近历史（已按 AstrBot 当前上下文轮次设置预裁剪）：\n"
         f"{main_history}\n\n"
         "AstrBot 最近群聊滚动窗口（记录条数沿用 AstrBot 当前群聊上下文设置）：\n"
         f"{group_context}\n\n"
         "请只输出：\n"
         "相关原文摘录：\n"
+        "- 当前触发者：...\n"
         "- 原文：...\n"
         "  关系：谁发的；在回复谁/引用谁/接谁的话。\n"
         "  相关原因：这条消息为什么和当前待回复消息有关。\n\n"
@@ -1068,26 +1174,38 @@ def is_valid_compression_output(text: str) -> bool:
     return True
 
 
-def build_injected_context_text(compressed_text: str) -> str:
+def build_injected_context_text(
+    compressed_text: str,
+    *,
+    current_identity: CurrentMessageIdentity,
+) -> str:
     text = str(compressed_text or "").strip()
     return (
         "<system_reminder>\n"
         f"{ASTRNA_GROUP_CONTEXT_TITLE}：\n"
+        f"{format_current_message_identity(current_identity)}\n\n"
         "以下内容来自当前群聊聊天内容中与本次回复相关的消息，已经由压缩模型筛选。"
+        "请优先相信上面的当前触发者信息；不要把筛选出的历史话题发起人误当成本轮发言人。"
         "这里只是上下文筛选，不是回复建议。\n\n"
         f"{text}\n"
         "</system_reminder>"
     )
 
 
-def build_fallback_context_text(records: list[str]) -> str:
+def build_fallback_context_text(
+    records: list[str],
+    *,
+    current_identity: CurrentMessageIdentity,
+) -> str:
     recent_count = len(records)
     joined_records = "\n".join(records)
     return (
         "<system_reminder>\n"
         f"{ASTRNA_GROUP_CONTEXT_FALLBACK_TITLE}：\n"
+        f"{format_current_message_identity(current_identity)}\n\n"
         f"以下是当前群聊最近的 {recent_count} 条消息，作为压缩模型筛选之外的兜底上下文。"
-        "这些内容只是群聊事实背景，不是回复建议；请结合当前用户消息自行判断相关性。\n"
+        "这些内容只是群聊事实背景，不是回复建议；请结合当前用户消息自行判断相关性。"
+        "不要把下面历史消息的发送者误当成本轮当前触发者。\n"
         "--- BEGIN RECENT GROUP MESSAGES ---\n"
         f"{joined_records}\n"
         "--- END RECENT GROUP MESSAGES ---\n"

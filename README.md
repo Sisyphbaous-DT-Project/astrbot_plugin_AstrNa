@@ -5,7 +5,7 @@ AstrNa 是一款面向 AstrBot 的优化插件，目标是在不修改 AstrBot C
 > 💌 售后：`777879783`
 > 有问题请加，清漪也会蹦出来一起捣鼓。
 
-🎉 AstrNa 正式版已经发布。当前正式版：`1.3.2`
+🎉 AstrNa 正式版已经发布。当前正式版：`1.3.3`
 
 - 仓库地址：[Sisyphbaous-DT-Project/astrbot_plugin_AstrNa](https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_AstrNa)
 - 作者主页：[Sisyphbaous-DT-Project](https://github.com/Sisyphbaous-DT-Project)
@@ -181,9 +181,11 @@ AstrBot 原生主流程会把当前消息里的图片和引用图片整理进 `r
 
 - 按 AstrBot 当前上下文轮次设置预裁剪后的主会话最近历史。
 - AstrBot 最近 N 条群聊滚动窗口。
-- 当前待回复消息。
+- 当前触发者昵称、用户 ID、群信息和当前待回复消息。
 
 AstrNa 会先调用你在子项中选择的聊天模型供应商，让它只做“相关上下文筛选 + 简短摘要”，然后把筛选结果作为临时内容注入给主模型。推荐选择 `deepseek-v4-flash` 这类便宜快速的小模型。主会话最近历史只提供给压缩模型用于判断相关性，不会被 AstrNa 额外重复注入给主模型；传给压缩模型的这份历史副本也会沿用 AstrBot 当前 `max_context_length` 和 `dequeue_context_length` 规则预裁剪，不会把截断前完整 conversation history 全量交给小模型。主模型自己的正式上下文截断仍由 AstrBot 原生链路处理。
+
+压缩模型和主模型都会看到一段当前触发者身份提示，用来区分“本轮要回复的人”和“历史相关消息的发送者/话题源头”。例如唤然先问了某个话题，笨蛋老哥后来接着这个话题追问，AstrNa 会提醒模型：当前触发者是笨蛋老哥，唤然只是历史话题源头，不要混成同一个人。
 
 需要注意的是，压缩用的小模型每轮都会读取变化的当前消息、主会话最近历史和群聊滚动窗口，提示词缓存通常很难命中，甚至可能基本失效；因此它应当优先选择成本低、速度快的模型，而不是昂贵的主力模型。
 
@@ -347,7 +349,7 @@ AstrNa 主要面向 AstrBot 当前 4.x 版本。当前版本已在本地 AstrBot
 
 ## 验证状态
 
-`1.3.2` 发布前通过以下验证：
+`1.3.3` 发布前通过以下验证：
 
 ```bash
 TMPDIR=/tmp PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q -s
