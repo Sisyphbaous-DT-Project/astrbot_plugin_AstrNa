@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .modules.auto_cache_cleanup import AutoCacheCleanupModule
 from .modules.deepseek_v4_400 import DeepSeekV4400Module
 from .modules.dynamic_system_prompt import DynamicSystemPromptModule
 from .modules.forward_nodes import (
@@ -56,6 +57,7 @@ DEFAULT_CONFIG = {
     "issue_assistant_devkit_enabled": False,
     "issue_assistant_github_token": "",
     "issue_assistant_target_umo": "",
+    "auto_cleanup_astrbot_cache": False,
 }
 
 
@@ -110,6 +112,7 @@ class AstrNaRuntime:
             provider_id=self.config.get("group_chat_context_compress_provider_id", ""),
             kv_store=kv_store,
         )
+        self.auto_cache_cleanup = AutoCacheCleanupModule(logger=logger)
         self._configure_group_context_persist_callback()
         self.issue_assistant = IssueAssistantModule(
             context=context,
@@ -148,8 +151,10 @@ class AstrNaRuntime:
             self.group_sender_concurrency.install()
         if self.config.get("optimize_group_chat_context", False):
             self.group_chat_context_optimizer.install()
+        self._configure_auto_cache_cleanup()
 
     async def sanitize_request(self, event: Any, req: Any) -> None:
+        self.begin_request_activity()
         if self.config.get("optimize_image_history_context", False):
             self.image_history_context.install()
             self.image_history_context.sanitize_request(req)
@@ -224,6 +229,8 @@ class AstrNaRuntime:
         else:
             self.group_chat_context_optimizer.terminate()
 
+        self._configure_auto_cache_cleanup()
+
         if self.config.get("optimize_identity_metadata", False):
             account_nickname_display = self.config.get(
                 "account_nickname_display",
@@ -255,6 +262,7 @@ class AstrNaRuntime:
         error: BaseException,
         traceback_text: str,
     ) -> None:
+        self.record_activity()
         self.issue_assistant.configure(
             enabled=self.config.get("issue_assistant_enabled", False),
             devkit_enabled=self.config.get("issue_assistant_devkit_enabled", False),
@@ -327,6 +335,38 @@ class AstrNaRuntime:
         else:
             self.long_reply_context.group_context_persist_callback = None
 
+    def _configure_auto_cache_cleanup(self) -> None:
+        enabled = self.config.get("auto_cleanup_astrbot_cache", False)
+        self.auto_cache_cleanup.configure(enabled=enabled)
+        if enabled:
+            self.auto_cache_cleanup.start()
+        else:
+            self.auto_cache_cleanup.terminate()
+
+    async def on_astrbot_loaded(self) -> None:
+        self._configure_auto_cache_cleanup()
+
+    def record_activity(self) -> None:
+        self.auto_cache_cleanup.mark_activity()
+
+    def begin_activity(self) -> None:
+        self.auto_cache_cleanup.begin_activity()
+
+    def end_activity(self) -> None:
+        self.auto_cache_cleanup.end_activity()
+
+    def begin_request_activity(self) -> None:
+        self.auto_cache_cleanup.begin_request_activity()
+
+    def end_request_activity(self) -> None:
+        self.auto_cache_cleanup.end_request_activity()
+
+    def begin_send_activity(self) -> None:
+        self.auto_cache_cleanup.begin_send_activity()
+
+    def end_send_activity(self) -> None:
+        self.auto_cache_cleanup.end_send_activity()
+
     async def terminate(self) -> None:
         await self.issue_assistant.terminate()
         self.group_sender_concurrency.terminate()
@@ -341,6 +381,7 @@ class AstrNaRuntime:
         self.group_identity_tools.terminate()
         self.reply_target_history.terminate()
         self.deepseek_v4_400.terminate()
+        self.auto_cache_cleanup.terminate()
 
 
 def merge_config(config: dict | None) -> dict[str, Any]:

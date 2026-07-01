@@ -32,6 +32,35 @@ class AstrNa(Star):
     ) -> None:
         await self.runtime.sanitize_request(event, req)
 
+    @filter.on_astrbot_loaded(priority=1000)
+    async def start_auto_cache_cleanup(self) -> None:
+        await self.runtime.on_astrbot_loaded()
+
+    @filter.on_llm_response(priority=1000)
+    async def record_llm_response(self, event: AstrMessageEvent, response) -> None:
+        self.runtime.end_request_activity()
+
+    @filter.on_agent_begin(priority=1000)
+    async def record_agent_begin(self, event: AstrMessageEvent, run_context) -> None:
+        self.runtime.begin_activity()
+
+    @filter.on_agent_done(priority=1000)
+    async def record_agent_done(
+        self,
+        event: AstrMessageEvent,
+        run_context,
+        response,
+    ) -> None:
+        self.runtime.end_activity()
+
+    @filter.on_decorating_result(priority=1000)
+    async def record_decorating_result(self, event: AstrMessageEvent) -> None:
+        self.runtime.begin_send_activity()
+
+    @filter.after_message_sent(priority=1000)
+    async def record_after_message_sent(self, event: AstrMessageEvent) -> None:
+        self.runtime.end_send_activity()
+
     @filter.on_plugin_error(priority=1000)
     async def analyze_plugin_error(
         self,

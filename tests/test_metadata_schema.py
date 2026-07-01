@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.3.3"
+    assert metadata["version"] == "1.3.4"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -53,6 +53,7 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "provide_group_identity_tools",
         "optimize_reply_target_history",
         "unlock_group_sender_concurrency",
+        "auto_cleanup_astrbot_cache",
         "issue_assistant_enabled",
         "issue_assistant_devkit_enabled",
         "issue_assistant_target_umo",
@@ -243,6 +244,15 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
     assert "⚠️" in schema["unlock_group_sender_concurrency"]["hint"]
     assert "防抖" in schema["unlock_group_sender_concurrency"]["hint"]
     assert schema["unlock_group_sender_concurrency"]["default"] is False
+    assert schema["auto_cleanup_astrbot_cache"]["type"] == "bool"
+    assert (
+        schema["auto_cleanup_astrbot_cache"]["description"]
+        == "自动清理 AstrBot 缓存"
+    )
+    assert schema["auto_cleanup_astrbot_cache"]["default"] is False
+    assert "cache" in schema["auto_cleanup_astrbot_cache"]["hint"]
+    assert "不清理日志" in schema["auto_cleanup_astrbot_cache"]["hint"]
+    assert "Python 进程内存" in schema["auto_cleanup_astrbot_cache"]["hint"]
     assert schema["issue_assistant_enabled"]["type"] == "bool"
     assert (
         schema["issue_assistant_enabled"]["description"]
@@ -322,5 +332,6 @@ def test_changelog_contains_release_notes():
     assert "## 1.3.1" in changelog
     assert "## 1.3.2" in changelog
     assert "## 1.3.3" in changelog
+    assert "## 1.3.4" in changelog
     assert "## 1.2.5" in changelog
     assert "## 1.2.4" in changelog

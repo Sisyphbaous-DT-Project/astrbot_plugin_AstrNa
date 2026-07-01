@@ -36,6 +36,7 @@ def test_merge_config_keeps_defaults_for_missing_values():
         "issue_assistant_devkit_enabled": False,
         "issue_assistant_github_token": "",
         "issue_assistant_target_umo": "",
+        "auto_cleanup_astrbot_cache": False,
     }
 
 
@@ -73,6 +74,7 @@ def test_merge_config_can_enable_modules():
             "issue_assistant_devkit_enabled": True,
             "issue_assistant_github_token": "github_pat_secret",
             "issue_assistant_target_umo": "aiocqhttp:PrivateMessage:1719500341",
+            "auto_cleanup_astrbot_cache": True,
         }
     )
 
@@ -108,6 +110,7 @@ def test_merge_config_can_enable_modules():
         "issue_assistant_devkit_enabled": True,
         "issue_assistant_github_token": "github_pat_secret",
         "issue_assistant_target_umo": "aiocqhttp:PrivateMessage:1719500341",
+        "auto_cleanup_astrbot_cache": True,
     }
 
 
