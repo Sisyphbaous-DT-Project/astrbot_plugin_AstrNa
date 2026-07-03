@@ -411,8 +411,12 @@ class LongReplyContextModule:
         pending_key, pending = self._find_pending_for_event(event)
         if not pending_key or pending is None:
             return
+        recovered_failures = sanitize_non_negative_int(
+            get_event_extra(event, "_astrna_forward_retry_recovered_failures", 0),
+        )
+        unresolved_failures = max(0, tracker.failed - recovered_failures)
         pending["send_succeeded"] = tracker.succeeded > 0
-        pending["send_failed"] = tracker.failed > 0
+        pending["send_failed"] = unresolved_failures > 0
         self._pending[pending_key] = pending
         self._pending.move_to_end(pending_key)
 
@@ -944,6 +948,16 @@ def sanitize_key_part(value: Any) -> str:
     return text
 
 
+def sanitize_non_negative_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, result)
+
+
 def clamp_context_text(text: str) -> str:
     text = str(text or "").strip()
     if len(text) <= MAX_LONG_REPLY_CONTEXT_LENGTH:
@@ -1073,17 +1087,17 @@ def set_event_extra(event: Any, key: str, value: Any) -> None:
         pass
 
 
-def get_event_extra(event: Any, key: str) -> Any:
+def get_event_extra(event: Any, key: str, default: Any = None) -> Any:
     getter = getattr(event, "get_extra", None)
     if callable(getter):
         try:
-            return getter(key, None)
+            return getter(key, default)
         except Exception:  # noqa: BLE001
             pass
     extras = getattr(event, "_extras", None)
     if isinstance(extras, dict):
-        return extras.get(key)
-    return getattr(event, key, None)
+        return extras.get(key, default)
+    return getattr(event, key, default)
 
 
 def safe_call(func: Any, *args: Any, **kwargs: Any) -> Any:

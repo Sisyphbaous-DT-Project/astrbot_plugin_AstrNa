@@ -55,7 +55,7 @@
   "optimize_forward_nodes": {
     "type": "bool",
     "description": "优化合并转发",
-    "hint": "开启后，AstrNa 会在 AstrBot 自带合并转发已经触发时，把过长的单个转发节点拆成多个较短节点。这是为了防止模型输出字符过多，触发 QQ 单条消息文字上限或 QQ/NapCat 单个合并转发节点隐藏限制而导致发送失败。只有打开并触发 AstrBot 自带的合并转发功能后，这个功能才会启用；AstrBot 原本不触发合并转发时，开了也没用。默认关闭。",
+    "hint": "开启后，AstrNa 会在 AstrBot 自带合并转发已经触发时，把过长的单个转发节点拆成多个较短节点；如果 AstrBot、OutputPro 或其他输出插件生成的标准 Node/Nodes 合并转发在 QQ/NapCat 发送阶段失败，AstrNa 会自动拆成更小的合并转发包重试，最后再兜底为普通分段发送，尽量完整送达长文本。这是为了降低 QQ 单条消息文字上限、QQ/NapCat 单个合并转发节点或合并转发总包隐藏限制导致的发送失败概率。AstrBot 原本不触发合并转发时，开了也不会强制把普通消息变成合并转发。默认关闭。",
     "default": false
   },
   "forward_node_max_length": {

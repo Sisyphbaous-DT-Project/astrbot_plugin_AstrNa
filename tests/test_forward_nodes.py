@@ -17,26 +17,36 @@ from astrna.modules.forward_nodes import (
 
 
 class Plain:
+    type = "Plain"
+
     def __init__(self, text):
         self.text = text
 
 
 class Image:
+    type = "Image"
+
     def __init__(self, file):
         self.file = file
 
 
 class At:
+    type = "At"
+
     def __init__(self, qq):
         self.qq = qq
 
 
 class Reply:
+    type = "Reply"
+
     def __init__(self, id):
         self.id = id
 
 
 class Node:
+    type = "Node"
+
     def __init__(self, content, uin="123456", name="AstrBot"):
         self.content = content
         self.uin = uin
@@ -44,6 +54,8 @@ class Node:
 
 
 class Nodes:
+    type = "Nodes"
+
     def __init__(self, nodes):
         self.nodes = nodes
 
@@ -52,12 +64,25 @@ class DummyResult:
     def __init__(self, chain):
         self.chain = chain
 
+    def derive(self, chain):
+        return DummyResult(chain)
+
+
+class UnderivableResult:
+    def __init__(self, chain, marker):
+        self.chain = chain
+        self.marker = marker
+
 
 class DummyEvent:
     def __init__(self, chain, platform_name="aiocqhttp", self_id="123456"):
         self.result = DummyResult(chain)
         self.platform_name = platform_name
         self.self_id = self_id
+        self.sent = []
+        self.fail_lengths = set()
+        self.fail_plain = False
+        self._extras = {}
 
     def get_platform_name(self):
         return self.platform_name
@@ -67,6 +92,29 @@ class DummyEvent:
 
     def get_self_id(self):
         return self.self_id
+
+    def set_extra(self, key, value):
+        self._extras[key] = value
+
+    def get_extra(self, key, default=None):
+        return self._extras.get(key, default)
+
+    async def send(self, message):
+        chain = getattr(message, "chain", None)
+        if chain is None:
+            chain = message
+        forward_lengths = [
+            len(comp.nodes) for comp in chain if isinstance(comp, Nodes)
+        ]
+        if forward_lengths and forward_lengths[0] in self.fail_lengths:
+            raise RuntimeError(
+                "ActionFailed status='failed', retcode=1200, "
+                "message='发送转发消息（res_id：xxx 失败', "
+                "stream='normal-action', action='send_private_forward_msg'",
+            )
+        if self.fail_plain and not forward_lengths:
+            raise RuntimeError("plain send failed")
+        self.sent.append(list(chain))
 
 
 class DummyLogger:
@@ -167,6 +215,23 @@ def plain_lengths(nodes):
     ]
 
 
+def build_nodes(count, text_prefix="node"):
+    return Nodes([Node([Plain(f"{text_prefix}-{idx}")]) for idx in range(count)])
+
+
+def sent_forward_lengths(event):
+    lengths = []
+    for chain in event.sent:
+        for comp in chain:
+            if isinstance(comp, Nodes):
+                lengths.append(len(comp.nodes))
+    return lengths
+
+
+class NonForwardError(RuntimeError):
+    pass
+
+
 def test_default_disabled_runtime_does_not_install_patch(fakes, astrbot_modules):
     runtime = fakes.build_runtime()
 
@@ -199,8 +264,32 @@ def test_install_skips_when_astrbot_has_native_forward_split(fakes, astrbot_modu
 
     runtime = fakes.build_runtime({"optimize_forward_nodes": True})
 
-    assert astrbot_modules.respond_stage_cls.process is original_process
-    assert ForwardNodesModule._original_process is None
+    assert astrbot_modules.respond_stage_cls.process is not original_process
+    assert ForwardNodesModule._original_process is original_process
+    assert runtime.forward_nodes._enable_auto_node_split is False
+    asyncio.run(runtime.terminate())
+
+
+def test_native_forward_split_still_installs_send_retry(fakes, astrbot_modules):
+    def native_build_forward_nodes(self):
+        return None
+
+    sent_seen = []
+
+    async def process(self, event):
+        sent_seen.append(event.send)
+        await event.send(event.get_result())
+
+    astrbot_modules.result_stage_cls._build_forward_nodes = native_build_forward_nodes
+    astrbot_modules.respond_stage_cls.process = process
+
+    runtime = fakes.build_runtime({"optimize_forward_nodes": True})
+    event = DummyEvent([build_nodes(3)])
+
+    asyncio.run(astrbot_modules.respond_stage_cls().process(event))
+
+    assert sent_seen[0].__name__ == "astrna_forward_retry_send"
+    assert sent_forward_lengths(event) == [3]
     asyncio.run(runtime.terminate())
 
 
@@ -245,6 +334,194 @@ def test_patch_does_not_turn_respond_stage_into_async_generator(astrbot_modules)
     asyncio.run(run_like_scheduler())
 
     assert calls == 1
+
+
+def test_forward_send_failure_retries_with_smaller_forward_batches(
+    astrbot_modules,
+):
+    async def process(self, event):
+        await event.send(event.get_result())
+
+    astrbot_modules.respond_stage_cls.process = process
+    module = build_module()
+    module.install()
+
+    event = DummyEvent([build_nodes(6)])
+    event.fail_lengths = {6}
+
+    asyncio.run(astrbot_modules.respond_stage_cls().process(event))
+
+    assert sent_forward_lengths(event) == [5, 1]
+    assert event.get_extra("_astrna_forward_retry_recovered_failures") == 1
+
+
+def test_forward_send_failure_shrinks_until_prefix_succeeds(
+    astrbot_modules,
+):
+    async def process(self, event):
+        await event.send(event.get_result())
+
+    astrbot_modules.respond_stage_cls.process = process
+    module = build_module()
+    module.install()
+
+    event = DummyEvent([build_nodes(6)])
+    event.fail_lengths = {6, 5}
+
+    asyncio.run(astrbot_modules.respond_stage_cls().process(event))
+
+    assert sent_forward_lengths(event) == [4, 2]
+    assert event.get_extra("_astrna_forward_retry_recovered_failures") == 2
+
+
+def test_forward_retry_does_not_repeat_successful_prefix(
+    astrbot_modules,
+):
+    async def process(self, event):
+        await event.send(event.get_result())
+
+    astrbot_modules.respond_stage_cls.process = process
+    module = build_module()
+    module.install()
+
+    event = DummyEvent([build_nodes(6)])
+    event.fail_lengths = {6, 5, 2}
+
+    asyncio.run(astrbot_modules.respond_stage_cls().process(event))
+
+    assert sent_forward_lengths(event) == [4, 1, 1]
+    assert len(event.sent) == 3
+    assert event.get_extra("_astrna_forward_retry_recovered_failures") == 3
+
+
+def test_single_node_failure_falls_back_to_plain_chunks(astrbot_modules):
+    async def process(self, event):
+        await event.send(event.get_result())
+
+    astrbot_modules.respond_stage_cls.process = process
+    module = build_module({"forward_node_max_length": 4, "forward_node_hard_limit": 5})
+    module.install()
+
+    event = DummyEvent([Nodes([Node([Plain("abcdefghijk")])])])
+    event.fail_lengths = {1}
+
+    asyncio.run(astrbot_modules.respond_stage_cls().process(event))
+
+    assert sent_forward_lengths(event) == []
+    assert event.get_extra("_astrna_forward_retry_recovered_failures") == 1
+    assert ["".join(comp.text for comp in chain) for chain in event.sent] == [
+        "abcde",
+        "fghij",
+        "k",
+    ]
+
+
+def test_single_node_plain_fallback_does_not_repeat_header(
+    astrbot_modules,
+):
+    async def process(self, event):
+        await event.send(event.get_result())
+
+    astrbot_modules.respond_stage_cls.process = process
+    module = build_module({"forward_node_max_length": 4, "forward_node_hard_limit": 5})
+    module.install()
+
+    reply = Reply("msg-1")
+    event = DummyEvent([reply, Nodes([Node([Plain("abcdefghijk")])])])
+    event.fail_lengths = {1}
+
+    asyncio.run(astrbot_modules.respond_stage_cls().process(event))
+
+    assert [reply in chain for chain in event.sent] == [False, False, False]
+
+
+def test_forward_retry_sends_suffix_without_repeating_prefix(astrbot_modules):
+    async def process(self, event):
+        await event.send(event.get_result())
+
+    astrbot_modules.respond_stage_cls.process = process
+    module = build_module()
+    module.install()
+
+    prefix = Reply("msg-1")
+    suffix = Plain("tail")
+    event = DummyEvent([prefix, build_nodes(3), suffix])
+    event.fail_lengths = {3}
+
+    asyncio.run(astrbot_modules.respond_stage_cls().process(event))
+
+    assert sent_forward_lengths(event) == [2, 1]
+    assert event.sent[-1] == [suffix]
+    assert all(prefix not in chain for chain in event.sent)
+
+
+def test_forward_retry_does_not_resend_original_chain_when_derive_fails(
+    astrbot_modules,
+):
+    async def process(self, event):
+        await event.send(event.get_result())
+
+    astrbot_modules.respond_stage_cls.process = process
+    module = build_module()
+    module.install()
+
+    event = DummyEvent([])
+    event.result = UnderivableResult([build_nodes(3)], marker="requires-marker")
+    event.fail_lengths = {3}
+
+    with pytest.raises(RuntimeError, match="无法构造合并转发重试消息"):
+        asyncio.run(astrbot_modules.respond_stage_cls().process(event))
+
+    assert event.sent == []
+    assert event.get_extra("_astrna_forward_retry_recovered_failures") is None
+
+
+def test_non_forward_send_error_is_not_swallowed(astrbot_modules):
+    async def process(self, event):
+        await event.send(event.get_result())
+
+    async def send_non_forward_error(_message):
+        raise NonForwardError("network broken")
+
+    astrbot_modules.respond_stage_cls.process = process
+    module = build_module()
+    module.install()
+
+    event = DummyEvent([build_nodes(3)])
+    event.send = send_non_forward_error
+
+    with pytest.raises(NonForwardError):
+        asyncio.run(astrbot_modules.respond_stage_cls().process(event))
+
+
+def test_non_aiocqhttp_send_failure_is_not_retried(astrbot_modules):
+    async def process(self, event):
+        await event.send(event.get_result())
+
+    astrbot_modules.respond_stage_cls.process = process
+    module = build_module()
+    module.install()
+
+    event = DummyEvent([build_nodes(3)], platform_name="telegram")
+    event.fail_lengths = {3}
+
+    with pytest.raises(RuntimeError, match="retcode=1200"):
+        asyncio.run(astrbot_modules.respond_stage_cls().process(event))
+
+
+def test_plain_message_chain_send_failure_is_not_retried(astrbot_modules):
+    async def process(self, event):
+        await event.send(event.get_result())
+
+    astrbot_modules.respond_stage_cls.process = process
+    module = build_module()
+    module.install()
+
+    event = DummyEvent([Plain("hello")])
+    event.fail_plain = True
+
+    with pytest.raises(RuntimeError, match="plain send failed"):
+        asyncio.run(astrbot_modules.respond_stage_cls().process(event))
 
 
 def test_non_aiocqhttp_platform_is_skipped():

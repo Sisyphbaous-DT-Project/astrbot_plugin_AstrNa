@@ -12,6 +12,7 @@ import pytest
 from astrna.modules.forward_nodes import ForwardNodesModule
 from astrna.modules.long_reply_context import (
     LongReplyContextModule,
+    SendTracker,
     extract_plain_text_from_chain,
 )
 from astrna.modules.reply_target_history import ReplyTargetHistoryModule
@@ -651,6 +652,82 @@ def test_send_failure_does_not_append_group_context_record(astrbot_modules):
 
     assert saved_assistant_content(astrbot_modules) == "新正文"
     assert list(context.group_chat_context.raw_records[event.unified_msg_origin]) == []
+
+
+def test_recovered_forward_retry_failure_allows_group_context_record(astrbot_modules):
+    conversation = DummyConversation(
+        history=json.dumps([{"role": "assistant", "content": "旧"}], ensure_ascii=False)
+    )
+    context = DummyPipelineContext(conversation)
+    event = DummyEvent(
+        result=DummyResult([Node([Plain("新正文")])]),
+        context=context,
+    )
+    req = DummyReq(conversation)
+    module = LongReplyContextModule(logger=DummyLogger())
+    module.install()
+    event.set_extra("_astrna_forward_retry_recovered_failures", 1)
+
+    run_full_turn(
+        astrbot_modules,
+        context=context,
+        event=event,
+        req=req,
+        response_text="新正文",
+        messages=[Message("assistant", "新正文")],
+    )
+
+    pending = module._find_pending_for_event(event)[1]
+    assert pending is None
+    records = list(context.group_chat_context.raw_records[event.unified_msg_origin])
+    assert len(records) == 1
+    assert "新正文" in records[0]
+
+
+def test_multiple_recovered_forward_retry_failures_allow_group_context_record(
+    astrbot_modules,
+):
+    conversation = DummyConversation(
+        history=json.dumps([{"role": "assistant", "content": "旧"}], ensure_ascii=False)
+    )
+    context = DummyPipelineContext(conversation)
+    event = DummyEvent(
+        result=DummyResult([Node([Plain("新正文")])]),
+        context=context,
+    )
+    req = DummyReq(conversation)
+    module = LongReplyContextModule(logger=DummyLogger())
+    module.install()
+    event.set_extra("_astrna_forward_retry_recovered_failures", 2)
+
+    pending_key = "pending-key"
+    module._pending[pending_key] = {
+        "text": "新正文",
+        "final_text": "新正文",
+        "append_group_context": True,
+        "pipeline_context": context,
+        "unified_msg_origin": event.unified_msg_origin,
+        "event_id": str(id(event)),
+    }
+    event.set_extra("_astrna_long_reply_pending_key", pending_key)
+    tracker = SendTracker()
+    tracker.succeeded = 2
+    tracker.failed = 2
+
+    module.record_send_result(event, tracker)
+    run(
+        astrbot_modules.internal_cls()._save_to_history(
+            event,
+            req,
+            DummyLLMResponse("新正文"),
+            [Message("assistant", "新正文")],
+            None,
+        )
+    )
+
+    records = list(context.group_chat_context.raw_records[event.unified_msg_origin])
+    assert len(records) == 1
+    assert "新正文" in records[0]
 
 
 def test_ambiguous_pending_for_same_session_is_skipped_without_event_key(
