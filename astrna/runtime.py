@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .modules.auto_cache_cleanup import AutoCacheCleanupModule
+from .modules.builtin_command_allowlist import BuiltinCommandAllowlistModule
 from .modules.deepseek_v4_400 import DeepSeekV4400Module
 from .modules.dynamic_system_prompt import DynamicSystemPromptModule
 from .modules.forward_nodes import (
@@ -58,6 +59,8 @@ DEFAULT_CONFIG = {
     "issue_assistant_github_token": "",
     "issue_assistant_target_umo": "",
     "auto_cleanup_astrbot_cache": False,
+    "custom_builtin_commands_enabled": False,
+    "custom_builtin_commands_allowlist": [],
 }
 
 
@@ -113,6 +116,11 @@ class AstrNaRuntime:
             kv_store=kv_store,
         )
         self.auto_cache_cleanup = AutoCacheCleanupModule(logger=logger)
+        self.builtin_command_allowlist = BuiltinCommandAllowlistModule(
+            logger=logger,
+            enabled=self.config.get("custom_builtin_commands_enabled", False),
+            allowlist=self.config.get("custom_builtin_commands_allowlist", []),
+        )
         self._configure_group_context_persist_callback()
         self.issue_assistant = IssueAssistantModule(
             context=context,
@@ -151,6 +159,8 @@ class AstrNaRuntime:
             self.group_sender_concurrency.install()
         if self.config.get("optimize_group_chat_context", False):
             self.group_chat_context_optimizer.install()
+        if self.config.get("custom_builtin_commands_enabled", False):
+            self.builtin_command_allowlist.install()
         self._configure_auto_cache_cleanup()
 
     async def sanitize_request(self, event: Any, req: Any) -> None:
@@ -229,6 +239,7 @@ class AstrNaRuntime:
         else:
             self.group_chat_context_optimizer.terminate()
 
+        self._configure_builtin_command_allowlist()
         self._configure_auto_cache_cleanup()
 
         if self.config.get("optimize_identity_metadata", False):
@@ -343,6 +354,17 @@ class AstrNaRuntime:
         else:
             self.auto_cache_cleanup.terminate()
 
+    def _configure_builtin_command_allowlist(self) -> None:
+        enabled = self.config.get("custom_builtin_commands_enabled", False)
+        self.builtin_command_allowlist.configure(
+            enabled=enabled,
+            allowlist=self.config.get("custom_builtin_commands_allowlist", []),
+        )
+        if enabled:
+            self.builtin_command_allowlist.install()
+        else:
+            self.builtin_command_allowlist.terminate()
+
     async def on_astrbot_loaded(self) -> None:
         self._configure_auto_cache_cleanup()
 
@@ -382,6 +404,7 @@ class AstrNaRuntime:
         self.reply_target_history.terminate()
         self.deepseek_v4_400.terminate()
         self.auto_cache_cleanup.terminate()
+        self.builtin_command_allowlist.terminate()
 
 
 def merge_config(config: dict | None) -> dict[str, Any]:

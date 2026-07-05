@@ -37,6 +37,8 @@ def test_merge_config_keeps_defaults_for_missing_values():
         "issue_assistant_github_token": "",
         "issue_assistant_target_umo": "",
         "auto_cleanup_astrbot_cache": False,
+        "custom_builtin_commands_enabled": False,
+        "custom_builtin_commands_allowlist": [],
     }
 
 
@@ -75,6 +77,8 @@ def test_merge_config_can_enable_modules():
             "issue_assistant_github_token": "github_pat_secret",
             "issue_assistant_target_umo": "aiocqhttp:PrivateMessage:1719500341",
             "auto_cleanup_astrbot_cache": True,
+            "custom_builtin_commands_enabled": True,
+            "custom_builtin_commands_allowlist": ["sid", "reset"],
         }
     )
 
@@ -111,6 +115,8 @@ def test_merge_config_can_enable_modules():
         "issue_assistant_github_token": "github_pat_secret",
         "issue_assistant_target_umo": "aiocqhttp:PrivateMessage:1719500341",
         "auto_cleanup_astrbot_cache": True,
+        "custom_builtin_commands_enabled": True,
+        "custom_builtin_commands_allowlist": ["sid", "reset"],
     }
 
 

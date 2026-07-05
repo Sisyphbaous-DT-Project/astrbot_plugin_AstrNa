@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.3.6"
+    assert metadata["version"] == "1.3.7"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -54,6 +54,8 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "optimize_reply_target_history",
         "unlock_group_sender_concurrency",
         "auto_cleanup_astrbot_cache",
+        "custom_builtin_commands_enabled",
+        "custom_builtin_commands_allowlist",
         "issue_assistant_enabled",
         "issue_assistant_devkit_enabled",
         "issue_assistant_target_umo",
@@ -253,6 +255,39 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
     assert "cache" in schema["auto_cleanup_astrbot_cache"]["hint"]
     assert "不清理日志" in schema["auto_cleanup_astrbot_cache"]["hint"]
     assert "Python 进程内存" in schema["auto_cleanup_astrbot_cache"]["hint"]
+    assert schema["custom_builtin_commands_enabled"]["type"] == "bool"
+    assert (
+        schema["custom_builtin_commands_enabled"]["description"]
+        == "自定义开启 AstrBot 内置指令"
+    )
+    assert schema["custom_builtin_commands_enabled"]["default"] is False
+    assert "禁用自带指令" in schema["custom_builtin_commands_enabled"]["hint"]
+    assert "管理员权限" in schema["custom_builtin_commands_enabled"]["hint"]
+    assert "builtin_commands_extension" in schema["custom_builtin_commands_enabled"]["hint"]
+    assert schema["custom_builtin_commands_allowlist"]["type"] == "list"
+    assert schema["custom_builtin_commands_allowlist"]["description"] == "允许使用的内置指令"
+    assert schema["custom_builtin_commands_allowlist"]["items"] == {"type": "string"}
+    assert schema["custom_builtin_commands_allowlist"]["options"] == [
+        "help",
+        "sid",
+        "name",
+        "reset",
+        "stop",
+        "new",
+        "stats",
+        "provider",
+        "dashboard_update",
+        "set",
+        "unset",
+    ]
+    assert "/sid - 查看 UMO" in schema["custom_builtin_commands_allowlist"]["labels"][1]
+    assert schema["custom_builtin_commands_allowlist"]["default"] == []
+    assert schema["custom_builtin_commands_allowlist"]["collapsed"] is True
+    assert schema["custom_builtin_commands_allowlist"]["condition"] == {
+        "custom_builtin_commands_enabled": True,
+    }
+    assert "canonical" in schema["custom_builtin_commands_allowlist"]["hint"]
+    assert "重命名" in schema["custom_builtin_commands_allowlist"]["hint"]
     assert schema["issue_assistant_enabled"]["type"] == "bool"
     assert (
         schema["issue_assistant_enabled"]["description"]
@@ -333,5 +368,6 @@ def test_changelog_contains_release_notes():
     assert "## 1.3.2" in changelog
     assert "## 1.3.3" in changelog
     assert "## 1.3.6" in changelog
+    assert "## 1.3.7" in changelog
     assert "## 1.2.5" in changelog
     assert "## 1.2.4" in changelog
