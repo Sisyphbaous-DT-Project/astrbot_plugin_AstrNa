@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.3.7"
+    assert metadata["version"] == "1.3.8"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -369,5 +369,6 @@ def test_changelog_contains_release_notes():
     assert "## 1.3.3" in changelog
     assert "## 1.3.6" in changelog
     assert "## 1.3.7" in changelog
+    assert "## 1.3.8" in changelog
     assert "## 1.2.5" in changelog
     assert "## 1.2.4" in changelog

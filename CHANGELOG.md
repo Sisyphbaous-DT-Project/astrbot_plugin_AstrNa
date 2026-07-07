@@ -1,5 +1,11 @@
 # 更新日志
 
+## 1.3.8
+
+- 更新版本与文档兼容性说明：当前已测试兼容 AstrBot `4.26.5`。
+- 补充“优化回复历史标记”平台边界：QQ 官方 Bot 引用消息缺少可靠的被引用消息发送者信息，AstrNa 无法安全判断引用关系，因此不支持该平台的引用回复指向优化。
+- 本次未调整运行时逻辑；经兼容性审查确认，AstrBot `4.26.5` 未改动 AstrNa 依赖的核心 patch 签名，`_process_quote_message`、`_iter_llm_responses_with_fallback`、`InternalAgentSubStage._save_to_history`、`RespondStage.process` 等入口仍兼容。
+
 ## 1.3.7
 
 - 新增自定义开启 AstrBot 内置指令：可用多选下拉选择 `/help`、`/sid`、`/reset` 等核心内置指令，选中的能用，没选中的不能用。
