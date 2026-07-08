@@ -4,6 +4,7 @@
 
 - 修复多个运行时补丁共用 AstrBot 方法时的链式恢复问题：输出字数限制、优化 `send_message_to_user`、优化合并转发和 DeepSeek V4 payload 补丁在关闭后即使仍被外层 wrapper 透传，也会安全转发到安装时捕获的原方法，不再因为类级原方法被清空而崩溃或递归。
 - 补齐运行时开关同步：优化合并转发、提供群身份查询工具、AstrBot 插件缓存优化、优化 `send_message_to_user` 和输出字数限制现在都能在配置切换后对称安装或终止。
+- 修复 AstrBot 插件缓存优化包装第三方 `on_llm_request` handler 时的参数兼容问题：当运行链路额外传入位置参数时，AstrNa 会按原 handler 签名裁剪参数，避免标准 `event, req` 监听器因为多余参数报错。
 - 加固共享补丁链共存：优化合并转发与优化超长回复上下文共同包装 `RespondStage.process` 时，关闭其中一个功能不会误摘掉另一个仍在启用的 wrapper。
 - 增加补丁链回归测试，覆盖关闭中间 wrapper、关闭后重新开启、运行时开关切换、共享链共存和 DeepSeek stale wrapper 透明透传等场景。
 

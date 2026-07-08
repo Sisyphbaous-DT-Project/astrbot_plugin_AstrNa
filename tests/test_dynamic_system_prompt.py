@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from enum import Enum
+from functools import partial
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ from astrna.modules.dynamic_system_prompt import (
     DYNAMIC_SYSTEM_PROMPT_STATE_KEY,
     SystemPromptDiff,
     TakeoverRule,
+    build_compatible_handler_call,
     build_migration,
     build_takeover_rule,
     detect_system_prompt_diff,
@@ -300,6 +302,191 @@ def test_runtime_toggle_off_restores_dynamic_system_prompt_handlers(
 
     assert handler.handler is target_handler
     assert runtime.dynamic_system_prompt._wrapped_handlers == {}
+    run(runtime.terminate())
+
+
+def test_wrapper_filters_extra_positional_args_for_standard_handler(
+    fakes,
+    fake_astrbot_llm_registry,
+):
+    async def target_handler(event, req):
+        req.system_prompt += "dynamic"
+
+    module_path = "plugins.standard_signature"
+    fake_astrbot_llm_registry.add_plugin(module_path)
+    handler = build_handler("target_handler", target_handler, module_path=module_path)
+    fake_astrbot_llm_registry.handlers.append(handler)
+    runtime = fakes.build_runtime({"optimize_dynamic_system_prompt": True})
+    req = fakes.Request(contexts=[])
+    req.system_prompt = "base"
+
+    run(handler.handler(fakes.Event(), req, "unexpected-extra"))
+
+    assert req.system_prompt == "basedynamic"
+    run(runtime.terminate())
+
+
+def test_wrapper_filters_extra_args_for_partial_bound_plugin_method(
+    fakes,
+    fake_astrbot_llm_registry,
+):
+    class Plugin:
+        async def auth_guard(self, event, req):
+            req.system_prompt += "guard"
+
+    module_path = "plugins.partial_signature"
+    fake_astrbot_llm_registry.add_plugin(module_path)
+    handler = build_handler(
+        "auth_guard",
+        partial(Plugin.auth_guard, Plugin()),
+        module_path=module_path,
+    )
+    fake_astrbot_llm_registry.handlers.append(handler)
+    runtime = fakes.build_runtime({"optimize_dynamic_system_prompt": True})
+    req = fakes.Request(contexts=[])
+    req.system_prompt = "base"
+
+    run(handler.handler(fakes.Event(), req, "unexpected-extra"))
+
+    assert req.system_prompt == "baseguard"
+    run(runtime.terminate())
+
+
+def test_wrapper_preserves_supported_extra_args_and_kwargs(
+    fakes,
+    fake_astrbot_llm_registry,
+):
+    seen = {}
+
+    async def target_handler(event, req, *args, trace=None, **kwargs):
+        seen["args"] = args
+        seen["trace"] = trace
+        seen["kwargs"] = kwargs
+        req.system_prompt += "dynamic"
+
+    module_path = "plugins.extended_signature"
+    fake_astrbot_llm_registry.add_plugin(module_path)
+    handler = build_handler("target_handler", target_handler, module_path=module_path)
+    fake_astrbot_llm_registry.handlers.append(handler)
+    runtime = fakes.build_runtime({"optimize_dynamic_system_prompt": True})
+    req = fakes.Request(contexts=[])
+    req.system_prompt = "base"
+
+    run(handler.handler(fakes.Event(), req, "extra-1", trace="trace-1", custom="value"))
+
+    assert seen == {
+        "args": ("extra-1",),
+        "trace": "trace-1",
+        "kwargs": {"custom": "value"},
+    }
+    assert req.system_prompt == "basedynamic"
+    run(runtime.terminate())
+
+
+def test_wrapper_filters_unsupported_kwargs(
+    fakes,
+    fake_astrbot_llm_registry,
+):
+    seen = {}
+
+    async def target_handler(event, req, *, trace=None):
+        seen["trace"] = trace
+        req.system_prompt += "dynamic"
+
+    module_path = "plugins.keyword_signature"
+    fake_astrbot_llm_registry.add_plugin(module_path)
+    handler = build_handler("target_handler", target_handler, module_path=module_path)
+    fake_astrbot_llm_registry.handlers.append(handler)
+    runtime = fakes.build_runtime({"optimize_dynamic_system_prompt": True})
+    req = fakes.Request(contexts=[])
+    req.system_prompt = "base"
+
+    run(handler.handler(fakes.Event(), req, "dropped-extra", trace="trace-1", custom="drop"))
+
+    assert seen == {"trace": "trace-1"}
+    assert req.system_prompt == "basedynamic"
+    run(runtime.terminate())
+
+
+def test_compatible_call_drops_event_and_req_from_extra_kwargs(fakes):
+    seen = {}
+
+    async def target_handler(event, req, **kwargs):
+        seen["event"] = event
+        seen["req"] = req
+        seen["kwargs"] = kwargs
+        req.system_prompt += "dynamic"
+
+    event = fakes.Event()
+    req = fakes.Request(contexts=[])
+    req.system_prompt = "base"
+    args, kwargs = build_compatible_handler_call(
+        target_handler,
+        event,
+        req,
+        (),
+        {
+            "event": "duplicate-event",
+            "req": "duplicate-req",
+            "custom": "value",
+        },
+        fakes.Logger(),
+    )
+
+    run(target_handler(*args, **kwargs))
+
+    assert seen == {
+        "event": event,
+        "req": req,
+        "kwargs": {"custom": "value"},
+    }
+    assert req.system_prompt == "basedynamic"
+
+
+def test_signature_fallback_uses_standard_event_and_request_args(fakes):
+    async def target_handler(event, req):
+        req.system_prompt += "dynamic"
+
+    class UnreadableSignatureHandler:
+        __signature__ = "unreadable"
+
+        def __call__(self, *args, **kwargs):
+            return target_handler(*args, **kwargs)
+
+    event = fakes.Event()
+    req = fakes.Request(contexts=[])
+    req.system_prompt = "base"
+    args, kwargs = build_compatible_handler_call(
+        UnreadableSignatureHandler(),
+        event,
+        req,
+        ("extra",),
+        {"custom": "drop"},
+        fakes.Logger(),
+    )
+
+    assert args == (event, req)
+    assert kwargs == {}
+    run(target_handler(*args, **kwargs))
+    assert req.system_prompt == "basedynamic"
+
+
+def test_wrapper_does_not_swallow_handler_type_error(
+    fakes,
+    fake_astrbot_llm_registry,
+):
+    async def target_handler(event, req):
+        raise TypeError("handler internal type error")
+
+    module_path = "plugins.type_error"
+    fake_astrbot_llm_registry.add_plugin(module_path)
+    handler = build_handler("target_handler", target_handler, module_path=module_path)
+    fake_astrbot_llm_registry.handlers.append(handler)
+    runtime = fakes.build_runtime({"optimize_dynamic_system_prompt": True})
+
+    with pytest.raises(TypeError, match="handler internal type error"):
+        run(handler.handler(fakes.Event(), fakes.Request([]), "unexpected-extra"))
+
     run(runtime.terminate())
 
 

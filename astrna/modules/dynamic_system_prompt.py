@@ -128,7 +128,14 @@ class DynamicSystemPromptModule:
         await self._ensure_state_loaded()
 
         before = get_system_prompt(req)
-        result = await original_handler(event, req, *args, **kwargs)
+        result = await call_handler_with_compatible_args(
+            original_handler,
+            event,
+            req,
+            args,
+            kwargs,
+            self.logger,
+        )
         after = get_system_prompt(req)
 
         diff = detect_system_prompt_diff(before, after)
@@ -327,6 +334,94 @@ def load_star_map() -> dict[str, Any]:
     except Exception:
         return {}
     return star_map
+
+
+async def call_handler_with_compatible_args(
+    handler: Any,
+    event: Any,
+    req: Any,
+    extra_args: tuple[Any, ...],
+    extra_kwargs: dict[str, Any],
+    logger: Any,
+) -> Any:
+    args, kwargs = build_compatible_handler_call(
+        handler,
+        event,
+        req,
+        extra_args,
+        extra_kwargs,
+        logger,
+    )
+    return await handler(*args, **kwargs)
+
+
+def build_compatible_handler_call(
+    handler: Any,
+    event: Any,
+    req: Any,
+    extra_args: tuple[Any, ...],
+    extra_kwargs: dict[str, Any],
+    logger: Any,
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    base_args = (event, req)
+    try:
+        signature = inspect.signature(handler)
+    except (TypeError, ValueError) as exc:
+        log(
+            logger,
+            "debug",
+            "AstrNa 无法读取缓存优化 handler 签名，按 OnLLMRequestEvent 标准参数调用: %s",
+            exc,
+        )
+        return base_args, {}
+
+    parameters = list(signature.parameters.values())
+    accepts_var_positional = any(
+        param.kind is inspect.Parameter.VAR_POSITIONAL for param in parameters
+    )
+    accepts_var_keyword = any(
+        param.kind is inspect.Parameter.VAR_KEYWORD for param in parameters
+    )
+    positional_params = [
+        param
+        for param in parameters
+        if param.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    max_positional = None if accepts_var_positional else len(positional_params)
+    positional_args = base_args + tuple(extra_args)
+    if max_positional is not None:
+        positional_args = positional_args[:max_positional]
+
+    occupied_names = {
+        param.name
+        for param in positional_params[: len(positional_args)]
+        if param.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    }
+    if accepts_var_keyword:
+        compatible_kwargs = dict(extra_kwargs)
+    else:
+        compatible_names = {
+            param.name
+            for param in parameters
+            if param.kind
+            in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        }
+        compatible_kwargs = {
+            key: value
+            for key, value in extra_kwargs.items()
+            if key in compatible_names
+        }
+    for occupied_name in occupied_names:
+        compatible_kwargs.pop(occupied_name, None)
+
+    return positional_args, compatible_kwargs
 
 
 def get_system_prompt(req: Any) -> str:
