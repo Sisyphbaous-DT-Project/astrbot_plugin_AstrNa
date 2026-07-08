@@ -1029,6 +1029,98 @@ def test_coexists_with_forward_nodes_respond_patch(fakes, astrbot_modules, monke
     forward.terminate()
 
 
+def test_runtime_turning_off_forward_nodes_keeps_long_reply_patch(
+    fakes,
+    astrbot_modules,
+    monkeypatch,
+):
+    components_module = ModuleType("astrbot.core.message.components")
+    components_module.Plain = Plain
+    components_module.Node = Node
+    components_module.Nodes = Nodes
+    result_stage_module = ModuleType("astrbot.core.pipeline.result_decorate.stage")
+
+    class ResultDecorateStage:
+        async def process(self, event):
+            yield None
+
+    result_stage_module.ResultDecorateStage = ResultDecorateStage
+    monkeypatch.setitem(sys.modules, "astrbot.core.message.components", components_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "astrbot.core.pipeline.result_decorate.stage",
+        result_stage_module,
+    )
+    original = astrbot_modules.respond_cls.process
+    runtime = fakes.build_runtime(
+        {
+            "optimize_forward_nodes": True,
+            "optimize_long_reply_context": True,
+        }
+    )
+
+    assert getattr(astrbot_modules.respond_cls.process, "_astrna_long_reply_context_patch")
+
+    runtime.config["optimize_forward_nodes"] = False
+    run(runtime.sanitize_request(fakes.Event(), fakes.Request([])))
+
+    assert runtime.forward_nodes._installed is False
+    assert runtime.long_reply_context._installed is True
+    assert getattr(astrbot_modules.respond_cls.process, "_astrna_long_reply_context_patch")
+    assert not getattr(
+        astrbot_modules.respond_cls.process,
+        "_astrna_forward_nodes_patch",
+        False,
+    )
+    assert LongReplyContextModule._original_respond_process is original
+    run(runtime.terminate())
+
+
+def test_runtime_turning_off_long_reply_keeps_forward_nodes_patch(
+    fakes,
+    astrbot_modules,
+    monkeypatch,
+):
+    components_module = ModuleType("astrbot.core.message.components")
+    components_module.Plain = Plain
+    components_module.Node = Node
+    components_module.Nodes = Nodes
+    result_stage_module = ModuleType("astrbot.core.pipeline.result_decorate.stage")
+
+    class ResultDecorateStage:
+        async def process(self, event):
+            yield None
+
+    result_stage_module.ResultDecorateStage = ResultDecorateStage
+    monkeypatch.setitem(sys.modules, "astrbot.core.message.components", components_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "astrbot.core.pipeline.result_decorate.stage",
+        result_stage_module,
+    )
+    runtime = fakes.build_runtime(
+        {
+            "optimize_forward_nodes": True,
+            "optimize_long_reply_context": True,
+        }
+    )
+
+    assert getattr(astrbot_modules.respond_cls.process, "_astrna_long_reply_context_patch")
+
+    runtime.config["optimize_long_reply_context"] = False
+    run(runtime.sanitize_request(fakes.Event(), fakes.Request([])))
+
+    assert runtime.forward_nodes._installed is True
+    assert runtime.long_reply_context._installed is False
+    assert getattr(astrbot_modules.respond_cls.process, "_astrna_forward_nodes_patch")
+    assert not getattr(
+        astrbot_modules.respond_cls.process,
+        "_astrna_long_reply_context_patch",
+        False,
+    )
+    run(runtime.terminate())
+
+
 def test_runtime_terminate_restores_long_reply_before_forward_nodes(
     fakes,
     astrbot_modules,

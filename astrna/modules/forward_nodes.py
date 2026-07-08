@@ -23,6 +23,7 @@ class ForwardNodesModule:
 
     _stage_cls: type | None = None
     _original_process: Any = None
+    _process_wrapper: Any = None
     _active_module: ForwardNodesModule | None = None
 
     def __init__(
@@ -83,15 +84,21 @@ class ForwardNodesModule:
         if module_cls._original_process is None:
             module_cls._stage_cls = stage_cls
             module_cls._original_process = stage_cls.process
+            original_process = stage_cls.process
 
             async def astrna_forward_nodes_process(stage_self: Any, event: Any):
                 active_module = module_cls._active_module
+                if getattr(
+                    astrna_forward_nodes_process,
+                    "_astrna_wrapper_active",
+                    True,
+                ) is False:
+                    active_module = None
                 restore_send = active_module._noop_restore if active_module else None
                 if active_module is not None:
                     active_module.optimize_event_result(stage_self, event)
                     restore_send = active_module.install_forward_send_retry(event)
 
-                original_process = module_cls._original_process
                 try:
                     processed = original_process(stage_self, event)
                     if inspect.isawaitable(processed):
@@ -102,6 +109,8 @@ class ForwardNodesModule:
                         restore_send()
 
             astrna_forward_nodes_process._astrna_forward_nodes_patch = True
+            mark_wrapper_active(astrna_forward_nodes_process, original_process)
+            module_cls._process_wrapper = astrna_forward_nodes_process
             stage_cls.process = astrna_forward_nodes_process
 
         module_cls._active_module = self
@@ -164,10 +173,16 @@ class ForwardNodesModule:
 
     @classmethod
     def restore_patch(cls) -> None:
+        mark_wrapper_inactive(cls._process_wrapper)
         if cls._stage_cls is not None and cls._original_process is not None:
-            cls._stage_cls.process = cls._original_process
+            current = getattr(cls._stage_cls, "process", None)
+            if getattr(current, "_astrna_forward_nodes_patch", False):
+                cls._stage_cls.process = unwrap_inactive_wrapper(cls._original_process)
+            elif getattr(cls._original_process, "_astrna_wrapper_active", True) is False:
+                cls._original_process = unwrap_inactive_wrapper(cls._original_process)
         cls._stage_cls = None
         cls._original_process = None
+        cls._process_wrapper = None
         cls._active_module = None
 
     def optimize_event_result(self, stage: Any, event: Any) -> None:
@@ -876,3 +891,35 @@ def safe_call(func: Any) -> Any:
         return func()
     except Exception:
         return None
+
+
+def mark_wrapper_active(wrapper: Any, original: Any) -> None:
+    try:
+        wrapper._astrna_wrapper_active = True
+        wrapper._astrna_wrapped_original = original
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def mark_wrapper_inactive(wrapper: Any) -> None:
+    if wrapper is None:
+        return
+    try:
+        wrapper._astrna_wrapper_active = False
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def unwrap_inactive_wrapper(func: Any) -> Any:
+    seen: set[int] = set()
+    while (
+        callable(func)
+        and getattr(func, "_astrna_wrapper_active", True) is False
+        and id(func) not in seen
+    ):
+        seen.add(id(func))
+        original = getattr(func, "_astrna_wrapped_original", None)
+        if not callable(original) or original is func:
+            break
+        func = original
+    return func

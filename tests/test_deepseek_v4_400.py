@@ -231,6 +231,61 @@ def test_runtime_can_disable_payload_patch_next_request(fakes, openai_provider_m
     assert openai_provider_module.ProviderOpenAIOfficial._finally_convert_payload is original
 
 
+def test_stale_payload_wrapper_delegates_after_terminate(fakes, openai_provider_module):
+    module = build_module(fakes)
+    assert module.install() is True
+    wrapper = openai_provider_module.ProviderOpenAIOfficial._finally_convert_payload
+
+    module.terminate()
+    payloads = {
+        "model": "deepseek-v4-pro",
+        "messages": [{"role": "assistant", "content": "上一轮回复"}],
+    }
+
+    wrapper(openai_provider_module.ProviderOpenAIOfficial(), payloads)
+
+    assert payloads["messages"][0]["reasoning_content"] == ""
+
+
+def test_stale_payload_wrapper_does_not_reuse_new_active_module(
+    fakes,
+    openai_provider_module,
+):
+    first_module = build_module(fakes)
+    assert first_module.install() is True
+    stale_wrapper = openai_provider_module.ProviderOpenAIOfficial._finally_convert_payload
+
+    def outer_wrapper(provider, payloads):
+        return stale_wrapper(provider, payloads)
+
+    openai_provider_module.ProviderOpenAIOfficial._finally_convert_payload = outer_wrapper
+    first_module.terminate()
+
+    second_module = build_module(fakes)
+    calls = []
+
+    def record_fix(provider, payloads):
+        calls.append(payloads)
+        DeepSeekV4400Module.fix_deepseek_v4_reasoning_payload(
+            second_module,
+            provider,
+            payloads,
+        )
+
+    second_module.fix_deepseek_v4_reasoning_payload = record_fix
+
+    assert second_module.install() is True
+    payloads = {
+        "model": "deepseek-v4-pro",
+        "messages": [{"role": "assistant", "content": "上一轮回复"}],
+    }
+
+    openai_provider_module.ProviderOpenAIOfficial()._finally_convert_payload(payloads)
+
+    assert len(calls) == 1
+    assert payloads["messages"][0]["reasoning_content"] == ""
+
+
 def test_proxy_deepseek_v4_models_get_reasoning_content(fakes, openai_provider_module):
     module = build_module(fakes)
     module.install()

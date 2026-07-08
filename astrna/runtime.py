@@ -176,10 +176,22 @@ class AstrNaRuntime:
 
         if self.config.get("optimize_dynamic_system_prompt", False):
             self.dynamic_system_prompt.install()
-        if self.config.get("optimize_send_message_to_user", False):
-            self.send_message_to_user.install()
-            self.send_message_to_user.prepare_request(event, req)
-        if self.config.get("output_length_limit_enabled", False):
+        else:
+            self.dynamic_system_prompt.terminate()
+
+        send_message_to_user_enabled = self.config.get(
+            "optimize_send_message_to_user",
+            False,
+        )
+        output_length_limit_enabled = self.config.get(
+            "output_length_limit_enabled",
+            False,
+        )
+        group_concurrency_enabled = self.config.get(
+            "unlock_group_sender_concurrency",
+            False,
+        )
+        if output_length_limit_enabled:
             self.output_length_limiter.configure(
                 whitelist_umos=self.config.get("output_length_limit_whitelist_umos", ""),
                 max_chars=self.config.get(
@@ -189,9 +201,31 @@ class AstrNaRuntime:
                 provider_id=self.config.get("output_length_limit_provider_id", ""),
                 persona_id=self.config.get("output_length_limit_persona_id", ""),
             )
-            self.output_length_limiter.install()
-        else:
+
+        send_message_to_user_will_change = (
+            bool(getattr(self.send_message_to_user, "_installed", False))
+            != send_message_to_user_enabled
+        )
+        output_length_limit_will_change = (
+            bool(getattr(self.output_length_limiter, "_installed", False))
+            != output_length_limit_enabled
+        )
+        if send_message_to_user_will_change or output_length_limit_will_change:
+            self.group_sender_concurrency.terminate()
             self.output_length_limiter.terminate()
+            self.send_message_to_user.terminate()
+            if send_message_to_user_enabled:
+                self.send_message_to_user.install()
+            if output_length_limit_enabled:
+                self.output_length_limiter.install()
+        else:
+            if send_message_to_user_enabled:
+                self.send_message_to_user.install()
+            if output_length_limit_enabled:
+                self.output_length_limiter.install()
+
+        if send_message_to_user_enabled:
+            self.send_message_to_user.prepare_request(event, req)
 
         self._configure_issue_assistant()
         await self.issue_assistant.prepare_request(event, req)
@@ -208,27 +242,34 @@ class AstrNaRuntime:
         else:
             self.deepseek_v4_400.terminate()
 
+        forward_nodes_enabled = self.config.get("optimize_forward_nodes", False)
         long_reply_enabled = self.config.get("optimize_long_reply_context", False)
-        group_concurrency_enabled = self.config.get(
-            "unlock_group_sender_concurrency",
-            False,
+        forward_nodes_will_change = (
+            bool(getattr(self.forward_nodes, "_installed", False))
+            != forward_nodes_enabled
         )
         long_reply_will_change = (
             bool(getattr(self.long_reply_context, "_installed", False))
             != long_reply_enabled
         )
-        if long_reply_will_change:
+        if forward_nodes_will_change or long_reply_will_change:
             self.group_sender_concurrency.terminate()
-
-        if long_reply_enabled:
-            self.long_reply_context.install()
-        else:
             self.long_reply_context.terminate()
+            self.forward_nodes.terminate()
+            if forward_nodes_enabled:
+                self.forward_nodes.install()
+            if long_reply_enabled:
+                self.long_reply_context.install()
 
         if group_concurrency_enabled:
             self.group_sender_concurrency.install()
         else:
             self.group_sender_concurrency.terminate()
+
+        if self.config.get("provide_group_identity_tools", False):
+            self.group_identity_tools.install()
+        else:
+            self.group_identity_tools.terminate()
 
         self.group_chat_context_optimizer.configure(
             provider_id=self.config.get("group_chat_context_compress_provider_id", ""),

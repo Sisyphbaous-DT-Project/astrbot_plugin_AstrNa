@@ -92,6 +92,22 @@ def test_enabled_runtime_registers_tools_and_terminate_unregisters(fakes):
     assert runtime.context.unregistered_tools == group_identity_tool_names()
 
 
+def test_runtime_toggle_syncs_group_identity_tools(fakes):
+    runtime = fakes.build_runtime({"provide_group_identity_tools": False})
+
+    runtime.config["provide_group_identity_tools"] = True
+    run(runtime.sanitize_request(fakes.Event(), fakes.Request([])))
+
+    assert [tool.name for tool in runtime.context.llm_tools] == group_identity_tool_names()
+
+    runtime.config["provide_group_identity_tools"] = False
+    run(runtime.sanitize_request(fakes.Event(), fakes.Request([])))
+
+    assert runtime.context.llm_tools == []
+    assert runtime.context.unregistered_tools == group_identity_tool_names()
+    run(runtime.terminate())
+
+
 def test_group_identity_tools_install_is_idempotent(fakes):
     context = fakes.build_runtime({}).context
     module = GroupIdentityToolsModule(context=context, logger=fakes.Logger())

@@ -255,6 +255,24 @@ def test_enabled_runtime_installs_patch_and_terminate_restores(fakes, astrbot_mo
     assert ForwardNodesModule._original_process is None
 
 
+def test_runtime_toggle_syncs_forward_nodes_patch(fakes, astrbot_modules):
+    original_process = astrbot_modules.respond_stage_cls.process
+    runtime = fakes.build_runtime({"optimize_forward_nodes": False})
+
+    runtime.config["optimize_forward_nodes"] = True
+    asyncio.run(runtime.sanitize_request(fakes.Event(), fakes.Request([])))
+
+    assert runtime.forward_nodes._installed is True
+    assert astrbot_modules.respond_stage_cls.process is not original_process
+
+    runtime.config["optimize_forward_nodes"] = False
+    asyncio.run(runtime.sanitize_request(fakes.Event(), fakes.Request([])))
+
+    assert runtime.forward_nodes._installed is False
+    assert astrbot_modules.respond_stage_cls.process is original_process
+    asyncio.run(runtime.terminate())
+
+
 def test_install_skips_when_astrbot_has_native_forward_split(fakes, astrbot_modules):
     def native_build_forward_nodes(self):
         return None

@@ -141,10 +141,16 @@ class OutputLengthLimiterModule:
         if module_cls._original_iter_llm_responses_with_fallback is None:
             module_cls._runner_cls = runner_cls
             module_cls._original_iter_llm_responses_with_fallback = original
+            original_method = original
 
             async def astrna_iter_llm_responses_with_fallback(runner_self: Any):
                 active_module = module_cls._active_module
-                original_method = module_cls._original_iter_llm_responses_with_fallback
+                if getattr(
+                    astrna_iter_llm_responses_with_fallback,
+                    "_astrna_wrapper_active",
+                    True,
+                ) is False:
+                    active_module = None
                 async for llm_response in original_method(runner_self):
                     if active_module is None:
                         yield llm_response
@@ -181,6 +187,7 @@ class OutputLengthLimiterModule:
         if module_cls._original_internal_process is None:
             module_cls._internal_stage_cls = stage_cls
             module_cls._original_internal_process = original
+            original_process = original
 
             async def astrna_internal_process(
                 stage_self: Any,
@@ -188,10 +195,15 @@ class OutputLengthLimiterModule:
                 provider_wake_prefix: str,
             ):
                 active_module = module_cls._active_module
+                if getattr(
+                    astrna_internal_process,
+                    "_astrna_wrapper_active",
+                    True,
+                ) is False:
+                    active_module = None
                 if active_module is not None:
                     active_module.prepare_event_for_process(event)
 
-                original_process = module_cls._original_internal_process
                 async for item in original_process(stage_self, event, provider_wake_prefix):
                     yield item
 

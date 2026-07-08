@@ -230,6 +230,26 @@ def test_install_is_idempotent(astrbot_runner_modules, fakes):
     asyncio.run(runtime.terminate())
 
 
+def test_runtime_toggle_off_restores_send_message_to_user_patches(
+    astrbot_runner_modules,
+    fakes,
+):
+    original_runner = astrbot_runner_modules.runner_cls._iter_llm_responses_with_fallback
+    original_stage = astrbot_runner_modules.internal_stage_cls.process
+    runtime = fakes.build_runtime({"optimize_send_message_to_user": True})
+
+    assert astrbot_runner_modules.runner_cls._iter_llm_responses_with_fallback is not original_runner
+    assert astrbot_runner_modules.internal_stage_cls.process is not original_stage
+
+    runtime.config["optimize_send_message_to_user"] = False
+    asyncio.run(runtime.sanitize_request(fakes.Event(), fakes.Request([])))
+
+    assert astrbot_runner_modules.runner_cls._iter_llm_responses_with_fallback is original_runner
+    assert astrbot_runner_modules.internal_stage_cls.process is original_stage
+    assert runtime.send_message_to_user._installed is False
+    asyncio.run(runtime.terminate())
+
+
 def test_process_stage_patch_disables_streaming_before_runner_is_built(
     astrbot_runner_modules,
     fakes,

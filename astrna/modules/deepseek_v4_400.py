@@ -64,17 +64,24 @@ class DeepSeekV4400Module:
         if module_cls._original_finally_convert_payload is None:
             module_cls._provider_cls = provider_cls
             module_cls._original_finally_convert_payload = original
+            original_method = original
 
             def astrna_finally_convert_payload(provider_self: Any, payloads: dict) -> None:
-                original_method = module_cls._original_finally_convert_payload
                 original_method(provider_self, payloads)
 
                 active_module = module_cls._active_module
+                if getattr(
+                    astrna_finally_convert_payload,
+                    "_astrna_wrapper_active",
+                    True,
+                ) is False:
+                    active_module = None
                 if active_module is None:
                     return
                 active_module.fix_deepseek_v4_reasoning_payload(provider_self, payloads)
 
             astrna_finally_convert_payload._astrna_deepseek_v4_400_patch = True  # type: ignore[attr-defined]
+            mark_wrapper_active(astrna_finally_convert_payload, original)
             module_cls._payload_wrapper = astrna_finally_convert_payload
             provider_cls._finally_convert_payload = astrna_finally_convert_payload
 
@@ -91,11 +98,20 @@ class DeepSeekV4400Module:
 
     @classmethod
     def restore_patch(cls) -> None:
+        mark_wrapper_inactive(cls._payload_wrapper)
         if cls._provider_cls is not None and cls._original_finally_convert_payload is not None:
             current = getattr(cls._provider_cls, "_finally_convert_payload", None)
             if getattr(current, "_astrna_deepseek_v4_400_patch", False):
                 cls._provider_cls._finally_convert_payload = (
-                    cls._original_finally_convert_payload
+                    unwrap_inactive_wrapper(cls._original_finally_convert_payload)
+                )
+            elif getattr(
+                cls._original_finally_convert_payload,
+                "_astrna_wrapper_active",
+                True,
+            ) is False:
+                cls._original_finally_convert_payload = (
+                    unwrap_inactive_wrapper(cls._original_finally_convert_payload)
                 )
         cls._provider_cls = None
         cls._original_finally_convert_payload = None
@@ -211,3 +227,35 @@ def get_provider_base_url_host(provider: Any) -> str:
     base_url = getattr(client, "base_url", None)
     host = getattr(base_url, "host", "")
     return str(host or "").lower()
+
+
+def mark_wrapper_active(wrapper: Any, original: Any) -> None:
+    try:
+        wrapper._astrna_wrapper_active = True
+        wrapper._astrna_wrapped_original = original
+    except Exception:
+        pass
+
+
+def mark_wrapper_inactive(wrapper: Any) -> None:
+    if wrapper is None:
+        return
+    try:
+        wrapper._astrna_wrapper_active = False
+    except Exception:
+        pass
+
+
+def unwrap_inactive_wrapper(func: Any) -> Any:
+    seen: set[int] = set()
+    while (
+        callable(func)
+        and getattr(func, "_astrna_wrapper_active", True) is False
+        and id(func) not in seen
+    ):
+        seen.add(id(func))
+        original = getattr(func, "_astrna_wrapped_original", None)
+        if not callable(original) or original is func:
+            break
+        func = original
+    return func

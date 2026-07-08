@@ -280,6 +280,29 @@ def test_enabled_runtime_wraps_other_plugin_llm_handlers(
     assert handler.handler is target_handler
 
 
+def test_runtime_toggle_off_restores_dynamic_system_prompt_handlers(
+    fakes,
+    fake_astrbot_llm_registry,
+):
+    async def target_handler(event, req):
+        req.system_prompt += "dynamic"
+
+    module_path = "plugins.dynamic_demo"
+    fake_astrbot_llm_registry.add_plugin(module_path)
+    handler = build_handler("target_handler", target_handler, module_path=module_path)
+    fake_astrbot_llm_registry.handlers.append(handler)
+    runtime = fakes.build_runtime({"optimize_dynamic_system_prompt": True})
+
+    assert getattr(handler.handler, "_astrna_dynamic_system_prompt_patch") is True
+
+    runtime.config["optimize_dynamic_system_prompt"] = False
+    run(runtime.sanitize_request(fakes.Event(), fakes.Request([])))
+
+    assert handler.handler is target_handler
+    assert runtime.dynamic_system_prompt._wrapped_handlers == {}
+    run(runtime.terminate())
+
+
 def test_install_skips_astrna_reserved_non_coroutine_and_non_llm_handlers(
     fakes,
     fake_astrbot_llm_registry,

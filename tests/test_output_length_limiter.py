@@ -552,6 +552,135 @@ def test_send_message_to_user_conversion_can_be_limited_afterwards(
     asyncio.run(runtime.terminate())
 
 
+def test_runtime_enabling_send_message_under_limiter_preserves_chain_order(
+    astrbot_runner_modules,
+):
+    provider = DummyProvider("短句")
+    runtime = build_runtime(
+        {
+            "output_length_limit_enabled": True,
+            "output_length_limit_provider_id": "clean",
+            "output_length_limit_max_chars": 4,
+        },
+        providers={"clean": provider},
+    )
+    event = DummyEvent()
+    req = SimpleNamespace(func_tool=SimpleNamespace(get_tool=lambda name: object()))
+    event.set_extra(NORMAL_CHAT_REQUEST_MARKER, True)
+
+    runtime.config["optimize_send_message_to_user"] = True
+    asyncio.run(runtime.sanitize_request(event, req))
+
+    assert getattr(req, NORMAL_CHAT_REQUEST_ATTR) is True
+    response = tool_response("这是工具误发出来的一段很长很长的普通聊天文本")
+    runner = build_runner(response, event=event)
+    runner.req = req
+
+    [actual] = asyncio.run(collect_runner_responses(runner))
+
+    assert actual.role == "assistant"
+    assert actual.completion_text == "短句"
+    assert actual.tools_call_name == []
+    assert provider.calls
+    asyncio.run(runtime.terminate())
+
+
+def test_inactive_limiter_stage_wrapper_transparently_delegates_under_outer_wrapper(
+    astrbot_runner_modules,
+):
+    limiter = OutputLengthLimiterModule(context=DummyContext(), logger=DummyLogger())
+
+    assert limiter.install() is True
+    limiter_wrapper = astrbot_runner_modules.internal_stage_cls.process
+
+    async def outer_process(stage_self, event, provider_wake_prefix):
+        async for item in limiter_wrapper(stage_self, event, provider_wake_prefix):
+            yield item
+
+    astrbot_runner_modules.internal_stage_cls.process = outer_process
+
+    limiter.terminate()
+
+    event = DummyEvent()
+    result = asyncio.run(collect_internal_process(astrbot_runner_modules, event))
+
+    assert result == ["processed"]
+    assert event.get_extra("enable_streaming") is None
+
+
+def test_reinstall_limiter_stage_after_middle_terminate_does_not_recurse(
+    astrbot_runner_modules,
+):
+    old_limiter = OutputLengthLimiterModule(context=DummyContext(), logger=DummyLogger())
+    new_limiter = OutputLengthLimiterModule(context=DummyContext(), logger=DummyLogger())
+
+    assert old_limiter.install() is True
+    old_limiter_wrapper = astrbot_runner_modules.internal_stage_cls.process
+
+    async def outer_process(stage_self, event, provider_wake_prefix):
+        async for item in old_limiter_wrapper(stage_self, event, provider_wake_prefix):
+            yield item
+
+    astrbot_runner_modules.internal_stage_cls.process = outer_process
+    old_limiter.terminate()
+    assert new_limiter.install() is True
+
+    event = DummyEvent()
+    result = asyncio.run(collect_internal_process(astrbot_runner_modules, event))
+
+    assert result == ["processed"]
+    assert event.get_extra("enable_streaming") is False
+    new_limiter.terminate()
+
+
+def test_inactive_send_message_runner_wrapper_transparently_delegates_under_limiter(
+    astrbot_runner_modules,
+):
+    send_module = SendMessageToUserModule(logger=DummyLogger())
+    limiter = OutputLengthLimiterModule(context=DummyContext(), logger=DummyLogger())
+
+    assert send_module.install() is True
+    assert limiter.install() is True
+    assert getattr(
+        OutputLengthLimiterModule._original_iter_llm_responses_with_fallback,
+        "_astrna_send_message_to_user_patch",
+        False,
+    )
+
+    send_module.terminate()
+    runner = build_runner(tool_response("工具文本"))
+    runner.run_context.context.event.set_extra(NORMAL_CHAT_REQUEST_MARKER, True)
+    setattr(runner.req, NORMAL_CHAT_REQUEST_ATTR, True)
+
+    [actual] = asyncio.run(collect_runner_responses(runner))
+
+    assert actual.tools_call_name == [SEND_MESSAGE_TOOL_NAME]
+    limiter.terminate()
+
+
+def test_reinstall_send_message_under_limiter_after_middle_terminate_does_not_recurse(
+    astrbot_runner_modules,
+):
+    old_send_module = SendMessageToUserModule(logger=DummyLogger())
+    limiter = OutputLengthLimiterModule(context=DummyContext(), logger=DummyLogger())
+    new_send_module = SendMessageToUserModule(logger=DummyLogger())
+
+    assert old_send_module.install() is True
+    assert limiter.install() is True
+    old_send_module.terminate()
+    assert new_send_module.install() is True
+
+    runner = build_runner(tool_response("工具文本"))
+    runner.run_context.context.event.set_extra(NORMAL_CHAT_REQUEST_MARKER, True)
+    setattr(runner.req, NORMAL_CHAT_REQUEST_ATTR, True)
+    [actual] = asyncio.run(collect_runner_responses(runner))
+
+    assert actual.role == "assistant"
+    assert actual.completion_text == "工具文本"
+    new_send_module.terminate()
+    limiter.terminate()
+
+
 async def collect_runner_responses(runner):
     return [
         response
