@@ -428,6 +428,57 @@ def test_install_and_terminate_restore_patch(fake_astrbot_modules):
     assert fake_astrbot_modules.internal_cls.process is original_process
 
 
+def test_follow_up_mirror_entries_keep_their_own_originals(fake_astrbot_modules):
+    calls = []
+
+    def internal_register(umo, runner):
+        calls.append(("register", umo, runner))
+
+    def internal_unregister(umo, runner):
+        calls.append(("unregister", umo, runner))
+
+    def internal_capture(event):
+        calls.append(("capture", event))
+        return "internal-capture"
+
+    fake_astrbot_modules.internal_module.register_active_runner = internal_register
+    fake_astrbot_modules.internal_module.unregister_active_runner = internal_unregister
+    fake_astrbot_modules.internal_module.try_capture_follow_up = internal_capture
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert module.install() is True
+    event = DummyEvent(
+        umo="aiocqhttp:FriendMessage:user-a",
+        sender_id="user-a",
+        group_id="",
+        private=True,
+    )
+    runner = DummyRunner(event)
+
+    fake_astrbot_modules.internal_module.register_active_runner(
+        event.unified_msg_origin,
+        runner,
+    )
+    result = fake_astrbot_modules.internal_module.try_capture_follow_up(event)
+    fake_astrbot_modules.internal_module.unregister_active_runner(
+        event.unified_msg_origin,
+        runner,
+    )
+
+    assert result == "internal-capture"
+    assert calls == [
+        ("register", event.unified_msg_origin, runner),
+        ("capture", event),
+        ("unregister", event.unified_msg_origin, runner),
+    ]
+    module.terminate()
+    assert fake_astrbot_modules.internal_module.register_active_runner is internal_register
+    assert (
+        fake_astrbot_modules.internal_module.unregister_active_runner
+        is internal_unregister
+    )
+    assert fake_astrbot_modules.internal_module.try_capture_follow_up is internal_capture
+
+
 def test_group_different_senders_can_enter_llm_concurrently(fake_astrbot_modules):
     module = GroupSenderConcurrencyModule(logger=DummyLogger())
     assert module.install() is True

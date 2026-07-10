@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import sys
 from enum import Enum
-from functools import partial
+from functools import partial, wraps
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -954,4 +955,158 @@ def test_kv_put_failure_does_not_break_takeover(
     assert part_texts(req) == ["\n动态 3"]
     assert kv_store.data == {}
 
+    run(runtime.terminate())
+
+
+def test_concurrent_takeover_rules_persist_latest_complete_snapshot(
+    fakes,
+    fake_astrbot_llm_registry,
+):
+    class OrderedKV:
+        def __init__(self):
+            self.data = {}
+            self.first_put_started = asyncio.Event()
+            self.release_first_put = asyncio.Event()
+            self.put_count = 0
+
+        async def get_kv_data(self, key, default):
+            return self.data.get(key, default)
+
+        async def put_kv_data(self, key, value):
+            self.put_count += 1
+            snapshot = copy.deepcopy(value)
+            if self.put_count == 1:
+                self.first_put_started.set()
+                await self.release_first_put.wait()
+            self.data[key] = snapshot
+
+    async def append_a(event, req):
+        req.system_prompt += "\nA3"
+
+    async def append_b(event, req):
+        req.system_prompt += "\nB3"
+
+    path_a = "plugins.concurrent_a"
+    path_b = "plugins.concurrent_b"
+    fake_astrbot_llm_registry.add_plugin(path_a, name="concurrent_a")
+    fake_astrbot_llm_registry.add_plugin(path_b, name="concurrent_b")
+    handler_a = build_handler("handler_a", append_a, module_path=path_a)
+    handler_b = build_handler("handler_b", append_b, module_path=path_b)
+    fake_astrbot_llm_registry.handlers.extend([handler_a, handler_b])
+    kv_store = OrderedKV()
+    runtime = fakes.build_runtime(
+        {"optimize_dynamic_system_prompt": True},
+        kv_store=kv_store,
+    )
+    module = runtime.dynamic_system_prompt
+    key_a = module._get_injection_key(handler_a, module._get_plugin_key(handler_a))
+    key_b = module._get_injection_key(handler_b, module._get_plugin_key(handler_b))
+    module._observed_diffs[key_a] = [
+        SystemPromptDiff("append", "\nA1", "base\nA1"),
+        SystemPromptDiff("append", "\nA2", "base\nA2"),
+    ]
+    module._observed_diffs[key_b] = [
+        SystemPromptDiff("append", "\nB1", "base\nB1"),
+        SystemPromptDiff("append", "\nB2", "base\nB2"),
+    ]
+
+    async def exercise():
+        req_a = fakes.Request(contexts=[])
+        req_a.system_prompt = "base"
+        req_b = fakes.Request(contexts=[])
+        req_b.system_prompt = "base"
+        first = asyncio.create_task(handler_a.handler(fakes.Event(), req_a))
+        await kv_store.first_put_started.wait()
+        second = asyncio.create_task(handler_b.handler(fakes.Event(), req_b))
+        await asyncio.sleep(0)
+        kv_store.release_first_put.set()
+        await asyncio.gather(first, second)
+
+    run(exercise())
+
+    assert set(kv_store.data[DYNAMIC_SYSTEM_PROMPT_STATE_KEY]["handlers"]) == {
+        key_a,
+        key_b,
+    }
+    run(runtime.terminate())
+
+
+def test_dynamic_wrapper_stays_inactive_below_third_party_outer(
+    fakes,
+    fake_astrbot_llm_registry,
+):
+    calls = []
+
+    async def target_handler(event, req):
+        calls.append("target")
+        req.system_prompt += "\nDYNAMIC"
+
+    module_path = "plugins.outer_dynamic"
+    fake_astrbot_llm_registry.add_plugin(module_path, name="outer_dynamic")
+    handler = build_handler("target_handler", target_handler, module_path=module_path)
+    fake_astrbot_llm_registry.handlers.append(handler)
+    runtime = fakes.build_runtime({"optimize_dynamic_system_prompt": True})
+    old_wrapper = handler.handler
+
+    async def third_party(event, req):
+        calls.append("outer")
+        return await old_wrapper(event, req)
+
+    handler.handler = third_party
+    runtime.config["optimize_dynamic_system_prompt"] = False
+    req = fakes.Request(contexts=[])
+    req.system_prompt = "base"
+    run(runtime.sanitize_request(fakes.Event(), req))
+    run(handler.handler(fakes.Event(), req))
+
+    assert handler.handler is third_party
+    assert calls == ["outer", "target"]
+    assert req.system_prompt == "base\nDYNAMIC"
+    assert req.extra_user_content_parts == []
+    run(runtime.terminate())
+
+
+def test_dynamic_wrapper_reopens_above_wraps_outer_and_observes_once(
+    fakes,
+    fake_astrbot_llm_registry,
+):
+    calls = []
+
+    async def target_handler(event, req):
+        calls.append("target")
+        req.system_prompt += "\nDYNAMIC"
+
+    module_path = "plugins.reopen_dynamic"
+    fake_astrbot_llm_registry.add_plugin(module_path, name="reopen_dynamic")
+    handler = build_handler("target_handler", target_handler, module_path=module_path)
+    fake_astrbot_llm_registry.handlers.append(handler)
+    runtime = fakes.build_runtime({"optimize_dynamic_system_prompt": True})
+    old_wrapper = handler.handler
+
+    @wraps(old_wrapper)
+    async def third_party(event, req):
+        calls.append("outer")
+        return await old_wrapper(event, req)
+
+    handler.handler = third_party
+    runtime.config["optimize_dynamic_system_prompt"] = False
+    run(runtime.sanitize_request(fakes.Event(), fakes.Request([])))
+    assert handler.handler is third_party
+
+    runtime.config["optimize_dynamic_system_prompt"] = True
+    run(runtime.sanitize_request(fakes.Event(), fakes.Request([])))
+    new_wrapper = handler.handler
+    req = fakes.Request(contexts=[])
+    req.system_prompt = "base"
+    run(new_wrapper(fakes.Event(), req))
+
+    module = runtime.dynamic_system_prompt
+    injection_key = module._get_injection_key(
+        handler,
+        module._get_plugin_key(handler),
+    )
+    assert new_wrapper is not third_party
+    assert calls == ["outer", "target"]
+    assert req.system_prompt == "base\nDYNAMIC"
+    assert len(module._observed_diffs[injection_key]) == 1
     run(runtime.terminate())

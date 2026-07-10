@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import sys
 from types import ModuleType, SimpleNamespace
@@ -17,6 +18,61 @@ from astrna.modules.reply_target_history import (
 
 def run(coro):
     return asyncio.run(coro)
+
+
+def test_reply_target_state_first_load_is_serialized():
+    class DelayedSnapshotKV:
+        def __init__(self):
+            self.data = {
+                "reply_target_history_state_v2": {
+                    "sessions": {"old": [{"hash": "old", "metadata": {}}]},
+                },
+            }
+            self.get_started = asyncio.Event()
+            self.release_get = asyncio.Event()
+
+        async def get_kv_data(self, key, default):
+            snapshot = copy.deepcopy(self.data.get(key, default))
+            self.get_started.set()
+            await self.release_get.wait()
+            return snapshot
+
+        async def put_kv_data(self, key, value):
+            self.data[key] = copy.deepcopy(value)
+
+    async def exercise():
+        kv_store = DelayedSnapshotKV()
+        module = ReplyTargetHistoryModule(DummyLogger(), kv_store)
+        first_event = DummyEvent()
+        first_event.unified_msg_origin = "umo:a"
+        second_event = DummyEvent()
+        second_event.unified_msg_origin = "umo:b"
+        first_req = DummyRequest()
+        first_req.conversation = SimpleNamespace(cid="conv")
+        second_req = DummyRequest()
+        second_req.conversation = SimpleNamespace(cid="conv")
+        first = asyncio.create_task(
+            module.remember_reply_target(
+                first_event,
+                first_req,
+                SimpleNamespace(content="reply-a"),
+                {"scope": "group"},
+            ),
+        )
+        await kv_store.get_started.wait()
+        second = asyncio.create_task(
+            module.remember_reply_target(
+                second_event,
+                second_req,
+                SimpleNamespace(content="reply-b"),
+                {"scope": "group"},
+            ),
+        )
+        kv_store.release_get.set()
+        await asyncio.gather(first, second)
+        return kv_store.data["reply_target_history_state_v2"]["sessions"]
+
+    assert set(run(exercise())) == {"old", "umo:a#conv", "umo:b#conv"}
 
 
 class DummyLogger:

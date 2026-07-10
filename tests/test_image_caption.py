@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from functools import wraps
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ from astrna.modules.image_caption import (
     build_image_caption_prompt,
     sanitize_caption_context_text,
 )
+from astrna.utils.patching import is_wrapper_active
 
 
 class Reply:
@@ -604,6 +606,40 @@ def test_patched_provider_keeps_unrelated_text_chat_prompt(astr_main_agent):
     assert len(quote_prompts) == 1
     assert "引用问题" in quote_prompts[0]
     assert "引用文本" in quote_prompts[0]
+
+
+def test_quote_provider_restore_keeps_wraps_outer_and_deactivates_old_layer(
+    astr_main_agent,
+):
+    async def run_check():
+        provider = DummyProvider()
+        provider.release = asyncio.Event()
+        module = ImageCaptionModule(logger=DummyLogger())
+        module.install()
+        quote_task = asyncio.create_task(
+            astr_main_agent._process_quote_message(
+                DummyEvent([Reply(message_str="引用文本")]),
+                DummyRequest(prompt="引用问题"),
+                "caption-provider",
+                DummyContext(provider),
+            )
+        )
+        await asyncio.sleep(0)
+        stale_wrapper = provider.text_chat
+
+        @wraps(stale_wrapper)
+        async def third_party_outer(*args, **kwargs):
+            return await stale_wrapper(*args, **kwargs)
+
+        provider.text_chat = third_party_outer
+        provider.release.set()
+        await quote_task
+        return provider, stale_wrapper, third_party_outer
+
+    provider, stale_wrapper, third_party_outer = run(run_check())
+
+    assert provider.text_chat is third_party_outer
+    assert not is_wrapper_active(stale_wrapper)
 
 
 def test_build_image_caption_prompt_keeps_base_without_context():

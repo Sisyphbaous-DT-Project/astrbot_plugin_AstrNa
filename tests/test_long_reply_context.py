@@ -5,6 +5,7 @@ import inspect
 import json
 import sys
 from collections import defaultdict, deque
+from functools import wraps
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -438,6 +439,42 @@ def test_install_is_idempotent(astrbot_modules):
 
     assert astrbot_modules.internal_cls._save_to_history is save_patch
     assert astrbot_modules.respond_cls.process is respond_patch
+
+
+def test_reinstall_above_wraps_outer_keeps_old_layer_inactive(astrbot_modules):
+    original_set_result = AstrMessageEvent.set_result
+    first_calls = []
+    second_calls = []
+    outer_calls = []
+    first = LongReplyContextModule(logger=DummyLogger())
+    second = LongReplyContextModule(logger=DummyLogger())
+    first.record_set_result = lambda event, result: first_calls.append(result)
+    second.record_set_result = lambda event, result: second_calls.append(result)
+
+    try:
+        assert first.install() is True
+        stale_wrapper = AstrMessageEvent.set_result
+
+        @wraps(stale_wrapper)
+        def third_party_outer(event_self, result):
+            outer_calls.append(result)
+            return stale_wrapper(event_self, result)
+
+        AstrMessageEvent.set_result = third_party_outer
+        first.terminate()
+        assert AstrMessageEvent.set_result is third_party_outer
+
+        assert second.install() is True
+        result = DummyResult([Plain("回复")])
+        DummyEvent().set_result(result)
+
+        assert outer_calls == [result]
+        assert first_calls == []
+        assert second_calls == [result]
+    finally:
+        second.terminate()
+        first.terminate()
+        AstrMessageEvent.set_result = original_set_result
 
 
 def test_wrapper_exceptions_do_not_break_history_or_send(astrbot_modules):

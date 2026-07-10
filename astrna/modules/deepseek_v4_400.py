@@ -6,6 +6,13 @@ from typing import Any
 from ..rules.empty_assistant import EmptyAssistantRule
 from ..rules.reasoning_only_assistant import ReasoningOnlyAssistantRule
 from ..rules.think_only_assistant import ThinkOnlyAssistantRule
+from ..utils.patching import (
+    is_wrapper_active,
+    mark_wrapper_active,
+    mark_wrapper_inactive,
+    same_callable,
+    unwrap_inactive_wrapper,
+)
 
 
 @dataclass
@@ -70,11 +77,7 @@ class DeepSeekV4400Module:
                 original_method(provider_self, payloads)
 
                 active_module = module_cls._active_module
-                if getattr(
-                    astrna_finally_convert_payload,
-                    "_astrna_wrapper_active",
-                    True,
-                ) is False:
+                if not is_wrapper_active(astrna_finally_convert_payload):
                     active_module = None
                 if active_module is None:
                     return
@@ -101,15 +104,11 @@ class DeepSeekV4400Module:
         mark_wrapper_inactive(cls._payload_wrapper)
         if cls._provider_cls is not None and cls._original_finally_convert_payload is not None:
             current = getattr(cls._provider_cls, "_finally_convert_payload", None)
-            if getattr(current, "_astrna_deepseek_v4_400_patch", False):
+            if same_callable(current, cls._payload_wrapper):
                 cls._provider_cls._finally_convert_payload = (
                     unwrap_inactive_wrapper(cls._original_finally_convert_payload)
                 )
-            elif getattr(
-                cls._original_finally_convert_payload,
-                "_astrna_wrapper_active",
-                True,
-            ) is False:
+            elif not is_wrapper_active(cls._original_finally_convert_payload):
                 cls._original_finally_convert_payload = (
                     unwrap_inactive_wrapper(cls._original_finally_convert_payload)
                 )
@@ -227,35 +226,3 @@ def get_provider_base_url_host(provider: Any) -> str:
     base_url = getattr(client, "base_url", None)
     host = getattr(base_url, "host", "")
     return str(host or "").lower()
-
-
-def mark_wrapper_active(wrapper: Any, original: Any) -> None:
-    try:
-        wrapper._astrna_wrapper_active = True
-        wrapper._astrna_wrapped_original = original
-    except Exception:
-        pass
-
-
-def mark_wrapper_inactive(wrapper: Any) -> None:
-    if wrapper is None:
-        return
-    try:
-        wrapper._astrna_wrapper_active = False
-    except Exception:
-        pass
-
-
-def unwrap_inactive_wrapper(func: Any) -> Any:
-    seen: set[int] = set()
-    while (
-        callable(func)
-        and getattr(func, "_astrna_wrapper_active", True) is False
-        and id(func) not in seen
-    ):
-        seen.add(id(func))
-        original = getattr(func, "_astrna_wrapped_original", None)
-        if not callable(original) or original is func:
-            break
-        func = original
-    return func

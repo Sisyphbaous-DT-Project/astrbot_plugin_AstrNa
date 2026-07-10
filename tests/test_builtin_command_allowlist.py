@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from dataclasses import dataclass
+from functools import wraps
 from types import ModuleType
 from typing import Any
 
@@ -563,9 +564,11 @@ def test_external_wrapper_after_astrna_patch_remains_callable_on_terminate(
     astrna_process = fake_astrbot_modules.stage_cls.process
     astrna_get_handlers = fake_astrbot_modules.registry.get_handlers_by_event_type
 
+    @wraps(astrna_process)
     async def external_process(stage_self, event):
         return await astrna_process(stage_self, event)
 
+    @wraps(astrna_get_handlers)
     def external_get_handlers(event_type, only_activated=True, plugins_name=None):
         return astrna_get_handlers(event_type, only_activated, plugins_name)
 

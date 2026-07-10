@@ -6,6 +6,14 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from ..utils.patching import (
+    is_wrapper_active,
+    mark_wrapper_active,
+    mark_wrapper_inactive,
+    same_callable,
+    unwrap_inactive_wrapper,
+)
+
 
 FIELD_MAX_LENGTH = 512
 QUOTE_IMAGE_CAPTION_PROMPT = "Please describe the image content."
@@ -20,6 +28,7 @@ _MISSING = object()
 class ProviderPatch:
     provider: Any
     original_text_chat: Any
+    wrapper: Any
     had_instance_text_chat: bool
     ref_count: int = 0
 
@@ -90,6 +99,8 @@ class ImageCaptionModule:
                 image_caption_provider: str,
             ) -> Any:
                 active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_ensure_img_caption):
+                    active_module = None
                 if active_module is None:
                     return await original_ensure_img_caption(
                         event,
@@ -114,6 +125,8 @@ class ImageCaptionModule:
 
             async def astrna_process_quote_message(*args: Any, **kwargs: Any) -> Any:
                 active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_process_quote_message):
+                    active_module = None
                 call = parse_quote_message_call(args, kwargs)
                 if active_module is None or call is None:
                     return await original_process_quote_message(*args, **kwargs)
@@ -154,7 +167,7 @@ class ImageCaptionModule:
             current_ensure = getattr(cls._astr_main_agent, "_ensure_img_caption", None)
             if (
                 cls._original_ensure_img_caption is not None
-                and getattr(current_ensure, "_astrna_image_caption_patch", False)
+                and same_callable(current_ensure, cls._ensure_img_caption_wrapper)
             ):
                 cls._astr_main_agent._ensure_img_caption = (
                     unwrap_inactive_wrapper(cls._original_ensure_img_caption)
@@ -166,7 +179,7 @@ class ImageCaptionModule:
             )
             if (
                 cls._original_process_quote_message is not None
-                and getattr(current_quote, "_astrna_image_caption_patch", False)
+                and same_callable(current_quote, cls._process_quote_message_wrapper)
             ):
                 cls._astr_main_agent._process_quote_message = (
                     unwrap_inactive_wrapper(cls._original_process_quote_message)
@@ -308,18 +321,21 @@ class ImageCaptionModule:
         had_instance_text_chat = "text_chat" in getattr(provider, "__dict__", {})
 
         async def astrna_quote_text_chat(*args: Any, **kwargs: Any) -> Any:
-            prompt = _QUOTE_PROMPT_CONTEXT.get()
-            if prompt:
-                args, kwargs = replace_quote_caption_prompt(args, kwargs, prompt)
+            if is_wrapper_active(astrna_quote_text_chat):
+                prompt = _QUOTE_PROMPT_CONTEXT.get()
+                if prompt:
+                    args, kwargs = replace_quote_caption_prompt(args, kwargs, prompt)
             result = original_text_chat(*args, **kwargs)
             if inspect.isawaitable(result):
                 return await result
             return result
 
+        mark_wrapper_active(astrna_quote_text_chat, original_text_chat)
         setattr(provider, "text_chat", astrna_quote_text_chat)
         module_cls._provider_patches[provider_id] = ProviderPatch(
             provider=provider,
             original_text_chat=original_text_chat,
+            wrapper=astrna_quote_text_chat,
             had_instance_text_chat=had_instance_text_chat,
             ref_count=1,
         )
@@ -339,13 +355,15 @@ class ImageCaptionModule:
         if not force and patch.ref_count > 0:
             return
 
-        if patch.had_instance_text_chat:
-            setattr(patch.provider, "text_chat", patch.original_text_chat)
-        else:
-            try:
-                delattr(patch.provider, "text_chat")
-            except AttributeError:
-                pass
+        mark_wrapper_inactive(patch.wrapper)
+        if same_callable(getattr(patch.provider, "text_chat", None), patch.wrapper):
+            if patch.had_instance_text_chat:
+                setattr(patch.provider, "text_chat", patch.original_text_chat)
+            else:
+                try:
+                    delattr(patch.provider, "text_chat")
+                except AttributeError:
+                    pass
         cls._provider_patches.pop(provider_id, None)
 
     def _load_astr_main_agent(self) -> Any | None:
@@ -428,38 +446,6 @@ def sanitize_caption_context_text(value: Any) -> str:
     text = text.replace("<", "＜").replace(">", "＞")
     text = re.sub(r"\s+", " ", text).strip()
     return text[:FIELD_MAX_LENGTH]
-
-
-def mark_wrapper_active(wrapper: Any, original: Any) -> None:
-    try:
-        wrapper._astrna_wrapper_active = True
-        wrapper._astrna_wrapped_original = original
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def mark_wrapper_inactive(wrapper: Any) -> None:
-    if wrapper is None:
-        return
-    try:
-        wrapper._astrna_wrapper_active = False
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def unwrap_inactive_wrapper(func: Any) -> Any:
-    seen: set[int] = set()
-    while (
-        callable(func)
-        and getattr(func, "_astrna_wrapper_active", True) is False
-        and id(func) not in seen
-    ):
-        seen.add(id(func))
-        original = getattr(func, "_astrna_wrapped_original", None)
-        if not callable(original) or original is func:
-            break
-        func = original
-    return func
 
 
 def replace_quote_caption_prompt(

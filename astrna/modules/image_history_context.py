@@ -5,6 +5,14 @@ import json
 from dataclasses import replace
 from typing import Any
 
+from ..utils.patching import (
+    is_wrapper_active,
+    mark_wrapper_active,
+    mark_wrapper_inactive,
+    same_callable,
+    unwrap_inactive_wrapper,
+)
+
 
 IMAGE_HISTORY_PLACEHOLDER = "[历史图片：已省略原始图像，仅保留占位符]"
 
@@ -55,6 +63,8 @@ class ImageHistoryContextModule:
 
             async def astrna_save_to_history(*args: Any, **kwargs: Any) -> Any:
                 active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_save_to_history):
+                    active_module = None
                 if active_module is not None:
                     try:
                         args, kwargs = active_module.optimize_save_history_call(
@@ -90,7 +100,7 @@ class ImageHistoryContextModule:
         mark_wrapper_inactive(cls._save_history_wrapper)
         if cls._internal_stage_cls is not None and cls._original_save_to_history is not None:
             current = getattr(cls._internal_stage_cls, "_save_to_history", None)
-            if getattr(current, "_astrna_image_history_context_patch", False):
+            if same_callable(current, cls._save_history_wrapper):
                 cls._internal_stage_cls._save_to_history = unwrap_inactive_wrapper(
                     cls._original_save_to_history,
                 )
@@ -394,35 +404,3 @@ def load_internal_stage_cls() -> type | None:
         return InternalAgentSubStage
     except Exception:  # noqa: BLE001
         return None
-
-
-def mark_wrapper_active(wrapper: Any, original: Any) -> None:
-    try:
-        wrapper._astrna_wrapper_active = True
-        wrapper._astrna_wrapped_original = original
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def mark_wrapper_inactive(wrapper: Any) -> None:
-    if wrapper is None:
-        return
-    try:
-        wrapper._astrna_wrapper_active = False
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def unwrap_inactive_wrapper(func: Any) -> Any:
-    seen: set[int] = set()
-    while (
-        callable(func)
-        and getattr(func, "_astrna_wrapper_active", True) is False
-        and id(func) not in seen
-    ):
-        seen.add(id(func))
-        original = getattr(func, "_astrna_wrapped_original", None)
-        if not callable(original) or original is func:
-            break
-        func = original
-    return func

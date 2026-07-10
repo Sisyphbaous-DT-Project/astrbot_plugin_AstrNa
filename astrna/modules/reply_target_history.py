@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
 import re
 from dataclasses import replace
 from typing import Any
+
+from ..utils.patching import (
+    is_wrapper_active,
+    mark_wrapper_active,
+    mark_wrapper_inactive,
+    same_callable,
+    unwrap_inactive_wrapper,
+)
 
 from .identity_metadata import (
     format_metadata_json,
@@ -51,6 +60,7 @@ class ReplyTargetHistoryModule:
         self._installed = False
         self._state_loaded = kv_store is None
         self._state_cache: dict[str, Any] = {"sessions": {}}
+        self._state_lock = asyncio.Lock()
 
     def install(self) -> bool:
         self.set_semantic_enabled(self.semantic_enabled)
@@ -88,7 +98,7 @@ class ReplyTargetHistoryModule:
             and cls._original_save_to_history is not None
         ):
             current = getattr(cls._internal_stage_cls, "_save_to_history", None)
-            if getattr(current, "_astrna_reply_target_history_patch", False):
+            if same_callable(current, cls._save_history_wrapper):
                 cls._internal_stage_cls._save_to_history = unwrap_inactive_wrapper(
                     cls._original_save_to_history
                 )
@@ -97,7 +107,7 @@ class ReplyTargetHistoryModule:
             and cls._original_complete_with_assistant_response is not None
         ):
             current = getattr(cls._runner_cls, "_complete_with_assistant_response", None)
-            if getattr(current, "_astrna_reply_target_history_patch", False):
+            if same_callable(current, cls._response_wrapper):
                 cls._runner_cls._complete_with_assistant_response = (
                     unwrap_inactive_wrapper(
                         cls._original_complete_with_assistant_response,
@@ -105,7 +115,7 @@ class ReplyTargetHistoryModule:
                 )
             if cls._original_iter_llm_responses is not None:
                 current_stream = getattr(cls._runner_cls, "_iter_llm_responses", None)
-                if getattr(current_stream, "_astrna_reply_target_history_patch", False):
+                if same_callable(current_stream, cls._response_stream_wrapper):
                     cls._runner_cls._iter_llm_responses = (
                         unwrap_inactive_wrapper(cls._original_iter_llm_responses)
                     )
@@ -114,7 +124,7 @@ class ReplyTargetHistoryModule:
             and cls._original_process_quote_message is not None
         ):
             current = getattr(cls._astr_main_agent, "_process_quote_message", None)
-            if getattr(current, "_astrna_reply_target_history_patch", False):
+            if same_callable(current, cls._quote_message_wrapper):
                 cls._astr_main_agent._process_quote_message = (
                     unwrap_inactive_wrapper(cls._original_process_quote_message)
                 )
@@ -313,6 +323,8 @@ class ReplyTargetHistoryModule:
 
             async def astrna_save_to_history(*args: Any, **kwargs: Any) -> Any:
                 active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_save_to_history):
+                    active_module = None
                 if active_module is not None:
                     args, kwargs = await active_module.optimize_save_history_call(
                         original_save_to_history,
@@ -356,6 +368,8 @@ class ReplyTargetHistoryModule:
                 llm_response: Any,
             ) -> Any:
                 active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_complete_with_assistant_response):
+                    active_module = None
                 if active_module is not None:
                     llm_response = active_module.sanitize_llm_response(llm_response)
                 return await original_complete(runner_self, llm_response)
@@ -383,6 +397,8 @@ class ReplyTargetHistoryModule:
                 **kwargs: Any,
             ):
                 active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_iter_llm_responses):
+                    active_module = None
                 async for llm_response in original_stream(runner_self, *args, **kwargs):
                     if active_module is not None:
                         llm_response = active_module.sanitize_llm_response(llm_response)
@@ -425,6 +441,8 @@ class ReplyTargetHistoryModule:
 
             async def astrna_process_quote_message(*args: Any, **kwargs: Any) -> Any:
                 active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_process_quote_message):
+                    active_module = None
                 if active_module is None:
                     return await original_process_quote_message(*args, **kwargs)
                 return await active_module.optimize_quote_message(
@@ -475,22 +493,23 @@ class ReplyTargetHistoryModule:
         if not text:
             return
 
-        await self._ensure_state_loaded()
-        sessions = self._state_cache.setdefault("sessions", {})
-        if not isinstance(sessions, dict):
-            sessions = {}
-            self._state_cache["sessions"] = sessions
+        async with self._state_lock:
+            await self._ensure_state_loaded_locked()
+            sessions = self._state_cache.setdefault("sessions", {})
+            if not isinstance(sessions, dict):
+                sessions = {}
+                self._state_cache["sessions"] = sessions
 
-        entries = sessions.get(session_key)
-        if not isinstance(entries, list):
-            entries = []
+            entries = sessions.get(session_key)
+            if not isinstance(entries, list):
+                entries = []
 
-        text_hash = hash_reply_text(text)
-        public_metadata = public_reply_target_metadata(metadata)
-        entries.append({"hash": text_hash, "metadata": public_metadata})
-        sessions[session_key] = entries[-MAX_REPLY_TARGET_INDEX_PER_SESSION:]
-        trim_reply_target_sessions(sessions)
-        await self._persist_state()
+            text_hash = hash_reply_text(text)
+            public_metadata = public_reply_target_metadata(metadata)
+            entries.append({"hash": text_hash, "metadata": public_metadata})
+            sessions[session_key] = entries[-MAX_REPLY_TARGET_INDEX_PER_SESSION:]
+            trim_reply_target_sessions(sessions)
+            await self._persist_state_locked()
 
     async def find_quoted_reply_target_metadata(
         self,
@@ -526,40 +545,49 @@ class ReplyTargetHistoryModule:
             return None
 
         await self._ensure_state_loaded()
-        sessions = self._state_cache.get("sessions")
-        if not isinstance(sessions, dict):
-            return None
-
-        entries = sessions.get(session_key)
-        if not isinstance(entries, list):
-            return None
-
-        text_hash = hash_reply_text(quote_body)
-        matches: list[dict[str, Any]] = [
-            entry.get("metadata")
-            for entry in entries
-            if isinstance(entry, dict) and entry.get("hash") == text_hash
-        ]
+        async with self._state_lock:
+            sessions = self._state_cache.get("sessions")
+            if not isinstance(sessions, dict):
+                return None
+            entries = sessions.get(session_key)
+            if not isinstance(entries, list):
+                return None
+            text_hash = hash_reply_text(quote_body)
+            matches: list[dict[str, Any]] = [
+                entry.get("metadata")
+                for entry in entries
+                if isinstance(entry, dict) and entry.get("hash") == text_hash
+            ]
         matches = [metadata for metadata in matches if isinstance(metadata, dict)]
         unique_matches = unique_metadata_matches(matches)
         return unique_matches[0] if len(unique_matches) == 1 else None
 
     async def _ensure_state_loaded(self) -> None:
+        async with self._state_lock:
+            await self._ensure_state_loaded_locked()
+
+    async def _ensure_state_loaded_locked(self) -> None:
         if self._state_loaded:
             return
-        self._state_loaded = True
         getter = getattr(self.kv_store, "get_kv_data", None)
         if not callable(getter):
+            self._state_loaded = True
             return
         try:
             state = await getter(REPLY_TARGET_HISTORY_STATE_KEY, {"sessions": {}})
         except Exception as exc:  # noqa: BLE001
             self._log("debug", "AstrNa 读取回复目标索引失败：%s", exc)
+            self._state_loaded = True
             return
         if isinstance(state, dict) and isinstance(state.get("sessions"), dict):
             self._state_cache = state
+        self._state_loaded = True
 
     async def _persist_state(self) -> None:
+        async with self._state_lock:
+            await self._persist_state_locked()
+
+    async def _persist_state_locked(self) -> None:
         putter = getattr(self.kv_store, "put_kv_data", None)
         if not callable(putter):
             return
@@ -690,38 +718,6 @@ def same_user_metadata(first: dict[str, Any], second: dict[str, Any]) -> bool:
     first_nickname = sanitize_optional_metadata_value(first.get("nickname"))
     second_nickname = sanitize_optional_metadata_value(second.get("nickname"))
     return bool(first_nickname and second_nickname and first_nickname == second_nickname)
-
-
-def mark_wrapper_active(wrapper: Any, original: Any) -> None:
-    try:
-        wrapper._astrna_wrapper_active = True
-        wrapper._astrna_wrapped_original = original
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def mark_wrapper_inactive(wrapper: Any) -> None:
-    if wrapper is None:
-        return
-    try:
-        wrapper._astrna_wrapper_active = False
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def unwrap_inactive_wrapper(func: Any) -> Any:
-    seen: set[int] = set()
-    while (
-        callable(func)
-        and getattr(func, "_astrna_wrapper_active", True) is False
-        and id(func) not in seen
-    ):
-        seen.add(id(func))
-        original = getattr(func, "_astrna_wrapped_original", None)
-        if not callable(original) or original is func:
-            break
-        func = original
-    return func
 
 
 def build_quoted_sender_marker(quote: Any) -> str:

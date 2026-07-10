@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import sys
 from collections import defaultdict, deque
 from types import ModuleType, SimpleNamespace
@@ -1112,6 +1113,125 @@ def test_restart_restore_from_kv_allows_missing_marker_compression(
     assert "[小红/12:01:00]" in prompt
 
 
+def test_restart_restores_before_first_handle_message(
+    astrbot_group_context_modules,
+):
+    umo = "aiocqhttp:GroupMessage:123456"
+    kv_store = DummyKVStore(
+        {
+            GROUP_CONTEXT_PERSISTENCE_KEY: {
+                "version": 1,
+                "sessions": {
+                    umo: {
+                        "records": ["old-1", "old-2"],
+                        "record_ids": ["old-id-1", "old-id-2"],
+                        "updated_at": 1,
+                    },
+                },
+            },
+        },
+    )
+    module = build_module_with_kv(
+        DummyProvider(valid_compressed_text()),
+        kv_store=kv_store,
+    )
+    module.install()
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+
+    run(group_context.handle_message(event))
+
+    records = list(group_context.raw_records[umo])
+    assert records[:2] == ["old-1", "old-2"]
+    assert len(records) == 3
+    assert kv_store.data[GROUP_CONTEXT_PERSISTENCE_KEY]["sessions"][umo][
+        "records"
+    ] == records
+
+
+def test_first_persisted_state_load_serializes_different_groups():
+    class DelayedSnapshotKV(DummyKVStore):
+        def __init__(self):
+            super().__init__()
+            self.get_started = asyncio.Event()
+            self.release_get = asyncio.Event()
+
+        async def get_kv_data(self, key, default):
+            snapshot = copy.deepcopy(self.data.get(key, default))
+            self.get_started.set()
+            await self.release_get.wait()
+            return snapshot
+
+        async def put_kv_data(self, key, value):
+            self.data[key] = copy.deepcopy(value)
+
+    async def exercise():
+        kv_store = DelayedSnapshotKV()
+        module = build_module_with_kv(
+            DummyProvider(valid_compressed_text()),
+            kv_store=kv_store,
+        )
+        first = asyncio.create_task(
+            module.put_persisted_session(
+                "umo:a",
+                {"records": ["a"], "record_ids": ["a-id"], "updated_at": 1},
+            ),
+        )
+        await kv_store.get_started.wait()
+        second = asyncio.create_task(
+            module.put_persisted_session(
+                "umo:b",
+                {"records": ["b"], "record_ids": ["b-id"], "updated_at": 2},
+            ),
+        )
+        await asyncio.sleep(0)
+        kv_store.release_get.set()
+        await asyncio.gather(first, second)
+        return kv_store.data[GROUP_CONTEXT_PERSISTENCE_KEY]["sessions"]
+
+    assert set(run(exercise())) == {"umo:a", "umo:b"}
+
+
+def test_concurrent_first_messages_restore_once_without_overwrite(
+    astrbot_group_context_modules,
+):
+    umo = "aiocqhttp:GroupMessage:123456"
+    kv_store = DummyKVStore(
+        {
+            GROUP_CONTEXT_PERSISTENCE_KEY: {
+                "version": 1,
+                "sessions": {
+                    umo: {
+                        "records": ["old"],
+                        "record_ids": ["old-id"],
+                        "updated_at": 1,
+                    },
+                },
+            },
+        },
+    )
+    module = build_module_with_kv(
+        DummyProvider(valid_compressed_text()),
+        kv_store=kv_store,
+    )
+    module.install()
+    group_context = astrbot_group_context_modules.group_context_cls()
+    first_event = DummyEvent(message_str="first")
+    second_event = DummyEvent(message_str="second")
+
+    async def exercise():
+        await asyncio.gather(
+            group_context.handle_message(first_event),
+            group_context.handle_message(second_event),
+        )
+
+    run(exercise())
+
+    records = list(group_context.raw_records[umo])
+    assert records[0] == "old"
+    assert len(records) == 3
+
+
 def test_marker_path_after_restore_excludes_current_message(
     astrbot_group_context_modules,
 ):
@@ -1181,6 +1301,48 @@ def test_remove_session_deletes_persisted_group_context(
     assert run(group_context.remove_session(event)) == 0
 
     assert kv_store.data[GROUP_CONTEXT_PERSISTENCE_KEY]["sessions"] == {}
+
+
+def test_remove_session_serializes_with_in_flight_persist(
+    astrbot_group_context_modules,
+):
+    class DelayedPutKV(DummyKVStore):
+        def __init__(self):
+            super().__init__()
+            self.put_started = asyncio.Event()
+            self.release_put = asyncio.Event()
+
+        async def put_kv_data(self, key, value):
+            self.put_started.set()
+            await self.release_put.wait()
+            await super().put_kv_data(key, copy.deepcopy(value))
+
+    async def exercise():
+        kv_store = DelayedPutKV()
+        module = build_module_with_kv(
+            DummyProvider(valid_compressed_text()),
+            kv_store=kv_store,
+        )
+        module.install()
+        group_context = astrbot_group_context_modules.group_context_cls()
+        event = DummyEvent()
+        seed_group_records(group_context, event)
+
+        persist_task = asyncio.create_task(
+            module.persist_group_context(group_context, event),
+        )
+        await kv_store.put_started.wait()
+        remove_task = asyncio.create_task(group_context.remove_session(event))
+        await asyncio.sleep(0)
+        assert not remove_task.done()
+        kv_store.release_put.set()
+        await asyncio.wait_for(
+            asyncio.gather(persist_task, remove_task),
+            timeout=1,
+        )
+        return kv_store.data[GROUP_CONTEXT_PERSISTENCE_KEY]["sessions"]
+
+    assert run(exercise()) == {}
 
 
 def test_persistence_failures_do_not_break_llm_request(

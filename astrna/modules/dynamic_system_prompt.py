@@ -7,6 +7,13 @@ from dataclasses import dataclass
 from functools import wraps
 from typing import Any, Literal
 
+from ..utils.patching import (
+    is_wrapper_active,
+    mark_wrapper_active,
+    mark_wrapper_inactive,
+    same_callable,
+)
+
 try:
     from astrbot.core.agent.message import TextPart
 except Exception:  # pragma: no cover
@@ -37,17 +44,24 @@ class SystemPromptMigration:
     dynamic_text: str
 
 
+@dataclass(frozen=True)
+class HandlerPatch:
+    handler: Any
+    original_handler: Any
+    wrapper: Any
+
+
 class DynamicSystemPromptModule:
     """迁移动态 system_prompt 注入，降低提示词缓存失效概率。"""
 
     def __init__(self, logger: Any, kv_store: Any | None = None):
         self.logger = logger
         self.kv_store = kv_store
-        self._wrapped_handlers: dict[str, tuple[Any, Any]] = {}
+        self._wrapped_handlers: dict[str, HandlerPatch] = {}
         self._observed_diffs: dict[str, list[SystemPromptDiff]] = {}
         self._takeover_rules: dict[str, TakeoverRule] = {}
         self._state_loaded = False
-        self._state_load_lock = asyncio.Lock()
+        self._state_lock = asyncio.Lock()
 
     def install(self) -> bool:
         registry_info = load_handler_registry()
@@ -71,31 +85,13 @@ class DynamicSystemPromptModule:
                 continue
 
             original_handler = getattr(handler, "handler", None)
-            module = self
-
-            @wraps(original_handler)
-            async def astrna_dynamic_system_prompt_wrapper(
-                event: Any,
-                req: Any,
-                *args: Any,
-                __handler: Any = handler,
-                __original_handler: Any = original_handler,
-                **kwargs: Any,
-            ) -> Any:
-                return await module._run_wrapped_handler(
-                    __handler,
-                    __original_handler,
-                    event,
-                    req,
-                    *args,
-                    **kwargs,
-                )
-
-            astrna_dynamic_system_prompt_wrapper._astrna_dynamic_system_prompt_patch = (  # type: ignore[attr-defined]
-                True
+            wrapper = self._build_handler_wrapper(handler, original_handler)
+            self._wrapped_handlers[handler_full_name] = HandlerPatch(
+                handler=handler,
+                original_handler=original_handler,
+                wrapper=wrapper,
             )
-            self._wrapped_handlers[handler_full_name] = (handler, original_handler)
-            handler.handler = astrna_dynamic_system_prompt_wrapper
+            handler.handler = wrapper
             wrapped_count += 1
 
         if wrapped_count:
@@ -107,13 +103,44 @@ class DynamicSystemPromptModule:
             )
         return bool(self._wrapped_handlers)
 
+    def _build_handler_wrapper(self, handler: Any, original_handler: Any) -> Any:
+        module = self
+
+        @wraps(original_handler)
+        async def wrapper(
+            event: Any,
+            req: Any,
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            if not is_wrapper_active(wrapper):
+                return await call_handler_with_compatible_args(
+                    original_handler,
+                    event,
+                    req,
+                    args,
+                    kwargs,
+                    module.logger,
+                )
+            return await module._run_wrapped_handler(
+                handler,
+                original_handler,
+                event,
+                req,
+                *args,
+                **kwargs,
+            )
+
+        wrapper._astrna_dynamic_system_prompt_patch = True
+        mark_wrapper_active(wrapper, original_handler)
+        return wrapper
+
     def terminate(self) -> None:
-        for _handler_full_name, (handler, original_handler) in list(
-            self._wrapped_handlers.items()
-        ):
-            current_handler = getattr(handler, "handler", None)
-            if getattr(current_handler, "_astrna_dynamic_system_prompt_patch", False):
-                handler.handler = original_handler
+        for patch in list(self._wrapped_handlers.values()):
+            mark_wrapper_inactive(patch.wrapper)
+            current_handler = getattr(patch.handler, "handler", None)
+            if same_callable(current_handler, patch.wrapper):
+                patch.handler.handler = patch.original_handler
         self._wrapped_handlers.clear()
 
     async def _run_wrapped_handler(
@@ -143,8 +170,30 @@ class DynamicSystemPromptModule:
         plugin_label = self._get_plugin_label(handler)
         injection_key = self._get_injection_key(handler, plugin_key)
 
+        migrated_rule = None
+        built_rule = False
+        async with self._state_lock:
+            if diff is None:
+                self._observed_diffs.pop(injection_key, None)
+            else:
+                migrated_rule = self._takeover_rules.get(injection_key)
+                if migrated_rule is None:
+                    observed_diffs = [
+                        *self._observed_diffs.get(injection_key, []),
+                        diff,
+                    ][-TAKEOVER_THRESHOLD:]
+                    if any(item.kind != diff.kind for item in observed_diffs):
+                        observed_diffs = [diff]
+                    self._observed_diffs[injection_key] = observed_diffs
+
+                    migrated_rule = build_takeover_rule(observed_diffs)
+                    if migrated_rule is not None:
+                        self._takeover_rules[injection_key] = migrated_rule
+                        self._observed_diffs.pop(injection_key, None)
+                        await self._save_state_locked()
+                        built_rule = True
+
         if diff is None:
-            self._observed_diffs.pop(injection_key, None)
             if before != after:
                 log(
                     self.logger,
@@ -154,30 +203,15 @@ class DynamicSystemPromptModule:
                 )
             return result
 
-        rule = self._takeover_rules.get(injection_key)
-        if rule is not None:
-            self._migrate_diff(req, diff, plugin_label, rule)
-            return result
-
-        observed_diffs = [*self._observed_diffs.get(injection_key, []), diff][
-            -TAKEOVER_THRESHOLD:
-        ]
-        if any(item.kind != diff.kind for item in observed_diffs):
-            observed_diffs = [diff]
-        self._observed_diffs[injection_key] = observed_diffs
-
-        rule = build_takeover_rule(observed_diffs)
-        if rule is not None:
-            self._takeover_rules[injection_key] = rule
-            self._observed_diffs.pop(injection_key, None)
-            await self._save_state()
+        if built_rule:
             log(
                 self.logger,
                 "info",
                 "AstrNa 已接管「%s」插件的提示词注入位置：system_prompt -> extra_user_content_parts，用于优化 LLM 缓存命中。",
                 plugin_label,
             )
-            self._migrate_diff(req, diff, plugin_label, rule)
+        if migrated_rule is not None:
+            self._migrate_diff(req, diff, plugin_label, migrated_rule)
 
         return result
 
@@ -208,7 +242,7 @@ class DynamicSystemPromptModule:
     async def _ensure_state_loaded(self) -> None:
         if self._state_loaded:
             return
-        async with self._state_load_lock:
+        async with self._state_lock:
             if self._state_loaded:
                 return
 
@@ -223,6 +257,10 @@ class DynamicSystemPromptModule:
             self._state_loaded = True
 
     async def _save_state(self) -> None:
+        async with self._state_lock:
+            await self._save_state_locked()
+
+    async def _save_state_locked(self) -> None:
         await self._put_kv_data(
             DYNAMIC_SYSTEM_PROMPT_STATE_KEY,
             {
@@ -271,9 +309,6 @@ class DynamicSystemPromptModule:
         original_handler = getattr(handler, "handler", None)
         if not inspect.iscoroutinefunction(original_handler):
             return False
-        if getattr(original_handler, "_astrna_dynamic_system_prompt_patch", False):
-            return False
-
         module_path = getattr(handler, "handler_module_path", "")
         metadata = star_map.get(module_path)
         if getattr(metadata, "reserved", False):

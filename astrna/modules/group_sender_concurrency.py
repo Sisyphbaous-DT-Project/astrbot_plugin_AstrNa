@@ -7,6 +7,14 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from ..utils.patching import (
+    is_wrapper_active,
+    mark_wrapper_active,
+    mark_wrapper_inactive,
+    same_callable,
+    unwrap_inactive_wrapper,
+)
+
 
 _CURRENT_EVENT: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
     "astrna_group_sender_concurrency_event",
@@ -64,6 +72,9 @@ class GroupSenderConcurrencyModule:
     _register_runner_wrapper: Any = None
     _unregister_runner_wrapper: Any = None
     _try_capture_wrapper: Any = None
+    _internal_register_runner_wrapper: Any = None
+    _internal_unregister_runner_wrapper: Any = None
+    _internal_try_capture_wrapper: Any = None
     _active_module: GroupSenderConcurrencyModule | None = None
 
     def __init__(self, logger: Any):
@@ -116,10 +127,13 @@ class GroupSenderConcurrencyModule:
         mark_wrapper_inactive(cls._register_runner_wrapper)
         mark_wrapper_inactive(cls._unregister_runner_wrapper)
         mark_wrapper_inactive(cls._try_capture_wrapper)
+        mark_wrapper_inactive(cls._internal_register_runner_wrapper)
+        mark_wrapper_inactive(cls._internal_unregister_runner_wrapper)
+        mark_wrapper_inactive(cls._internal_try_capture_wrapper)
 
         if cls._session_lock_manager is not None and cls._original_acquire_lock is not None:
             current = getattr(cls._session_lock_manager, "acquire_lock", None)
-            if getattr(current, "_astrna_group_sender_concurrency_patch", False):
+            if same_callable(current, cls._lock_wrapper):
                 cls._session_lock_manager.acquire_lock = unwrap_inactive_wrapper(
                     cls._original_acquire_lock,
                 )
@@ -127,13 +141,13 @@ class GroupSenderConcurrencyModule:
         if cls._internal_stage_cls is not None:
             if cls._original_internal_process is not None:
                 current = getattr(cls._internal_stage_cls, "process", None)
-                if getattr(current, "_astrna_group_sender_concurrency_patch", False):
+                if same_callable(current, cls._process_wrapper):
                     cls._internal_stage_cls.process = unwrap_inactive_wrapper(
                         cls._original_internal_process,
                     )
             if cls._original_save_to_history is not None:
                 current = getattr(cls._internal_stage_cls, "_save_to_history", None)
-                if getattr(current, "_astrna_group_sender_concurrency_patch", False):
+                if same_callable(current, cls._save_history_wrapper):
                     cls._internal_stage_cls._save_to_history = unwrap_inactive_wrapper(
                         cls._original_save_to_history,
                     )
@@ -143,7 +157,7 @@ class GroupSenderConcurrencyModule:
             and cls._original_update_conversation is not None
         ):
             current = getattr(cls._conversation_manager_cls, "update_conversation", None)
-            if getattr(current, "_astrna_group_sender_concurrency_patch", False):
+            if same_callable(current, cls._update_conversation_wrapper):
                 cls._conversation_manager_cls.update_conversation = (
                     unwrap_inactive_wrapper(cls._original_update_conversation)
                 )
@@ -151,7 +165,7 @@ class GroupSenderConcurrencyModule:
         if cls._follow_up_module is not None:
             if cls._original_register_active_runner is not None:
                 current = getattr(cls._follow_up_module, "register_active_runner", None)
-                if getattr(current, "_astrna_group_sender_concurrency_patch", False):
+                if same_callable(current, cls._register_runner_wrapper):
                     cls._follow_up_module.register_active_runner = (
                         unwrap_inactive_wrapper(cls._original_register_active_runner)
                     )
@@ -161,13 +175,13 @@ class GroupSenderConcurrencyModule:
                     "unregister_active_runner",
                     None,
                 )
-                if getattr(current, "_astrna_group_sender_concurrency_patch", False):
+                if same_callable(current, cls._unregister_runner_wrapper):
                     cls._follow_up_module.unregister_active_runner = (
                         unwrap_inactive_wrapper(cls._original_unregister_active_runner)
                     )
             if cls._original_try_capture_follow_up is not None:
                 current = getattr(cls._follow_up_module, "try_capture_follow_up", None)
-                if getattr(current, "_astrna_group_sender_concurrency_patch", False):
+                if same_callable(current, cls._try_capture_wrapper):
                     cls._follow_up_module.try_capture_follow_up = (
                         unwrap_inactive_wrapper(cls._original_try_capture_follow_up)
                     )
@@ -175,7 +189,7 @@ class GroupSenderConcurrencyModule:
         if cls._internal_module is not None:
             if cls._original_internal_register_active_runner is not None:
                 current = getattr(cls._internal_module, "register_active_runner", None)
-                if getattr(current, "_astrna_group_sender_concurrency_patch", False):
+                if same_callable(current, cls._internal_register_runner_wrapper):
                     cls._internal_module.register_active_runner = (
                         unwrap_inactive_wrapper(
                             cls._original_internal_register_active_runner,
@@ -187,7 +201,7 @@ class GroupSenderConcurrencyModule:
                     "unregister_active_runner",
                     None,
                 )
-                if getattr(current, "_astrna_group_sender_concurrency_patch", False):
+                if same_callable(current, cls._internal_unregister_runner_wrapper):
                     cls._internal_module.unregister_active_runner = (
                         unwrap_inactive_wrapper(
                             cls._original_internal_unregister_active_runner,
@@ -195,7 +209,7 @@ class GroupSenderConcurrencyModule:
                     )
             if cls._original_internal_try_capture_follow_up is not None:
                 current = getattr(cls._internal_module, "try_capture_follow_up", None)
-                if getattr(current, "_astrna_group_sender_concurrency_patch", False):
+                if same_callable(current, cls._internal_try_capture_wrapper):
                     cls._internal_module.try_capture_follow_up = (
                         unwrap_inactive_wrapper(
                             cls._original_internal_try_capture_follow_up,
@@ -224,6 +238,9 @@ class GroupSenderConcurrencyModule:
         cls._register_runner_wrapper = None
         cls._unregister_runner_wrapper = None
         cls._try_capture_wrapper = None
+        cls._internal_register_runner_wrapper = None
+        cls._internal_unregister_runner_wrapper = None
+        cls._internal_try_capture_wrapper = None
         cls._active_module = None
 
     def _install_process_patch(self) -> bool:
@@ -253,7 +270,9 @@ class GroupSenderConcurrencyModule:
                 *args: Any,
                 **kwargs: Any,
             ):
-                token = _CURRENT_EVENT.set(event)
+                token = None
+                if is_wrapper_active(astrna_internal_process):
+                    token = _CURRENT_EVENT.set(event)
                 try:
                     processed = original_process(stage_self, event, *args, **kwargs)
                     if inspect.isasyncgen(processed):
@@ -264,7 +283,8 @@ class GroupSenderConcurrencyModule:
                     else:
                         return
                 finally:
-                    _CURRENT_EVENT.reset(token)
+                    if token is not None:
+                        _CURRENT_EVENT.reset(token)
 
             astrna_internal_process._astrna_group_sender_concurrency_patch = True
             mark_wrapper_active(astrna_internal_process, original_process)
@@ -296,6 +316,8 @@ class GroupSenderConcurrencyModule:
 
             def astrna_acquire_lock(session_id: str):
                 active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_acquire_lock):
+                    active_module = None
                 lock_key = session_id
                 lock_scope = None
                 if active_module is not None:
@@ -353,6 +375,8 @@ class GroupSenderConcurrencyModule:
 
             async def astrna_save_to_history(*args: Any, **kwargs: Any) -> Any:
                 active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_save_to_history):
+                    active_module = None
                 token = None
                 if active_module is not None:
                     try:
@@ -402,6 +426,8 @@ class GroupSenderConcurrencyModule:
 
             async def astrna_update_conversation(manager_self: Any, *args: Any, **kwargs: Any):
                 active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_update_conversation):
+                    active_module = None
                 save_context = _CURRENT_SAVE_CONTEXT.get()
                 if active_module is None or save_context is None:
                     return await original_update_conversation(
@@ -475,56 +501,76 @@ class GroupSenderConcurrencyModule:
             module_cls._original_internal_unregister_active_runner = internal_unregister
             module_cls._original_internal_try_capture_follow_up = internal_try_capture
 
-            def astrna_register_active_runner(umo: str, runner: Any) -> Any:
-                active_module = module_cls._active_module
-                if active_module is not None and active_module.register_sender_runner(
-                    umo,
-                    runner,
-                ):
-                    return None
-                return original_register(umo, runner)
+            def build_register_wrapper(original: Any) -> Any:
+                def astrna_register_active_runner(umo: str, runner: Any) -> Any:
+                    active_module = module_cls._active_module
+                    if not is_wrapper_active(astrna_register_active_runner):
+                        active_module = None
+                    if active_module is not None and active_module.register_sender_runner(
+                        umo,
+                        runner,
+                    ):
+                        return None
+                    return original(umo, runner)
 
-            def astrna_unregister_active_runner(umo: str, runner: Any) -> Any:
-                active_module = module_cls._active_module
-                if active_module is not None and active_module.unregister_sender_runner(
-                    umo,
-                    runner,
-                ):
-                    return None
-                return original_unregister(umo, runner)
+                astrna_register_active_runner._astrna_group_sender_concurrency_patch = True
+                mark_wrapper_active(astrna_register_active_runner, original)
+                return astrna_register_active_runner
 
-            def astrna_try_capture_follow_up(event: Any) -> Any:
-                active_module = module_cls._active_module
-                if active_module is not None:
-                    sender_key = build_group_sender_key(event)
-                    if sender_key is not None:
-                        return active_module.try_capture_sender_follow_up(
-                            follow_up_module,
-                            sender_key,
-                            event,
-                        )
-                return original_try_capture(event)
+            def build_unregister_wrapper(original: Any) -> Any:
+                def astrna_unregister_active_runner(umo: str, runner: Any) -> Any:
+                    active_module = module_cls._active_module
+                    if not is_wrapper_active(astrna_unregister_active_runner):
+                        active_module = None
+                    if (
+                        active_module is not None
+                        and active_module.unregister_sender_runner(umo, runner)
+                    ):
+                        return None
+                    return original(umo, runner)
 
-            for wrapper in (
-                astrna_register_active_runner,
-                astrna_unregister_active_runner,
-                astrna_try_capture_follow_up,
-            ):
-                wrapper._astrna_group_sender_concurrency_patch = True
+                astrna_unregister_active_runner._astrna_group_sender_concurrency_patch = True
+                mark_wrapper_active(astrna_unregister_active_runner, original)
+                return astrna_unregister_active_runner
 
-            mark_wrapper_active(astrna_register_active_runner, original_register)
-            mark_wrapper_active(astrna_unregister_active_runner, original_unregister)
-            mark_wrapper_active(astrna_try_capture_follow_up, original_try_capture)
+            def build_capture_wrapper(original: Any) -> Any:
+                def astrna_try_capture_follow_up(event: Any) -> Any:
+                    active_module = module_cls._active_module
+                    if not is_wrapper_active(astrna_try_capture_follow_up):
+                        active_module = None
+                    if active_module is not None:
+                        sender_key = build_group_sender_key(event)
+                        if sender_key is not None:
+                            return active_module.try_capture_sender_follow_up(
+                                follow_up_module,
+                                sender_key,
+                                event,
+                            )
+                    return original(event)
+
+                astrna_try_capture_follow_up._astrna_group_sender_concurrency_patch = True
+                mark_wrapper_active(astrna_try_capture_follow_up, original)
+                return astrna_try_capture_follow_up
+
+            astrna_register_active_runner = build_register_wrapper(original_register)
+            astrna_unregister_active_runner = build_unregister_wrapper(original_unregister)
+            astrna_try_capture_follow_up = build_capture_wrapper(original_try_capture)
+            internal_register_wrapper = build_register_wrapper(internal_register)
+            internal_unregister_wrapper = build_unregister_wrapper(internal_unregister)
+            internal_try_capture_wrapper = build_capture_wrapper(internal_try_capture)
             module_cls._register_runner_wrapper = astrna_register_active_runner
             module_cls._unregister_runner_wrapper = astrna_unregister_active_runner
             module_cls._try_capture_wrapper = astrna_try_capture_follow_up
+            module_cls._internal_register_runner_wrapper = internal_register_wrapper
+            module_cls._internal_unregister_runner_wrapper = internal_unregister_wrapper
+            module_cls._internal_try_capture_wrapper = internal_try_capture_wrapper
 
             follow_up_module.register_active_runner = astrna_register_active_runner
             follow_up_module.unregister_active_runner = astrna_unregister_active_runner
             follow_up_module.try_capture_follow_up = astrna_try_capture_follow_up
-            internal_module.register_active_runner = astrna_register_active_runner
-            internal_module.unregister_active_runner = astrna_unregister_active_runner
-            internal_module.try_capture_follow_up = astrna_try_capture_follow_up
+            internal_module.register_active_runner = internal_register_wrapper
+            internal_module.unregister_active_runner = internal_unregister_wrapper
+            internal_module.try_capture_follow_up = internal_try_capture_wrapper
 
         return True
 
@@ -954,35 +1000,6 @@ def load_conversation_manager_cls() -> type | None:
         return ConversationManager
     except Exception:  # noqa: BLE001
         return None
-
-
-def mark_wrapper_active(wrapper: Any, original: Any) -> None:
-    try:
-        wrapper._astrna_wrapper_active = True
-        wrapper._astrna_wrapped_original = original
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def mark_wrapper_inactive(wrapper: Any) -> None:
-    if wrapper is None:
-        return
-    try:
-        wrapper._astrna_wrapper_active = False
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def unwrap_inactive_wrapper(func: Any) -> Any:
-    seen: set[int] = set()
-    while (
-        getattr(func, "_astrna_wrapper_active", True) is False
-        and getattr(func, "_astrna_wrapped_original", None) is not None
-        and id(func) not in seen
-    ):
-        seen.add(id(func))
-        func = getattr(func, "_astrna_wrapped_original")
-    return func
 
 
 class GroupConcurrencyGate:

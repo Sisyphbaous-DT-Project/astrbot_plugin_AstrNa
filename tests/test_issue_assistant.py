@@ -360,6 +360,7 @@ def test_safe_report_for_model_redacts_umo_and_traceback():
     report = make_report(
         umo="aiocqhttp:GroupMessage:openid_abcXYZ_953245617",
         session_hash="abcdef1234567890",
+        detected_at_ns=987654321,
         traceback_text=(
             "Traceback qq=1719500341 "
             "openid_abcXYZ_953245617 session_hash=abcdef1234567890"
@@ -371,9 +372,21 @@ def test_safe_report_for_model_redacts_umo_and_traceback():
     assert "953245617" not in payload["umo"]
     assert "abcXYZ" not in payload["umo"]
     assert "session_hash" not in payload
+    assert "detected_at_ns" not in payload
     assert "1719500341" not in payload["traceback_text"]
     assert "abcXYZ" not in payload["traceback_text"]
     assert "abcdef1234567890" not in payload["traceback_text"]
+
+    triage_prompt = mod.build_triage_prompt(report)
+    draft_prompt = build_draft_prompt(
+        make_pending(report=report),
+        "https://github.com/example/demo",
+        None,
+    )
+    assert "detected_at_ns" not in triage_prompt
+    assert "987654321" not in triage_prompt
+    assert "detected_at_ns" not in draft_prompt
+    assert "987654321" not in draft_prompt
 
 
 def test_core_repo_points_to_astrbotdevs():
@@ -985,6 +998,52 @@ def test_ignore_deletes_pending_issue():
     assert run(module._get_pending_for_event(event)) is None
 
 
+def test_ignore_reports_when_new_pending_replaces_target_before_delete():
+    class ReplacingModule(IssueAssistantModule):
+        async def _delete_pending_for_event(self, event, *, expected_report_key=None):
+            newer = make_pending(
+                event,
+                report=make_report(
+                    report_id="new",
+                    detected_at_ns=2,
+                    umo=event.unified_msg_origin,
+                ),
+            )
+            await self._save_pending_if_newer(event, newer)
+            return await super()._delete_pending_for_event(
+                event,
+                expected_report_key=expected_report_key,
+            )
+
+    async def exercise():
+        module = ReplacingModule(
+            context=DummyContext(),
+            logger=DummyLogger(),
+            kv_store=DummyKVStore(),
+            enabled=True,
+        )
+        event = DummyEvent()
+        await module._save_pending_for_event(
+            event,
+            make_pending(
+                event,
+                report=make_report(
+                    report_id="old",
+                    detected_at_ns=1,
+                    umo=event.unified_msg_origin,
+                ),
+            ),
+        )
+        text = await module.command_ignore(event)
+        return text, await module._get_pending_for_event(event)
+
+    text, pending = run(exercise())
+
+    assert "保留最新待办" in text
+    assert pending is not None
+    assert pending.report.report_id == "new"
+
+
 def test_analyze_requires_devkit_switch():
     module = make_module(enabled=True, devkit_enabled=False)
     event = DummyEvent()
@@ -1152,6 +1211,402 @@ def test_submit_uses_github_api_and_deletes_pending(monkeypatch):
 
     assert "https://github.com/example/demo/issues/1" in text
     assert run(module._get_pending_for_event(event)) is None
+
+
+def test_concurrent_submit_calls_github_once():
+    class SubmitModule(IssueAssistantModule):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.submit_calls = 0
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def submit_issue(self, draft):
+            self.submit_calls += 1
+            self.started.set()
+            await self.release.wait()
+            return {"ok": True, "url": "https://github.com/example/demo/issues/1"}
+
+    async def exercise():
+        context = DummyContext()
+        module = SubmitModule(
+            context=context,
+            logger=DummyLogger(),
+            kv_store=DummyKVStore(),
+            enabled=True,
+            github_token="token",
+        )
+        event = DummyEvent(is_admin=True)
+        pending = make_pending(
+            event,
+            draft=IssueDraft(
+                title="t",
+                body="b",
+                repo_url="https://github.com/example/demo",
+            ),
+        )
+        await module._save_pending_for_event(event, pending)
+        first = asyncio.create_task(module.command_submit(event))
+        await module.started.wait()
+        second = asyncio.create_task(module.command_submit(event))
+        module.release.set()
+        results = await asyncio.gather(first, second)
+        return module, results
+
+    module, results = run(exercise())
+
+    assert module.submit_calls == 1
+    assert sum("已提交 Issue" in item for item in results) == 1
+
+
+def test_failed_submit_keeps_pending_and_can_retry():
+    class RetrySubmitModule(IssueAssistantModule):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.submit_calls = 0
+
+        async def submit_issue(self, draft):
+            self.submit_calls += 1
+            if self.submit_calls == 1:
+                return {"ok": False, "error": "temporary_failure"}
+            return {"ok": True, "url": "https://github.com/example/demo/issues/2"}
+
+    async def exercise():
+        module = RetrySubmitModule(
+            context=DummyContext(),
+            logger=DummyLogger(),
+            kv_store=DummyKVStore(),
+            enabled=True,
+            github_token="token",
+        )
+        event = DummyEvent(is_admin=True)
+        await module._save_pending_for_event(
+            event,
+            make_pending(
+                event,
+                draft=IssueDraft(
+                    title="t",
+                    body="b",
+                    repo_url="https://github.com/example/demo",
+                ),
+            ),
+        )
+        first = await module.command_submit(event)
+        pending_after_failure = await module._get_pending_for_event(event)
+        second = await module.command_submit(event)
+        pending_after_success = await module._get_pending_for_event(event)
+        return module, first, pending_after_failure, second, pending_after_success
+
+    module, first, pending_after_failure, second, pending_after_success = run(
+        exercise()
+    )
+
+    assert module.submit_calls == 2
+    assert "temporary_failure" in first
+    assert pending_after_failure is not None
+    assert "/issues/2" in second
+    assert pending_after_success is None
+
+
+def test_successful_old_submit_does_not_delete_new_pending():
+    class DelayedSubmitModule(IssueAssistantModule):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def submit_issue(self, draft):
+            self.started.set()
+            await self.release.wait()
+            return {"ok": True, "url": "https://github.com/example/demo/issues/3"}
+
+    async def exercise():
+        module = DelayedSubmitModule(
+            context=DummyContext(),
+            logger=DummyLogger(),
+            kv_store=DummyKVStore(),
+            enabled=True,
+            github_token="token",
+        )
+        event = DummyEvent(is_admin=True)
+        old_pending = make_pending(
+            event,
+            report=make_report(
+                report_id="old",
+                detected_at_ns=1,
+                umo=event.unified_msg_origin,
+            ),
+            draft=IssueDraft(
+                title="old",
+                body="old",
+                repo_url="https://github.com/example/demo",
+            ),
+        )
+        await module._save_pending_for_event(event, old_pending)
+        submit_task = asyncio.create_task(module.command_submit(event))
+        await module.started.wait()
+        new_pending = make_pending(
+            event,
+            report=make_report(
+                report_id="new",
+                detected_at_ns=2,
+                umo=event.unified_msg_origin,
+            ),
+        )
+        assert await module._save_pending_if_newer(event, new_pending)
+        module.release.set()
+        result = await submit_task
+        return result, await module._get_pending_for_event(event)
+
+    result, pending = run(exercise())
+
+    assert "/issues/3" in result
+    assert pending is not None
+    assert pending.report.report_id == "new"
+
+
+def test_submit_does_not_delete_new_pending_with_same_report_id():
+    class DelayedSubmitModule(IssueAssistantModule):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def submit_issue(self, draft):
+            self.started.set()
+            await self.release.wait()
+            return {"ok": True, "url": "https://github.com/example/demo/issues/5"}
+
+    async def exercise():
+        module = DelayedSubmitModule(
+            context=DummyContext(),
+            logger=DummyLogger(),
+            kv_store=DummyKVStore(),
+            enabled=True,
+            github_token="token",
+        )
+        event = DummyEvent(is_admin=True)
+        old_pending = make_pending(
+            event,
+            report=make_report(
+                report_id="same-id",
+                created_at=1,
+                detected_at_ns=1,
+                umo=event.unified_msg_origin,
+            ),
+            draft=IssueDraft(
+                title="old",
+                body="old",
+                repo_url="https://github.com/example/demo",
+            ),
+        )
+        await module._save_pending_for_event(event, old_pending)
+        submit_task = asyncio.create_task(module.command_submit(event))
+        await module.started.wait()
+        new_pending = make_pending(
+            event,
+            report=make_report(
+                report_id="same-id",
+                created_at=1,
+                detected_at_ns=2,
+                umo=event.unified_msg_origin,
+            ),
+        )
+        assert await module._save_pending_if_newer(event, new_pending)
+        module.release.set()
+        await submit_task
+        return await module._get_pending_for_event(event)
+
+    pending = run(exercise())
+
+    assert pending is not None
+    assert pending.report.detected_at_ns == 2
+
+
+def test_old_submit_draft_generation_does_not_overwrite_new_pending():
+    class DelayedDraftModule(IssueAssistantModule):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.draft_started = asyncio.Event()
+            self.release_draft = asyncio.Event()
+            self.submitted_titles = []
+
+        async def generate_issue_draft(self, pending, *, event=None):
+            self.draft_started.set()
+            await self.release_draft.wait()
+            return IssueDraft(
+                title=pending.report.report_id,
+                body="body",
+                repo_url="https://github.com/example/demo",
+            )
+
+        async def submit_issue(self, draft):
+            self.submitted_titles.append(draft.title)
+            return {"ok": True, "url": "https://github.com/example/demo/issues/4"}
+
+    async def exercise():
+        module = DelayedDraftModule(
+            context=DummyContext(),
+            logger=DummyLogger(),
+            kv_store=DummyKVStore(),
+            enabled=True,
+            github_token="token",
+        )
+        event = DummyEvent(is_admin=True)
+        old_pending = make_pending(
+            event,
+            report=make_report(
+                report_id="old",
+                detected_at_ns=1,
+                umo=event.unified_msg_origin,
+            ),
+        )
+        await module._save_pending_for_event(event, old_pending)
+        submit_task = asyncio.create_task(module.command_submit(event))
+        await module.draft_started.wait()
+        new_pending = make_pending(
+            event,
+            report=make_report(
+                report_id="new",
+                detected_at_ns=2,
+                umo=event.unified_msg_origin,
+            ),
+        )
+        assert await module._save_pending_if_newer(event, new_pending)
+        module.release_draft.set()
+        result = await submit_task
+        return module, result, await module._get_pending_for_event(event)
+
+    module, result, pending = run(exercise())
+
+    assert "/issues/4" in result
+    assert module.submitted_titles == ["old"]
+    assert pending is not None
+    assert pending.report.report_id == "new"
+
+
+def test_older_background_analysis_cannot_replace_newer_pending():
+    class OrderedAnalysisModule(IssueAssistantModule):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.old_started = asyncio.Event()
+            self.release_old = asyncio.Event()
+
+        async def _triage_with_llm(self, event, report):
+            if report.report_id == "old":
+                self.old_started.set()
+                await self.release_old.wait()
+            return TriageResult(
+                real_issue=True,
+                confidence=0.9,
+                summary=report.report_id,
+            )
+
+    async def exercise():
+        kv_store = DummyKVStore()
+        context = DummyContext()
+        module = OrderedAnalysisModule(
+            context=context,
+            logger=DummyLogger(),
+            kv_store=kv_store,
+            enabled=True,
+            target_umo="aiocqhttp:FriendMessage:notify",
+        )
+        event = DummyEvent()
+        old_report = make_report(
+            report_id="old",
+            created_at=1,
+            detected_at_ns=1,
+        )
+        new_report = make_report(
+            report_id="new",
+            created_at=2,
+            detected_at_ns=2,
+        )
+        old_task = asyncio.create_task(module._analyze_and_notify(event, old_report))
+        await module.old_started.wait()
+        await module._analyze_and_notify(event, new_report)
+        module.release_old.set()
+        await old_task
+        pending = await module._get_pending_for_event(event)
+        return pending, context.sent_messages
+
+    pending, sent_messages = run(exercise())
+
+    assert pending.report.report_id == "new"
+    assert len(sent_messages) == 1
+
+
+def test_newer_notification_cannot_overtake_in_flight_older_notification():
+    class DelayedContext(DummyContext):
+        def __init__(self):
+            super().__init__()
+            self.old_send_started = asyncio.Event()
+            self.release_old_send = asyncio.Event()
+
+        async def send_message(self, session, message_chain):
+            text = str(message_chain)
+            if "old" in text:
+                self.old_send_started.set()
+                await self.release_old_send.wait()
+            self.sent_messages.append((str(session), message_chain))
+            return True
+
+    class ImmediateAnalysisModule(IssueAssistantModule):
+        async def _triage_with_llm(self, event, report):
+            return TriageResult(
+                real_issue=True,
+                confidence=0.9,
+                summary=report.report_id,
+            )
+
+    async def exercise():
+        context = DelayedContext()
+        module = ImmediateAnalysisModule(
+            context=context,
+            logger=DummyLogger(),
+            kv_store=DummyKVStore(),
+            enabled=True,
+            target_umo="aiocqhttp:FriendMessage:notify",
+        )
+        event = DummyEvent()
+        old_report = make_report(
+            report_id="old",
+            created_at=1,
+            detected_at_ns=1,
+        )
+        new_report = make_report(
+            report_id="new",
+            created_at=2,
+            detected_at_ns=2,
+        )
+        old_task = asyncio.create_task(module._analyze_and_notify(event, old_report))
+        await context.old_send_started.wait()
+        new_task = asyncio.create_task(module._analyze_and_notify(event, new_report))
+        await asyncio.sleep(0)
+        assert not new_task.done()
+        context.release_old_send.set()
+        await asyncio.wait_for(asyncio.gather(old_task, new_task), timeout=1)
+        pending = await module._get_pending_for_event(event)
+        summaries = [str(message) for _, message in context.sent_messages]
+        return pending, summaries
+
+    pending, summaries = run(exercise())
+
+    assert pending.report.report_id == "new"
+    assert len(summaries) == 2
+    assert "old" in summaries[0]
+    assert "new" in summaries[1]
+
+
+def test_old_pending_payload_without_detected_ns_remains_compatible():
+    payload = mod.dump_pending_issue(make_pending())
+    payload["report"].pop("detected_at_ns")
+
+    loaded = mod.load_pending_issue(payload)
+
+    assert loaded is not None
+    assert loaded.report.detected_at_ns == 0
 
 
 def test_background_task_exception_is_retrieved_and_redacted(monkeypatch):

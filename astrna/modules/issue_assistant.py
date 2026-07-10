@@ -10,6 +10,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import weakref
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -112,6 +113,7 @@ class ErrorReport:
     astrna_version: str
     repo_url: str = ""
     session_hash: str = ""
+    detected_at_ns: int = 0
 
 
 @dataclass
@@ -176,6 +178,12 @@ class IssueAssistantModule:
         self._memory_state: dict[str, Any] = {"pending_by_umo": {}, "reports": []}
         self._state_loaded = False
         self._state_lock = asyncio.Lock()
+        self._submit_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
+        self._notification_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
         self._rate_limited: dict[str, int] = {}
 
     def configure(
@@ -301,7 +309,13 @@ class IssueAssistantModule:
         if pending.draft is None:
             pending.draft = await self.generate_issue_draft(pending, event=event)
         pending.status = ISSUE_STATUS_DRAFT_READY
-        await self._save_pending_for_event(event, pending)
+        saved = await self._save_pending_for_event(
+            event,
+            pending,
+            expected_report_key=report_order_key(pending.report),
+        )
+        if not saved:
+            return "生成草稿期间出现了更新的报错，AstrNa 已保留最新待办；请重新查看后再操作。"
         return format_issue_draft(pending.draft)
 
     async def command_edit(self, event: Any, note: str) -> str:
@@ -318,7 +332,13 @@ class IssueAssistantModule:
         pending.user_note = merge_user_note(pending.user_note, clean_note)
         pending.draft = await self.generate_issue_draft(pending, event=event)
         pending.status = ISSUE_STATUS_DRAFT_READY
-        await self._save_pending_for_event(event, pending)
+        saved = await self._save_pending_for_event(
+            event,
+            pending,
+            expected_report_key=report_order_key(pending.report),
+        )
+        if not saved:
+            return "生成草稿期间出现了更新的报错，AstrNa 已保留最新待办；请重新查看后再操作。"
         return "AstrNa 已把补充说明写进 Issue 草稿。可以使用 /astrna issue draft 查看，确认后用 /astrna issue submit 提交。"
 
     async def command_ignore(self, event: Any) -> str:
@@ -327,7 +347,12 @@ class IssueAssistantModule:
         if denied:
             return denied
         pending.status = ISSUE_STATUS_IGNORED
-        await self._delete_pending_for_event(event)
+        deleted = await self._delete_pending_for_event(
+            event,
+            expected_report_key=report_order_key(pending.report),
+        )
+        if not deleted:
+            return "操作期间出现了更新的报错，AstrNa 已保留最新待办；请重新查看后再操作。"
         return "AstrNa 已忽略当前报错，不会继续生成 Issue 草稿。"
 
     async def command_analyze(self, event: Any, req: Any | None = None) -> str:
@@ -344,7 +369,13 @@ class IssueAssistantModule:
         status_text = format_devkit_status(available_tools)
         pending.status = ISSUE_STATUS_SOURCE_ANALYSIS_REQUESTED
         pending.draft = None
-        await self._save_pending_for_event(event, pending)
+        saved = await self._save_pending_for_event(
+            event,
+            pending,
+            expected_report_key=report_order_key(pending.report),
+        )
+        if not saved:
+            return "操作期间出现了更新的报错，AstrNa 已保留最新待办；请重新查看后再操作。"
         return (
             "AstrNa 已进入源码辅助分析流程。\n"
             f"{status_text}\n"
@@ -378,7 +409,13 @@ class IssueAssistantModule:
         pending.source_analysis = clean_analysis
         pending.status = ISSUE_STATUS_SOURCE_ANALYSIS_DONE
         pending.draft = None
-        await self._save_pending_for_event(event, pending)
+        saved = await self._save_pending_for_event(
+            event,
+            pending,
+            expected_report_key=report_order_key(pending.report),
+        )
+        if not saved:
+            return "操作期间出现了更新的报错，AstrNa 已保留最新待办；请重新查看后再操作。"
         return (
             "AstrNa 已记录源码分析结论。"
             "现在可以使用 /astrna issue draft 生成包含源码分析的 Issue 草稿。"
@@ -390,35 +427,59 @@ class IssueAssistantModule:
         if denied:
             return denied
         pending.status = ISSUE_STATUS_CANCELLED
-        await self._delete_pending_for_event(event)
+        deleted = await self._delete_pending_for_event(
+            event,
+            expected_report_key=report_order_key(pending.report),
+        )
+        if not deleted:
+            return "操作期间出现了更新的报错，AstrNa 已保留最新待办；请重新查看后再操作。"
         return "AstrNa 已丢弃当前会话的 Issue 草稿。"
 
     async def command_submit(self, event: Any, *, confirm: bool = True) -> str:
-        pending = await self._get_pending_for_event(event)
-        denied = self._permission_denied_text(event, pending)
-        if denied:
-            return denied
-        if not confirm:
+        state_key = self._state_key_for_event(event)
+        submit_lock = self._submit_locks.setdefault(state_key, asyncio.Lock())
+        async with submit_lock:
+            pending = await self._get_pending_for_event(event)
+            denied = self._permission_denied_text(event, pending)
+            if denied:
+                return denied
+            if not confirm:
+                if pending.draft is None:
+                    pending.draft = await self.generate_issue_draft(pending, event=event)
+                    pending.status = ISSUE_STATUS_DRAFT_READY
+                    saved = await self._save_pending_for_event(
+                        event,
+                        pending,
+                        expected_report_key=report_order_key(pending.report),
+                    )
+                    if not saved:
+                        return (
+                            "生成草稿期间出现了更新的报错，AstrNa 已保留最新待办；"
+                            "请重新查看后再操作。"
+                        )
+                return (
+                    format_issue_draft(pending.draft)
+                    + "\n\n提交 Issue 需要明确确认。确认无误后再调用提交工具并传入 confirm=true，"
+                    "或使用 /astrna issue submit。"
+                )
+            if not self.github_token:
+                return "AstrNa 没有配置 GitHub Token，所以只能生成草稿，不能自动提交。"
             if pending.draft is None:
                 pending.draft = await self.generate_issue_draft(pending, event=event)
-                pending.status = ISSUE_STATUS_DRAFT_READY
-                await self._save_pending_for_event(event, pending)
-            return (
-                format_issue_draft(pending.draft)
-                + "\n\n提交 Issue 需要明确确认。确认无误后再调用提交工具并传入 confirm=true，"
-                "或使用 /astrna issue submit。"
-            )
-        if not self.github_token:
-            return "AstrNa 没有配置 GitHub Token，所以只能生成草稿，不能自动提交。"
-        if pending.draft is None:
-            pending.draft = await self.generate_issue_draft(pending, event=event)
-            await self._save_pending_for_event(event, pending)
-        result = await self.submit_issue(pending.draft)
-        if result.get("ok"):
-            pending.status = ISSUE_STATUS_SUBMITTED
-            await self._delete_pending_for_event(event)
-            return f"AstrNa 已提交 Issue：{result.get('url')}"
-        return f"AstrNa 提交 Issue 失败：{result.get('error', 'unknown_error')}"
+                await self._save_pending_for_event(
+                    event,
+                    pending,
+                    expected_report_key=report_order_key(pending.report),
+                )
+            result = await self.submit_issue(pending.draft)
+            if result.get("ok"):
+                pending.status = ISSUE_STATUS_SUBMITTED
+                await self._delete_pending_for_event(
+                    event,
+                    expected_report_key=report_order_key(pending.report),
+                )
+                return f"AstrNa 已提交 Issue：{result.get('url')}"
+            return f"AstrNa 提交 Issue 失败：{result.get('error', 'unknown_error')}"
 
     async def terminate(self) -> None:
         self.terminate_tools()
@@ -507,6 +568,7 @@ class IssueAssistantModule:
             astrbot_version=sanitize_plain_text(load_astrbot_version(), limit=80),
             astrna_version=sanitize_plain_text(load_astrna_version(), limit=80),
             repo_url=repo_url,
+            detected_at_ns=time.time_ns(),
         )
 
     async def generate_issue_draft(
@@ -593,13 +655,21 @@ class IssueAssistantModule:
                 report.report_id,
             )
             return
-        await self._save_pending_for_event(event, pending)
-        sent = await send_text_to_session(
-            self.context,
-            self.target_umo,
-            build_notification_text(pending),
-            logger=self.logger,
+        state_key = self._state_key_for_event(event)
+        notification_lock = self._notification_locks.setdefault(
+            state_key,
+            asyncio.Lock(),
         )
+        async with notification_lock:
+            saved = await self._save_pending_if_newer(event, pending)
+            if not saved:
+                return
+            sent = await send_text_to_session(
+                self.context,
+                self.target_umo,
+                build_notification_text(pending),
+                logger=self.logger,
+            )
         if not sent:
             self._log(
                 "debug",
@@ -720,19 +790,66 @@ class IssueAssistantModule:
             )
         return load_pending_issue(payload)
 
-    async def _save_pending_for_event(self, event: Any, pending: PendingIssue) -> None:
+    async def _save_pending_for_event(
+        self,
+        event: Any,
+        pending: PendingIssue,
+        *,
+        expected_report_key: tuple[int, int, str] | None = None,
+    ) -> bool:
         await self._ensure_state_loaded()
         async with self._state_lock:
             pending_by_umo = self._memory_state.setdefault("pending_by_umo", {})
-            pending_by_umo[self._state_key_for_event(event)] = dump_pending_issue(pending)
+            state_key = self._state_key_for_event(event)
+            if expected_report_key is not None:
+                current = load_pending_issue(pending_by_umo.get(state_key))
+                if (
+                    current is None
+                    or report_order_key(current.report) != expected_report_key
+                ):
+                    return False
+            pending_by_umo[state_key] = dump_pending_issue(pending)
             await self._save_state()
+            return True
 
-    async def _delete_pending_for_event(self, event: Any) -> None:
+    async def _save_pending_if_newer(
+        self,
+        event: Any,
+        pending: PendingIssue,
+    ) -> bool:
         await self._ensure_state_loaded()
         async with self._state_lock:
             pending_by_umo = self._memory_state.setdefault("pending_by_umo", {})
-            pending_by_umo.pop(self._state_key_for_event(event), None)
+            state_key = self._state_key_for_event(event)
+            current = load_pending_issue(pending_by_umo.get(state_key))
+            if current is not None and report_order_key(
+                current.report,
+            ) >= report_order_key(pending.report):
+                return False
+            pending_by_umo[state_key] = dump_pending_issue(pending)
             await self._save_state()
+            return True
+
+    async def _delete_pending_for_event(
+        self,
+        event: Any,
+        *,
+        expected_report_key: tuple[int, int, str] | None = None,
+    ) -> bool:
+        await self._ensure_state_loaded()
+        async with self._state_lock:
+            pending_by_umo = self._memory_state.setdefault("pending_by_umo", {})
+            state_key = self._state_key_for_event(event)
+            if expected_report_key is not None:
+                current = load_pending_issue(pending_by_umo.get(state_key))
+                if (
+                    current is None
+                    or report_order_key(current.report) != expected_report_key
+                ):
+                    return False
+            pending_by_umo.pop(state_key, None)
+            await self._save_state()
+            return True
 
     async def _append_report(self, report: ErrorReport) -> None:
         await self._ensure_state_loaded()
@@ -1165,6 +1282,14 @@ def should_notify(triage: TriageResult) -> bool:
     return bool(triage.real_issue and triage.confidence >= 0.45)
 
 
+def report_order_key(report: ErrorReport) -> tuple[int, int, str]:
+    return (
+        int(report.detected_at_ns or 0),
+        int(report.created_at or 0),
+        str(report.report_id or ""),
+    )
+
+
 def fallback_triage(report: ErrorReport) -> TriageResult:
     return TriageResult(
         real_issue=False,
@@ -1485,6 +1610,7 @@ def safe_report_for_model(report: ErrorReport) -> dict[str, Any]:
     payload = asdict(report)
     payload["umo"] = redact_umo(payload.get("umo", ""))
     payload.pop("session_hash", None)
+    payload.pop("detected_at_ns", None)
     payload["traceback_text"] = redact_sensitive_text(payload.get("traceback_text", ""))
     payload["error_message"] = redact_sensitive_text(payload.get("error_message", ""))
     return payload

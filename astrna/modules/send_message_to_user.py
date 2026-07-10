@@ -3,6 +3,14 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
+from ..utils.patching import (
+    is_wrapper_active,
+    mark_wrapper_active,
+    mark_wrapper_inactive,
+    same_callable,
+    unwrap_inactive_wrapper,
+)
+
 
 SEND_MESSAGE_TOOL_NAME = "send_message_to_user"
 PROACTIVE_PROMPT_MARKER = "You are now responding to a scheduled task."
@@ -53,11 +61,7 @@ class SendMessageToUserModule:
 
             async def astrna_iter_llm_responses_with_fallback(runner_self: Any):
                 active_module = module_cls._active_module
-                if getattr(
-                    astrna_iter_llm_responses_with_fallback,
-                    "_astrna_wrapper_active",
-                    True,
-                ) is False:
+                if not is_wrapper_active(astrna_iter_llm_responses_with_fallback):
                     active_module = None
                 async for llm_response in original_method(runner_self):
                     if active_module is None:
@@ -126,17 +130,15 @@ class SendMessageToUserModule:
             and cls._original_iter_llm_responses_with_fallback is not None
         ):
             current = getattr(cls._runner_cls, "_iter_llm_responses_with_fallback", None)
-            if getattr(current, "_astrna_send_message_to_user_patch", False):
+            if same_callable(current, cls._response_wrapper):
                 cls._runner_cls._iter_llm_responses_with_fallback = (
                     unwrap_inactive_wrapper(
                         cls._original_iter_llm_responses_with_fallback,
                     )
                 )
-            elif getattr(
+            elif not is_wrapper_active(
                 cls._original_iter_llm_responses_with_fallback,
-                "_astrna_wrapper_active",
-                True,
-            ) is False:
+            ):
                 cls._original_iter_llm_responses_with_fallback = (
                     unwrap_inactive_wrapper(
                         cls._original_iter_llm_responses_with_fallback,
@@ -144,15 +146,11 @@ class SendMessageToUserModule:
                 )
         if cls._internal_stage_cls is not None and cls._original_internal_process is not None:
             current_process = getattr(cls._internal_stage_cls, "process", None)
-            if getattr(current_process, "_astrna_send_message_to_user_stage_patch", False):
+            if same_callable(current_process, cls._stage_wrapper):
                 cls._internal_stage_cls.process = unwrap_inactive_wrapper(
                     cls._original_internal_process,
                 )
-            elif getattr(
-                cls._original_internal_process,
-                "_astrna_wrapper_active",
-                True,
-            ) is False:
+            elif not is_wrapper_active(cls._original_internal_process):
                 cls._original_internal_process = unwrap_inactive_wrapper(
                     cls._original_internal_process,
                 )
@@ -286,11 +284,7 @@ class SendMessageToUserModule:
             provider_wake_prefix: str,
         ):
             active_module = module_cls._active_module
-            if getattr(
-                astrna_internal_process,
-                "_astrna_wrapper_active",
-                True,
-            ) is False:
+            if not is_wrapper_active(astrna_internal_process):
                 active_module = None
             if active_module is not None:
                 active_module.prepare_event_for_process(event)
@@ -451,35 +445,3 @@ def log(logger: Any, level: str, message: str, *args: Any) -> None:
     method = getattr(logger, level, None)
     if callable(method):
         method(message, *args)
-
-
-def mark_wrapper_active(wrapper: Any, original: Any) -> None:
-    try:
-        wrapper._astrna_wrapper_active = True
-        wrapper._astrna_wrapped_original = original
-    except Exception:
-        pass
-
-
-def mark_wrapper_inactive(wrapper: Any) -> None:
-    if wrapper is None:
-        return
-    try:
-        wrapper._astrna_wrapper_active = False
-    except Exception:
-        pass
-
-
-def unwrap_inactive_wrapper(func: Any) -> Any:
-    seen: set[int] = set()
-    while (
-        callable(func)
-        and getattr(func, "_astrna_wrapper_active", True) is False
-        and id(func) not in seen
-    ):
-        seen.add(id(func))
-        original = getattr(func, "_astrna_wrapped_original", None)
-        if not callable(original) or original is func:
-            break
-        func = original
-    return func

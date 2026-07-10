@@ -6,6 +6,14 @@ import re
 import uuid
 from typing import Any
 
+from ..utils.patching import (
+    is_wrapper_active,
+    mark_wrapper_active,
+    mark_wrapper_inactive,
+    same_callable,
+    unwrap_inactive_wrapper,
+)
+
 
 DEFAULT_OUTPUT_LENGTH_LIMIT = 50
 OUTPUT_LENGTH_CLEAN_TIMEOUT_SECONDS = 120
@@ -83,17 +91,15 @@ class OutputLengthLimiterModule:
             and cls._original_iter_llm_responses_with_fallback is not None
         ):
             current = getattr(cls._runner_cls, "_iter_llm_responses_with_fallback", None)
-            if getattr(current, "_astrna_output_length_limiter_patch", False):
+            if same_callable(current, cls._response_wrapper):
                 cls._runner_cls._iter_llm_responses_with_fallback = (
                     unwrap_inactive_wrapper(
                         cls._original_iter_llm_responses_with_fallback,
                     )
                 )
-            elif getattr(
+            elif not is_wrapper_active(
                 cls._original_iter_llm_responses_with_fallback,
-                "_astrna_wrapper_active",
-                True,
-            ) is False:
+            ):
                 cls._original_iter_llm_responses_with_fallback = (
                     unwrap_inactive_wrapper(
                         cls._original_iter_llm_responses_with_fallback,
@@ -102,15 +108,11 @@ class OutputLengthLimiterModule:
 
         if cls._internal_stage_cls is not None and cls._original_internal_process is not None:
             current_process = getattr(cls._internal_stage_cls, "process", None)
-            if getattr(current_process, "_astrna_output_length_limiter_stage_patch", False):
+            if same_callable(current_process, cls._stage_wrapper):
                 cls._internal_stage_cls.process = unwrap_inactive_wrapper(
                     cls._original_internal_process,
                 )
-            elif getattr(
-                cls._original_internal_process,
-                "_astrna_wrapper_active",
-                True,
-            ) is False:
+            elif not is_wrapper_active(cls._original_internal_process):
                 cls._original_internal_process = unwrap_inactive_wrapper(
                     cls._original_internal_process,
                 )
@@ -145,11 +147,7 @@ class OutputLengthLimiterModule:
 
             async def astrna_iter_llm_responses_with_fallback(runner_self: Any):
                 active_module = module_cls._active_module
-                if getattr(
-                    astrna_iter_llm_responses_with_fallback,
-                    "_astrna_wrapper_active",
-                    True,
-                ) is False:
+                if not is_wrapper_active(astrna_iter_llm_responses_with_fallback):
                     active_module = None
                 async for llm_response in original_method(runner_self):
                     if active_module is None:
@@ -195,11 +193,7 @@ class OutputLengthLimiterModule:
                 provider_wake_prefix: str,
             ):
                 active_module = module_cls._active_module
-                if getattr(
-                    astrna_internal_process,
-                    "_astrna_wrapper_active",
-                    True,
-                ) is False:
+                if not is_wrapper_active(astrna_internal_process):
                     active_module = None
                 if active_module is not None:
                     active_module.prepare_event_for_process(event)
@@ -643,36 +637,6 @@ def load_internal_stage_cls() -> type | None:
     return InternalAgentSubStage
 
 
-def mark_wrapper_active(wrapper: Any, original: Any) -> None:
-    try:
-        wrapper._astrna_wrapper_active = True
-        wrapper._astrna_wrapped_original = original
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def mark_wrapper_inactive(wrapper: Any) -> None:
-    if wrapper is None:
-        return
-    try:
-        wrapper._astrna_wrapper_active = False
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def unwrap_inactive_wrapper(func: Any) -> Any:
-    seen: set[int] = set()
-    while (
-        callable(func)
-        and getattr(func, "_astrna_wrapper_active", True) is False
-        and id(func) not in seen
-    ):
-        seen.add(id(func))
-        original = getattr(func, "_astrna_wrapped_original", None)
-        if not callable(original) or original is func:
-            break
-        func = original
-    return func
 
 
 def log(logger: Any, level: str, message: str, *args: Any) -> None:

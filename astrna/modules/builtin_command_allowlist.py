@@ -5,6 +5,13 @@ import inspect
 import types
 from typing import Any
 
+from ..utils.patching import (
+    is_wrapper_active,
+    mark_wrapper_active,
+    mark_wrapper_inactive,
+    same_callable,
+)
+
 
 BUILTIN_COMMANDS_MODULE = "astrbot.builtin_stars.builtin_commands.main"
 
@@ -55,6 +62,9 @@ class BuiltinCommandAllowlistModule:
     _original_get_handlers_instance_attr: Any = None
     _registry_had_instance_get_handlers = False
     _original_help_builder: Any = None
+    _process_wrapper: Any = None
+    _get_handlers_wrapper: Any = None
+    _help_wrapper: Any = None
     _active_module: BuiltinCommandAllowlistModule | None = None
 
     def __init__(
@@ -123,6 +133,8 @@ class BuiltinCommandAllowlistModule:
 
             async def astrna_builtin_allowlist_process(stage_self: Any, event: Any):
                 active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_builtin_allowlist_process):
+                    active_module = None
                 if active_module is None or not active_module._enabled:
                     return await call_process(original_process, stage_self, event)
 
@@ -142,6 +154,8 @@ class BuiltinCommandAllowlistModule:
                     _allowed_builtin_commands.reset(token)
 
             astrna_builtin_allowlist_process._astrna_builtin_command_allowlist_patch = True
+            mark_wrapper_active(astrna_builtin_allowlist_process, original_process)
+            module_cls._process_wrapper = astrna_builtin_allowlist_process
             stage_cls.process = astrna_builtin_allowlist_process
 
         if module_cls._original_get_handlers is None:
@@ -162,6 +176,8 @@ class BuiltinCommandAllowlistModule:
                 *args: Any,
                 **kwargs: Any,
             ):
+                if not is_wrapper_active(astrna_get_handlers_by_event_type):
+                    return original_get_handlers(*args, **kwargs)
                 event_type = args[0] if args else kwargs.get("event_type")
                 handlers = original_get_handlers(*args, **kwargs)
                 allowed = _allowed_builtin_commands.get()
@@ -178,6 +194,11 @@ class BuiltinCommandAllowlistModule:
                 astrna_get_handlers_by_event_type,
                 registry,
             )
+            mark_wrapper_active(
+                registry.get_handlers_by_event_type,
+                original_get_handlers,
+            )
+            module_cls._get_handlers_wrapper = registry.get_handlers_by_event_type
 
         if help_cls is not None and module_cls._original_help_builder is None:
             module_cls._help_cls = help_cls
@@ -186,6 +207,8 @@ class BuiltinCommandAllowlistModule:
 
             async def astrna_build_reserved_command_lines(help_self: Any) -> list[str]:
                 active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_build_reserved_command_lines):
+                    active_module = None
                 if active_module is None or not active_module._enabled:
                     result = original_help_builder(help_self)
                     if inspect.isawaitable(result):
@@ -194,6 +217,11 @@ class BuiltinCommandAllowlistModule:
                 return await build_allowlisted_help_lines(active_module.allowed_commands)
 
             astrna_build_reserved_command_lines._astrna_builtin_command_allowlist_patch = True
+            mark_wrapper_active(
+                astrna_build_reserved_command_lines,
+                original_help_builder,
+            )
+            module_cls._help_wrapper = astrna_build_reserved_command_lines
             help_cls._build_reserved_command_lines = astrna_build_reserved_command_lines
 
         module_cls._active_module = self
@@ -213,14 +241,17 @@ class BuiltinCommandAllowlistModule:
 
     @classmethod
     def restore_patch(cls) -> None:
+        mark_wrapper_inactive(cls._process_wrapper)
+        mark_wrapper_inactive(cls._get_handlers_wrapper)
+        mark_wrapper_inactive(cls._help_wrapper)
         if cls._stage_cls is not None and cls._original_process is not None:
             current = getattr(cls._stage_cls, "process", None)
-            if has_patch_marker(current):
+            if same_callable(current, cls._process_wrapper):
                 cls._stage_cls.process = cls._original_process
 
         if cls._registry is not None and cls._original_get_handlers is not None:
             current = getattr(cls._registry, "get_handlers_by_event_type", None)
-            if has_patch_marker(current):
+            if same_callable(current, cls._get_handlers_wrapper):
                 if cls._registry_had_instance_get_handlers:
                     cls._registry.get_handlers_by_event_type = (
                         cls._original_get_handlers_instance_attr
@@ -235,7 +266,7 @@ class BuiltinCommandAllowlistModule:
 
         if cls._help_cls is not None and cls._original_help_builder is not None:
             current = getattr(cls._help_cls, "_build_reserved_command_lines", None)
-            if has_patch_marker(current):
+            if same_callable(current, cls._help_wrapper):
                 cls._help_cls._build_reserved_command_lines = cls._original_help_builder
 
         cls._stage_cls = None
@@ -247,6 +278,9 @@ class BuiltinCommandAllowlistModule:
         cls._original_get_handlers_instance_attr = None
         cls._registry_had_instance_get_handlers = False
         cls._original_help_builder = None
+        cls._process_wrapper = None
+        cls._get_handlers_wrapper = None
+        cls._help_wrapper = None
         cls._active_module = None
 
     def _load_waking_check_stage(self) -> type | None:

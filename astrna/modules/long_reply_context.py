@@ -8,6 +8,14 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
+from ..utils.patching import (
+    is_wrapper_active,
+    mark_wrapper_active,
+    mark_wrapper_inactive,
+    same_callable,
+    unwrap_inactive_wrapper,
+)
+
 
 MAX_LONG_REPLY_CONTEXT_LENGTH = 20000
 MAX_PENDING_REPLIES = 200
@@ -76,19 +84,19 @@ class LongReplyContextModule:
         mark_wrapper_inactive(cls._set_result_wrapper)
         if cls._event_cls is not None and cls._original_set_result is not None:
             current = getattr(cls._event_cls, "set_result", None)
-            if getattr(current, "_astrna_long_reply_context_patch", False):
+            if same_callable(current, cls._set_result_wrapper):
                 cls._event_cls.set_result = unwrap_inactive_wrapper(
                     cls._original_set_result,
                 )
         if cls._internal_stage_cls is not None and cls._original_save_to_history is not None:
             current = getattr(cls._internal_stage_cls, "_save_to_history", None)
-            if getattr(current, "_astrna_long_reply_context_patch", False):
+            if same_callable(current, cls._save_history_wrapper):
                 cls._internal_stage_cls._save_to_history = unwrap_inactive_wrapper(
                     cls._original_save_to_history,
                 )
         if cls._respond_stage_cls is not None and cls._original_respond_process is not None:
             current = getattr(cls._respond_stage_cls, "process", None)
-            if getattr(current, "_astrna_long_reply_context_patch", False):
+            if same_callable(current, cls._respond_wrapper):
                 cls._respond_stage_cls.process = unwrap_inactive_wrapper(
                     cls._original_respond_process,
                 )
@@ -126,6 +134,8 @@ class LongReplyContextModule:
             def astrna_set_result(event_self: Any, result: Any) -> Any:
                 ret = original_set_result(event_self, result)
                 active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_set_result):
+                    active_module = None
                 if active_module is not None:
                     try:
                         active_module.record_set_result(event_self, result)
@@ -166,6 +176,8 @@ class LongReplyContextModule:
 
             async def astrna_save_to_history(*args: Any, **kwargs: Any) -> Any:
                 active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_save_to_history):
+                    active_module = None
                 if active_module is not None:
                     try:
                         args, kwargs = await active_module.optimize_save_history_call(
@@ -213,6 +225,8 @@ class LongReplyContextModule:
 
             async def astrna_respond_process(stage_self: Any, event: Any) -> Any:
                 active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_respond_process):
+                    active_module = None
                 if active_module is not None:
                     try:
                         await active_module.optimize_before_respond(
@@ -1107,38 +1121,6 @@ def safe_call(func: Any, *args: Any, **kwargs: Any) -> Any:
         return func(*args, **kwargs)
     except Exception:  # noqa: BLE001
         return None
-
-
-def mark_wrapper_active(wrapper: Any, original: Any) -> None:
-    try:
-        wrapper._astrna_wrapper_active = True
-        wrapper._astrna_wrapped_original = original
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def mark_wrapper_inactive(wrapper: Any) -> None:
-    if wrapper is None:
-        return
-    try:
-        wrapper._astrna_wrapper_active = False
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def unwrap_inactive_wrapper(func: Any) -> Any:
-    seen: set[int] = set()
-    while (
-        callable(func)
-        and getattr(func, "_astrna_wrapper_active", True) is False
-        and id(func) not in seen
-    ):
-        seen.add(id(func))
-        original = getattr(func, "_astrna_wrapped_original", None)
-        if not callable(original) or original is func:
-            break
-        func = original
-    return func
 
 
 def load_internal_stage_cls() -> type | None:

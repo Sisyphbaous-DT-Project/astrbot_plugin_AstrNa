@@ -4,9 +4,18 @@ import asyncio
 import re
 import time
 import uuid
+import weakref
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
+
+from ..utils.patching import (
+    is_wrapper_active,
+    mark_wrapper_active,
+    mark_wrapper_inactive,
+    same_callable,
+    unwrap_inactive_wrapper,
+)
 
 
 GROUP_CONTEXT_COMPRESS_TIMEOUT_SECONDS = 300
@@ -85,6 +94,11 @@ class GroupChatContextOptimizerModule:
         self._empty_provider_logged = False
         self._persisted_state_loaded = kv_store is None
         self._persisted_state = build_empty_persisted_state()
+        self._persisted_state_lock = asyncio.Lock()
+        self._session_persistence_locks: weakref.WeakValueDictionary[
+            str,
+            asyncio.Lock,
+        ] = weakref.WeakValueDictionary()
 
     def configure(self, *, provider_id: str = "") -> None:
         self.provider_id = normalize_provider_id(provider_id)
@@ -132,6 +146,8 @@ class GroupChatContextOptimizerModule:
                 req: Any,
             ) -> Any:
                 active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_group_context_on_req_llm):
+                    active_module = None
                 if active_module is None:
                     return await original_on_req_llm(group_context_self, event, req)
                 return await active_module.optimize_on_req_llm(
@@ -152,8 +168,12 @@ class GroupChatContextOptimizerModule:
                 group_context_self: Any,
                 event: Any,
             ) -> Any:
-                ret = await original_handle_message(group_context_self, event)
                 active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_group_context_handle_message):
+                    active_module = None
+                if active_module is not None:
+                    await active_module.restore_group_context(group_context_self, event)
+                ret = await original_handle_message(group_context_self, event)
                 if active_module is not None:
                     await active_module.persist_group_context(group_context_self, event)
                 return ret
@@ -173,11 +193,21 @@ class GroupChatContextOptimizerModule:
                 group_context_self: Any,
                 event: Any,
             ) -> Any:
-                ret = await original_remove_session(group_context_self, event)
                 active_module = module_cls._active_module
-                if active_module is not None:
-                    await active_module.delete_persisted_group_context(event)
-                return ret
+                if not is_wrapper_active(astrna_group_context_remove_session):
+                    active_module = None
+                if active_module is None:
+                    return await original_remove_session(group_context_self, event)
+                umo = getattr(event, "unified_msg_origin", "")
+                if not umo:
+                    return await original_remove_session(group_context_self, event)
+                async with active_module.get_session_persistence_lock(umo):
+                    ret = await original_remove_session(group_context_self, event)
+                    await active_module.delete_persisted_group_context(
+                        event,
+                        lock_held=True,
+                    )
+                    return ret
 
             astrna_group_context_remove_session._astrna_group_context_optimizer_patch = True
             mark_wrapper_active(
@@ -212,19 +242,19 @@ class GroupChatContextOptimizerModule:
         mark_wrapper_inactive(cls._remove_session_wrapper)
         if cls._group_chat_context_cls is not None and cls._original_on_req_llm is not None:
             current = getattr(cls._group_chat_context_cls, "on_req_llm", None)
-            if getattr(current, "_astrna_group_context_optimizer_patch", False):
+            if same_callable(current, cls._on_req_llm_wrapper):
                 cls._group_chat_context_cls.on_req_llm = unwrap_inactive_wrapper(
                     cls._original_on_req_llm,
                 )
         if cls._group_chat_context_cls is not None and cls._original_handle_message is not None:
             current = getattr(cls._group_chat_context_cls, "handle_message", None)
-            if getattr(current, "_astrna_group_context_optimizer_patch", False):
+            if same_callable(current, cls._handle_message_wrapper):
                 cls._group_chat_context_cls.handle_message = unwrap_inactive_wrapper(
                     cls._original_handle_message,
                 )
         if cls._group_chat_context_cls is not None and cls._original_remove_session is not None:
             current = getattr(cls._group_chat_context_cls, "remove_session", None)
-            if getattr(current, "_astrna_group_context_optimizer_patch", False):
+            if same_callable(current, cls._remove_session_wrapper):
                 cls._group_chat_context_cls.remove_session = unwrap_inactive_wrapper(
                     cls._original_remove_session,
                 )
@@ -296,20 +326,21 @@ class GroupChatContextOptimizerModule:
         if not umo:
             return
 
-        lock_getter = getattr(group_context, "_get_lock", None)
-        lock = lock_getter(umo) if callable(lock_getter) else None
-
-        def build_snapshot_locked() -> dict[str, Any] | None:
-            return self.build_group_context_snapshot(group_context, event, umo)
-
         try:
-            if lock is None:
-                snapshot = build_snapshot_locked()
-            else:
-                async with lock:
+            async with self.get_session_persistence_lock(umo):
+                lock_getter = getattr(group_context, "_get_lock", None)
+                group_lock = lock_getter(umo) if callable(lock_getter) else None
+
+                def build_snapshot_locked() -> dict[str, Any] | None:
+                    return self.build_group_context_snapshot(group_context, event, umo)
+
+                if group_lock is None:
                     snapshot = build_snapshot_locked()
-            if snapshot is not None:
-                await self.put_persisted_session(umo, snapshot)
+                else:
+                    async with group_lock:
+                        snapshot = build_snapshot_locked()
+                if snapshot is not None:
+                    await self.put_persisted_session(umo, snapshot)
         except Exception as exc:  # noqa: BLE001
             self._log("debug", "AstrNa 持久化群聊上下文失败: %s", exc)
 
@@ -318,41 +349,46 @@ class GroupChatContextOptimizerModule:
         if not umo:
             return
 
-        raw_records = getattr(group_context, "raw_records", None)
-        if hasattr(raw_records, "get") and raw_records.get(umo):
-            return
-
-        session = await self.get_persisted_session(umo)
-        records = sanitize_string_list(get_config_value(session, "records", []))
-        if not records:
-            return
-
-        record_ids = sanitize_string_list(get_config_value(session, "record_ids", []))
-        if len(record_ids) != len(records):
-            record_ids = build_fallback_record_ids(len(records))
-
-        max_cnt = self.resolve_group_message_max_cnt(group_context, event)
-        records = records[-max_cnt:]
-        record_ids = record_ids[-len(records) :]
-
-        lock_getter = getattr(group_context, "_get_lock", None)
-        lock = lock_getter(umo) if callable(lock_getter) else None
-
-        async def restore_locked() -> None:
-            raw_map = getattr(group_context, "raw_records", None)
-            ids_map = getattr(group_context, "_record_ids", None)
-            if raw_map is None:
-                return
-            raw_map[umo] = deque(records)
-            if ids_map is not None:
-                ids_map[umo] = deque(record_ids)
-
         try:
-            if lock is None:
-                await restore_locked()
-            else:
-                async with lock:
-                    await restore_locked()
+            async with self.get_session_persistence_lock(umo):
+                session = await self.get_persisted_session(umo)
+                records = sanitize_string_list(
+                    get_config_value(session, "records", []),
+                )
+                if not records:
+                    return
+
+                record_ids = sanitize_string_list(
+                    get_config_value(session, "record_ids", []),
+                )
+                if len(record_ids) != len(records):
+                    record_ids = build_fallback_record_ids(len(records))
+
+                max_cnt = self.resolve_group_message_max_cnt(group_context, event)
+                records = records[-max_cnt:]
+                record_ids = record_ids[-len(records) :]
+                lock_getter = getattr(group_context, "_get_lock", None)
+                group_lock = lock_getter(umo) if callable(lock_getter) else None
+
+                def restore_locked() -> bool:
+                    raw_map = getattr(group_context, "raw_records", None)
+                    ids_map = getattr(group_context, "_record_ids", None)
+                    if raw_map is None:
+                        return False
+                    if hasattr(raw_map, "get") and raw_map.get(umo):
+                        return False
+                    raw_map[umo] = deque(records)
+                    if ids_map is not None:
+                        ids_map[umo] = deque(record_ids)
+                    return True
+
+                if group_lock is None:
+                    restored = restore_locked()
+                else:
+                    async with group_lock:
+                        restored = restore_locked()
+            if not restored:
+                return
             self._log(
                 "debug",
                 "AstrNa 已从 KV 恢复群聊上下文: session=%s, records=%s",
@@ -362,14 +398,30 @@ class GroupChatContextOptimizerModule:
         except Exception as exc:  # noqa: BLE001
             self._log("debug", "AstrNa 恢复群聊上下文失败: %s", exc)
 
-    async def delete_persisted_group_context(self, event: Any) -> None:
+    async def delete_persisted_group_context(
+        self,
+        event: Any,
+        *,
+        lock_held: bool = False,
+    ) -> None:
         umo = getattr(event, "unified_msg_origin", "")
         if not umo:
             return
         try:
-            await self.remove_persisted_session(umo)
+            if lock_held:
+                await self.remove_persisted_session(umo)
+            else:
+                async with self.get_session_persistence_lock(umo):
+                    await self.remove_persisted_session(umo)
         except Exception as exc:  # noqa: BLE001
             self._log("debug", "AstrNa 删除持久化群聊上下文失败: %s", exc)
+
+    def get_session_persistence_lock(self, umo: str) -> asyncio.Lock:
+        lock = self._session_persistence_locks.get(umo)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_persistence_locks[umo] = lock
+        return lock
 
     def build_group_context_snapshot(
         self,
@@ -420,33 +472,40 @@ class GroupChatContextOptimizerModule:
         return 300
 
     async def get_persisted_session(self, umo: str) -> dict[str, Any] | None:
-        state = await self.ensure_persisted_state_loaded()
-        sessions = get_config_value(state, "sessions", {})
-        if isinstance(sessions, dict):
-            session = sessions.get(umo)
-            if isinstance(session, dict):
-                return session
+        async with self._persisted_state_lock:
+            state = await self._ensure_persisted_state_loaded_locked()
+            sessions = get_config_value(state, "sessions", {})
+            if isinstance(sessions, dict):
+                session = sessions.get(umo)
+                if isinstance(session, dict):
+                    return normalize_persisted_session(session)
         return None
 
     async def put_persisted_session(self, umo: str, session: dict[str, Any]) -> None:
-        state = await self.ensure_persisted_state_loaded()
-        sessions = get_config_value(state, "sessions", {})
-        if not isinstance(sessions, dict):
-            sessions = {}
-        sessions[umo] = session
-        state["sessions"] = trim_persisted_sessions(sessions)
-        await self.save_persisted_state(state)
+        async with self._persisted_state_lock:
+            state = await self._ensure_persisted_state_loaded_locked()
+            sessions = get_config_value(state, "sessions", {})
+            if not isinstance(sessions, dict):
+                sessions = {}
+            sessions[umo] = session
+            state["sessions"] = trim_persisted_sessions(sessions)
+            await self._save_persisted_state_locked(state)
 
     async def remove_persisted_session(self, umo: str) -> None:
-        state = await self.ensure_persisted_state_loaded()
-        sessions = get_config_value(state, "sessions", {})
-        if isinstance(sessions, dict) and umo in sessions:
-            sessions = dict(sessions)
-            sessions.pop(umo, None)
-            state["sessions"] = sessions
-            await self.save_persisted_state(state)
+        async with self._persisted_state_lock:
+            state = await self._ensure_persisted_state_loaded_locked()
+            sessions = get_config_value(state, "sessions", {})
+            if isinstance(sessions, dict) and umo in sessions:
+                sessions = dict(sessions)
+                sessions.pop(umo, None)
+                state["sessions"] = sessions
+                await self._save_persisted_state_locked(state)
 
     async def ensure_persisted_state_loaded(self) -> dict[str, Any]:
+        async with self._persisted_state_lock:
+            return await self._ensure_persisted_state_loaded_locked()
+
+    async def _ensure_persisted_state_loaded_locked(self) -> dict[str, Any]:
         if self._persisted_state_loaded:
             return self._persisted_state
 
@@ -466,6 +525,10 @@ class GroupChatContextOptimizerModule:
         return self._persisted_state
 
     async def save_persisted_state(self, state: dict[str, Any]) -> None:
+        async with self._persisted_state_lock:
+            await self._save_persisted_state_locked(state)
+
+    async def _save_persisted_state_locked(self, state: dict[str, Any]) -> None:
         self._persisted_state = normalize_persisted_state(state)
         putter = getattr(self.kv_store, "put_kv_data", None)
         if not callable(putter):
@@ -948,6 +1011,13 @@ def normalize_persisted_state(state: Any) -> dict[str, Any]:
     }
 
 
+def normalize_persisted_session(session: Any) -> dict[str, Any]:
+    normalized = normalize_persisted_state(
+        {"sessions": {"session": session}},
+    )
+    return normalized["sessions"].get("session", {})
+
+
 def trim_persisted_sessions(sessions: dict[str, Any]) -> dict[str, Any]:
     valid_items = [
         (umo, session)
@@ -1215,38 +1285,6 @@ def build_fallback_context_text(
 
 def normalize_provider_id(value: Any) -> str:
     return str(value or "").strip()
-
-
-def mark_wrapper_active(wrapper: Any, original: Any) -> None:
-    try:
-        wrapper._astrna_wrapper_active = True
-        wrapper._astrna_wrapped_original = original
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def mark_wrapper_inactive(wrapper: Any) -> None:
-    if wrapper is None:
-        return
-    try:
-        wrapper._astrna_wrapper_active = False
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def unwrap_inactive_wrapper(func: Any) -> Any:
-    seen: set[int] = set()
-    while (
-        callable(func)
-        and getattr(func, "_astrna_wrapper_active", True) is False
-        and id(func) not in seen
-    ):
-        seen.add(id(func))
-        original = getattr(func, "_astrna_wrapped_original", None)
-        if not callable(original) or original is func:
-            break
-        func = original
-    return func
 
 
 def load_group_chat_context_cls() -> type | None:
