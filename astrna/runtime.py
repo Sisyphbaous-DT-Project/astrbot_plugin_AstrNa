@@ -26,6 +26,7 @@ from .modules.output_length_limiter import (
 from .modules.quoted_image_input import QuotedImageInputModule
 from .modules.reply_target_history import ReplyTargetHistoryModule
 from .modules.send_message_to_user import SendMessageToUserModule
+from .modules.tool_history_context import ToolHistoryContextModule
 
 
 DEFAULT_CONFIG = {
@@ -40,6 +41,7 @@ DEFAULT_CONFIG = {
     "forward_node_hard_limit": FORWARD_NODE_HARD_LIMIT_DEFAULT,
     "optimize_dynamic_system_prompt": False,
     "optimize_image_history_context": False,
+    "optimize_tool_history_context": False,
     "optimize_quoted_image_input": False,
     "optimize_group_chat_context": False,
     "group_chat_context_compress_provider_id": "",
@@ -89,6 +91,7 @@ class AstrNaRuntime:
             kv_store=kv_store,
         )
         self.image_history_context = ImageHistoryContextModule(logger=logger)
+        self.tool_history_context = ToolHistoryContextModule(logger=logger)
         self.quoted_image_input = QuotedImageInputModule(logger=logger)
         self.image_caption = ImageCaptionModule(logger=logger)
         self.send_message_to_user = SendMessageToUserModule(logger=logger)
@@ -142,6 +145,8 @@ class AstrNaRuntime:
             self.dynamic_system_prompt.install()
         if self.config.get("optimize_image_history_context", False):
             self.image_history_context.install()
+        if self.config.get("optimize_tool_history_context", False):
+            self.tool_history_context.install()
         self.reply_target_history.install()
         if self.config.get("fix_deepseek_v4_400", False):
             self.deepseek_v4_400.install()
@@ -170,6 +175,12 @@ class AstrNaRuntime:
             self.image_history_context.sanitize_request(req)
         else:
             self.image_history_context.terminate()
+
+        if self.config.get("optimize_tool_history_context", False):
+            self.tool_history_context.install()
+            self.tool_history_context.sanitize_request(req)
+        else:
+            self.tool_history_context.terminate()
 
         if self.config.get("optimize_quoted_image_input", False):
             await self.quoted_image_input.optimize(event, req)
@@ -437,6 +448,7 @@ class AstrNaRuntime:
         self.long_reply_context.terminate()
         self.forward_nodes.terminate()
         self.dynamic_system_prompt.terminate()
+        self.tool_history_context.terminate()
         self.image_history_context.terminate()
         self.image_caption.terminate()
         self.send_message_to_user.terminate()

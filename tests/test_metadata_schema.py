@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.4.1"
+    assert metadata["version"] == "1.4.2"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -40,6 +40,7 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "optimize_long_reply_context",
         "optimize_dynamic_system_prompt",
         "optimize_image_history_context",
+        "optimize_tool_history_context",
         "optimize_quoted_image_input",
         "optimize_group_chat_context",
         "group_chat_context_compress_provider_id",
@@ -124,6 +125,17 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
     assert "data:image" in schema["optimize_image_history_context"]["hint"]
     assert "本轮用户新发图片" in schema["optimize_image_history_context"]["hint"]
     assert "默认关闭" in schema["optimize_image_history_context"]["hint"]
+    assert schema["optimize_tool_history_context"]["type"] == "bool"
+    assert (
+        schema["optimize_tool_history_context"]["description"]
+        == "优化工具调用历史上下文"
+    )
+    assert schema["optimize_tool_history_context"]["default"] is False
+    assert "tool_calls" in schema["optimize_tool_history_context"]["hint"]
+    assert "tool_call_id" in schema["optimize_tool_history_context"]["hint"]
+    assert "当前轮正在执行的工具调用" in schema["optimize_tool_history_context"]["hint"]
+    assert "工具定义 schema" in schema["optimize_tool_history_context"]["hint"]
+    assert "默认关闭" in schema["optimize_tool_history_context"]["hint"]
     assert schema["optimize_quoted_image_input"]["type"] == "bool"
     assert (
         schema["optimize_quoted_image_input"]["description"]
@@ -372,5 +384,6 @@ def test_changelog_contains_release_notes():
     assert "## 1.3.8" in changelog
     assert "## 1.3.9" in changelog
     assert "## 1.4.1" in changelog
+    assert "## 1.4.2" in changelog
     assert "## 1.2.5" in changelog
     assert "## 1.2.4" in changelog
