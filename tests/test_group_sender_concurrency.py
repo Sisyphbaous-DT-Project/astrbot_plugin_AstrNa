@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import sys
 import time
@@ -11,6 +12,7 @@ import pytest
 
 from astrna.modules.group_sender_concurrency import (
     GroupSenderConcurrencyModule,
+    SendRound,
     merge_histories,
 )
 
@@ -63,6 +65,8 @@ class DummyEvent:
         sender_id="user-1",
         group_id="group-1",
         private=False,
+        send_log=None,
+        send_delay=0.0,
     ):
         self.unified_msg_origin = umo
         self._sender_id = sender_id
@@ -70,6 +74,9 @@ class DummyEvent:
         self._private = private
         self.message_obj = DummyMessageObj(group_id=group_id, sender_id=sender_id)
         self._extras = {}
+        self.sent = []
+        self.send_log = send_log
+        self.send_delay = send_delay
 
     def is_private_chat(self):
         return self._private
@@ -91,6 +98,16 @@ class DummyEvent:
 
     def get_message_outline(self):
         return "补充消息"
+
+    async def send(self, message):
+        if self.send_log is not None:
+            self.send_log.append((self._sender_id, message))
+        if self.send_delay:
+            await asyncio.sleep(self.send_delay)
+        self.sent.append(message)
+
+    async def send_streaming(self, generator, use_fallback=False):
+        self.sent.append((generator, use_fallback))
 
 
 class DummyConversation:
@@ -164,6 +181,9 @@ def fake_astrbot_modules(monkeypatch):
     internal_module = ModuleType(
         "astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal"
     )
+    third_party_module = ModuleType(
+        "astrbot.core.pipeline.process_stage.method.agent_sub_stages.third_party"
+    )
     respond_module = ModuleType("astrbot.core.pipeline.respond.stage")
     event_module = ModuleType("astrbot.core.platform.astr_message_event")
 
@@ -172,7 +192,13 @@ def fake_astrbot_modules(monkeypatch):
             from astrbot.core.utils.session_lock import session_lock_manager
 
             async with session_lock_manager.acquire_lock(event.unified_msg_origin):
-                await asyncio.sleep(0.03)
+                await asyncio.sleep(event.get_extra("llm_delay") or 0.03)
+                if event.get_extra("no_output"):
+                    return
+                for message in event.get_extra("intermediate_messages") or []:
+                    await event.send(message)
+                for context, session, message in event.get_extra("context_sends") or []:
+                    await context.send_message(session, message)
                 yield "done"
 
         async def _save_to_history(
@@ -191,6 +217,23 @@ def fake_astrbot_modules(monkeypatch):
             )
 
     internal_module.InternalAgentSubStage = InternalAgentSubStage
+
+    class ThirdPartyAgentSubStage:
+        async def process(self, event, provider_wake_prefix=""):
+            event.set_extra(
+                "third_party_streaming_observed",
+                event.get_extra("enable_streaming"),
+            )
+            await asyncio.sleep(event.get_extra("llm_delay") or 0.03)
+            if event.get_extra("no_output"):
+                return
+            for message in event.get_extra("intermediate_messages") or []:
+                await event.send(message)
+            for context, session, message in event.get_extra("context_sends") or []:
+                await context.send_message(session, message)
+            yield "done"
+
+    third_party_module.ThirdPartyAgentSubStage = ThirdPartyAgentSubStage
 
     class RespondStage:
         async def process(self, event):
@@ -249,6 +292,7 @@ def fake_astrbot_modules(monkeypatch):
     internal_module.try_capture_follow_up = try_capture_follow_up
 
     conversation_module = ModuleType("astrbot.core.conversation_mgr")
+    context_module = ModuleType("astrbot.core.star.context")
 
     class ConversationManager:
         def __init__(self, conversation=None):
@@ -280,6 +324,22 @@ def fake_astrbot_modules(monkeypatch):
 
     conversation_module.ConversationManager = ConversationManager
 
+    class Context:
+        def __init__(self, send_log=None, send_delay=0.0):
+            self.sent = []
+            self.send_log = send_log
+            self.send_delay = send_delay
+
+        async def send_message(self, session, message_chain):
+            if self.send_log is not None:
+                self.send_log.append((str(session), message_chain))
+            if self.send_delay:
+                await asyncio.sleep(self.send_delay)
+            self.sent.append((str(session), message_chain))
+            return True
+
+    context_module.Context = Context
+
     module_names = [
         "astrbot",
         "astrbot.core",
@@ -290,6 +350,7 @@ def fake_astrbot_modules(monkeypatch):
         "astrbot.core.pipeline.process_stage.method.agent_sub_stages",
         "astrbot.core.pipeline.respond",
         "astrbot.core.platform",
+        "astrbot.core.star",
     ]
     for name in module_names:
         monkeypatch.setitem(sys.modules, name, ModuleType(name))
@@ -298,6 +359,11 @@ def fake_astrbot_modules(monkeypatch):
         sys.modules,
         "astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal",
         internal_module,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "astrbot.core.pipeline.process_stage.method.agent_sub_stages.third_party",
+        third_party_module,
     )
     monkeypatch.setitem(
         sys.modules,
@@ -311,15 +377,18 @@ def fake_astrbot_modules(monkeypatch):
         event_module,
     )
     monkeypatch.setitem(sys.modules, "astrbot.core.conversation_mgr", conversation_module)
+    monkeypatch.setitem(sys.modules, "astrbot.core.star.context", context_module)
 
     yield SimpleNamespace(
         session_lock=session_lock,
         internal_cls=InternalAgentSubStage,
+        third_party_cls=ThirdPartyAgentSubStage,
         respond_cls=RespondStage,
         event_cls=AstrMessageEvent,
         follow_up=follow_up_module,
         internal_module=internal_module,
         conversation_cls=ConversationManager,
+        context_cls=Context,
     )
 
     GroupSenderConcurrencyModule.restore_patch()
@@ -406,10 +475,15 @@ def test_install_and_terminate_restore_patch(fake_astrbot_modules):
     module = GroupSenderConcurrencyModule(logger=DummyLogger())
     original_lock = fake_astrbot_modules.session_lock.acquire_lock
     original_process = fake_astrbot_modules.internal_cls.process
+    original_third_party_process = fake_astrbot_modules.third_party_cls.process
 
     assert module.install() is True
     assert fake_astrbot_modules.session_lock.acquire_lock is not original_lock
     assert fake_astrbot_modules.internal_cls.process is not original_process
+    assert (
+        fake_astrbot_modules.third_party_cls.process
+        is not original_third_party_process
+    )
 
     assert module.install() is True
     patched_lock = fake_astrbot_modules.session_lock.acquire_lock
@@ -426,6 +500,190 @@ def test_install_and_terminate_restore_patch(fake_astrbot_modules):
         is False
     )
     assert fake_astrbot_modules.internal_cls.process is original_process
+    assert (
+        fake_astrbot_modules.third_party_cls.process
+        is original_third_party_process
+    )
+
+
+def test_missing_context_send_message_rolls_back_all_patches(
+    fake_astrbot_modules,
+):
+    original_lock = fake_astrbot_modules.session_lock.acquire_lock
+    original_process = fake_astrbot_modules.internal_cls.process
+    fake_astrbot_modules.context_cls.send_message = None
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+
+    assert module.install() is False
+    current_lock = fake_astrbot_modules.session_lock.acquire_lock
+    assert current_lock.__self__ is original_lock.__self__
+    assert current_lock.__func__ is original_lock.__func__
+    assert fake_astrbot_modules.internal_cls.process is original_process
+
+
+def test_context_send_wrapper_keeps_third_party_outer_and_reopens(
+    fake_astrbot_modules,
+):
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    original = fake_astrbot_modules.context_cls.send_message
+    assert module.install() is True
+    astrna_wrapper = fake_astrbot_modules.context_cls.send_message
+    calls = []
+
+    @functools.wraps(astrna_wrapper)
+    async def third_party_outer(context_self, *args, **kwargs):
+        calls.append("outer")
+        return await astrna_wrapper(context_self, *args, **kwargs)
+
+    fake_astrbot_modules.context_cls.send_message = third_party_outer
+    module.terminate()
+
+    assert fake_astrbot_modules.context_cls.send_message is third_party_outer
+    context = fake_astrbot_modules.context_cls()
+    assert run(context.send_message("aiocqhttp:GroupMessage:group-1", "plain")) is True
+    assert calls == ["outer"]
+
+    assert module.install() is True
+    reopened = fake_astrbot_modules.context_cls.send_message
+    assert reopened is not third_party_outer
+    assert run(context.send_message("aiocqhttp:GroupMessage:group-1", "again")) is True
+    assert calls == ["outer", "outer"]
+
+    module.terminate()
+    assert fake_astrbot_modules.context_cls.send_message is third_party_outer
+    assert getattr(third_party_outer, "__wrapped__", None) is astrna_wrapper
+    assert original is not astrna_wrapper
+
+
+def test_third_party_process_outer_survives_terminate_and_reopen(
+    fake_astrbot_modules,
+):
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    original = fake_astrbot_modules.third_party_cls.process
+    assert module.install() is True
+    astrna_wrapper = fake_astrbot_modules.third_party_cls.process
+    calls = []
+
+    @functools.wraps(astrna_wrapper)
+    async def third_party_outer(stage_self, *args, **kwargs):
+        calls.append("outer")
+        async for item in astrna_wrapper(stage_self, *args, **kwargs):
+            yield item
+
+    fake_astrbot_modules.third_party_cls.process = third_party_outer
+    module.terminate()
+
+    stage = fake_astrbot_modules.third_party_cls()
+    collect_async_generator(stage.process(DummyEvent(), ""))
+    assert calls == ["outer"]
+    assert fake_astrbot_modules.third_party_cls.process is third_party_outer
+
+    reopened_module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert reopened_module.install() is True
+    collect_async_generator(stage.process(DummyEvent(), ""))
+    assert calls == ["outer", "outer"]
+
+    reopened_module.terminate()
+    assert fake_astrbot_modules.third_party_cls.process is third_party_outer
+    assert getattr(third_party_outer, "__wrapped__", None) is astrna_wrapper
+    assert original is not astrna_wrapper
+
+
+def test_event_send_outer_survives_round_cleanup(fake_astrbot_modules):
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert module.install() is True
+    stage = fake_astrbot_modules.internal_cls()
+    event = DummyEvent(sender_id="user-a")
+    original_send = event.send
+
+    async def scenario():
+        async for _ in stage.process(event, ""):
+            astrna_send = event.send
+
+            @functools.wraps(astrna_send)
+            async def third_party_outer(*args, **kwargs):
+                return await astrna_send(*args, **kwargs)
+
+            event.send = third_party_outer
+            await event.send("final")
+        return third_party_outer, astrna_send
+
+    third_party_outer, astrna_send = run(scenario())
+
+    assert event.send is third_party_outer
+    assert getattr(third_party_outer, "__wrapped__", None) is astrna_send
+    assert event.sent == ["final"]
+    run(event.send("after-round"))
+    assert event.sent == ["final", "after-round"]
+    assert not getattr(astrna_send, "_astrna_wrapper_active")
+    assert event.send is not original_send
+
+
+def test_new_module_instance_reopen_keeps_in_flight_group_send_queue(
+    fake_astrbot_modules,
+):
+    old_module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert old_module.install() is True
+    stage = fake_astrbot_modules.internal_cls()
+    holder = DummyEvent(sender_id="holder")
+    next_event = DummyEvent(sender_id="next")
+    holder_started = asyncio.Event()
+    holder_release = asyncio.Event()
+    next_started = asyncio.Event()
+
+    async def holder_send(_message):
+        holder_started.set()
+        await holder_release.wait()
+
+    async def next_send(_message):
+        next_started.set()
+
+    holder.send = holder_send
+    next_event.send = next_send
+
+    async def run_round(current_stage, event, message):
+        async for _ in current_stage.process(event, ""):
+            await event.send(message)
+
+    async def scenario():
+        holder_task = asyncio.create_task(run_round(stage, holder, "holder"))
+        await asyncio.wait_for(holder_started.wait(), timeout=0.2)
+
+        old_module.terminate()
+        new_module = GroupSenderConcurrencyModule(logger=DummyLogger())
+        assert new_module.install() is True
+        reopened_stage = fake_astrbot_modules.internal_cls()
+        next_task = asyncio.create_task(run_round(reopened_stage, next_event, "next"))
+        await asyncio.sleep(0.02)
+        assert not next_started.is_set()
+
+        holder_release.set()
+        await asyncio.gather(holder_task, next_task)
+        new_module.terminate()
+
+    run(scenario())
+
+    assert next_started.is_set()
+
+
+def test_send_round_setup_failure_restores_event_context(
+    fake_astrbot_modules,
+    monkeypatch,
+):
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert module.install() is True
+    stage = fake_astrbot_modules.internal_cls()
+    event = DummyEvent(sender_id="user-a")
+
+    def fail_build_send_round(_event):
+        raise RuntimeError("setup failed")
+
+    monkeypatch.setattr(module, "build_send_round", fail_build_send_round)
+
+    with pytest.raises(RuntimeError, match="setup failed"):
+        collect_async_generator(stage.process(event, ""))
+
+    assert module.build_lock_scope_for_session(event.unified_msg_origin) is None
 
 
 def test_follow_up_mirror_entries_keep_their_own_originals(fake_astrbot_modules):
@@ -501,6 +759,468 @@ def test_group_different_senders_can_enter_llm_concurrently(fake_astrbot_modules
         "aiocqhttp:GroupMessage:group-1#astrna_sender:user-a",
         "aiocqhttp:GroupMessage:group-1#astrna_sender:user-b",
     ]
+
+
+def test_group_whole_reply_rounds_do_not_interleave(fake_astrbot_modules):
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert module.install() is True
+    stage = fake_astrbot_modules.internal_cls()
+    send_log = []
+    event_a = DummyEvent(sender_id="user-a", send_log=send_log, send_delay=0.01)
+    event_b = DummyEvent(sender_id="user-b", send_log=send_log, send_delay=0.01)
+
+    async def run_round(event, messages):
+        async for _ in stage.process(event, ""):
+            for message in messages:
+                await event.send(message)
+
+    async def run_two():
+        await asyncio.gather(
+            run_round(event_a, ["a-1", "a-2"]),
+            run_round(event_b, ["b-1", "b-2"]),
+        )
+
+    run(run_two())
+
+    assert [message for _, message in send_log] in (
+        ["a-1", "a-2", "b-1", "b-2"],
+        ["b-1", "b-2", "a-1", "a-2"],
+    )
+
+
+def test_third_party_rounds_disable_streaming_and_do_not_interleave(
+    fake_astrbot_modules,
+):
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert module.install() is True
+    stage = fake_astrbot_modules.third_party_cls()
+    send_log = []
+    context = fake_astrbot_modules.context_cls(send_log=send_log, send_delay=0.01)
+    event_a = DummyEvent(sender_id="user-a", send_log=send_log, send_delay=0.01)
+    event_b = DummyEvent(sender_id="user-b", send_log=send_log, send_delay=0.01)
+    for event, prefix in ((event_a, "a"), (event_b, "b")):
+        event.set_extra("enable_streaming", True)
+        event.set_extra("intermediate_messages", [f"{prefix}-tool"])
+        event.set_extra(
+            "context_sends",
+            [(context, event.unified_msg_origin, f"{prefix}-context")],
+        )
+
+    async def run_round(event, final_message):
+        async for _ in stage.process(event, ""):
+            await event.send(final_message)
+
+    async def run_two():
+        await asyncio.gather(
+            run_round(event_a, "a-final"),
+            run_round(event_b, "b-final"),
+        )
+
+    run(run_two())
+
+    messages = [message for _, message in send_log]
+    assert messages in (
+        ["a-tool", "a-context", "a-final", "b-tool", "b-context", "b-final"],
+        ["b-tool", "b-context", "b-final", "a-tool", "a-context", "a-final"],
+    )
+    assert event_a.get_extra("third_party_streaming_observed") is False
+    assert event_b.get_extra("third_party_streaming_observed") is False
+
+
+def test_first_ready_round_sends_first(fake_astrbot_modules):
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert module.install() is True
+    stage = fake_astrbot_modules.internal_cls()
+    send_log = []
+    event_slow = DummyEvent(sender_id="slow", send_log=send_log)
+    event_fast = DummyEvent(sender_id="fast", send_log=send_log)
+    event_slow.set_extra("llm_delay", 0.04)
+    event_fast.set_extra("llm_delay", 0.005)
+
+    async def run_round(event, message):
+        async for _ in stage.process(event, ""):
+            await event.send(message)
+
+    async def run_two():
+        await asyncio.gather(
+            run_round(event_slow, "slow-final"),
+            run_round(event_fast, "fast-final"),
+        )
+
+    run(run_two())
+
+    assert [message for _, message in send_log] == ["fast-final", "slow-final"]
+
+
+def test_tool_message_and_final_reply_stay_in_one_round(fake_astrbot_modules):
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert module.install() is True
+    stage = fake_astrbot_modules.internal_cls()
+    send_log = []
+    event_a = DummyEvent(sender_id="user-a", send_log=send_log, send_delay=0.01)
+    event_b = DummyEvent(sender_id="user-b", send_log=send_log, send_delay=0.01)
+    event_a.set_extra("intermediate_messages", ["a-tool"])
+    event_b.set_extra("intermediate_messages", ["b-tool"])
+
+    async def run_round(event, final):
+        async for _ in stage.process(event, ""):
+            await event.send(final)
+
+    async def run_two():
+        await asyncio.gather(
+            run_round(event_a, "a-final"),
+            run_round(event_b, "b-final"),
+        )
+
+    run(run_two())
+
+    assert [message for _, message in send_log] in (
+        ["a-tool", "a-final", "b-tool", "b-final"],
+        ["b-tool", "b-final", "a-tool", "a-final"],
+    )
+
+
+def test_current_group_context_send_joins_round_cross_session_does_not(
+    fake_astrbot_modules,
+):
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert module.install() is True
+    stage = fake_astrbot_modules.internal_cls()
+    send_log = []
+    context = fake_astrbot_modules.context_cls(send_log=send_log, send_delay=0.01)
+    event_a = DummyEvent(sender_id="user-a", send_log=send_log, send_delay=0.01)
+    event_b = DummyEvent(sender_id="user-b", send_log=send_log, send_delay=0.01)
+    event_a.set_extra(
+        "context_sends",
+        [(context, event_a.unified_msg_origin, "a-current")],
+    )
+    event_b.set_extra(
+        "context_sends",
+        [(context, "aiocqhttp:GroupMessage:other-group", "b-cross")],
+    )
+
+    async def run_round(event, final):
+        async for _ in stage.process(event, ""):
+            await event.send(final)
+
+    async def run_two():
+        await asyncio.gather(
+            run_round(event_a, "a-final"),
+            run_round(event_b, "b-final"),
+        )
+
+    run(run_two())
+
+    messages = [message for _, message in send_log]
+    between_a_messages = messages[
+        messages.index("a-current") + 1 : messages.index("a-final")
+    ]
+    assert "b-final" not in between_a_messages
+    assert set(messages) == {"a-current", "a-final", "b-cross", "b-final"}
+
+
+def test_downstream_context_send_after_yield_keeps_round_context(
+    fake_astrbot_modules,
+):
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert module.install() is True
+    stage = fake_astrbot_modules.internal_cls()
+    send_log = []
+    context = fake_astrbot_modules.context_cls(send_log=send_log, send_delay=0.01)
+    event_a = DummyEvent(sender_id="user-a", send_log=send_log, send_delay=0.01)
+    event_b = DummyEvent(sender_id="user-b", send_log=send_log, send_delay=0.01)
+
+    async def run_round(event, context_message, final):
+        async for _ in stage.process(event, ""):
+            await context.send_message(event.unified_msg_origin, context_message)
+            await event.send(final)
+
+    async def run_two():
+        await asyncio.gather(
+            run_round(event_a, "a-context", "a-final"),
+            run_round(event_b, "b-context", "b-final"),
+        )
+
+    run(run_two())
+
+    assert [message for _, message in send_log] in (
+        ["a-context", "a-final", "b-context", "b-final"],
+        ["b-context", "b-final", "a-context", "a-final"],
+    )
+
+
+def test_group_round_disables_streaming_before_original_process(
+    fake_astrbot_modules,
+):
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert module.install() is True
+    stage = fake_astrbot_modules.internal_cls()
+    group_event = DummyEvent(sender_id="user-a")
+    private_event = DummyEvent(
+        umo="aiocqhttp:FriendMessage:user-a",
+        sender_id="user-a",
+        group_id="",
+        private=True,
+    )
+
+    collect_async_generator(stage.process(group_event, ""))
+    collect_async_generator(stage.process(private_event, ""))
+
+    assert group_event.get_extra("enable_streaming") is False
+    assert private_event.get_extra("enable_streaming") is None
+
+
+def test_live_and_missing_sender_keep_streaming_setting(fake_astrbot_modules):
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert module.install() is True
+    stage = fake_astrbot_modules.internal_cls()
+    live_event = DummyEvent(sender_id="user-a")
+    live_event.set_extra("action_type", "live")
+    missing_sender_event = DummyEvent(sender_id="")
+
+    collect_async_generator(stage.process(live_event, ""))
+    collect_async_generator(stage.process(missing_sender_event, ""))
+
+    assert live_event.get_extra("enable_streaming") is None
+    assert missing_sender_event.get_extra("enable_streaming") is None
+
+
+def test_different_groups_can_send_concurrently(fake_astrbot_modules):
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert module.install() is True
+    stage = fake_astrbot_modules.internal_cls()
+    send_log = []
+    event_a = DummyEvent(
+        umo="aiocqhttp:GroupMessage:group-a",
+        group_id="group-a",
+        sender_id="user-a",
+        send_log=send_log,
+        send_delay=0.03,
+    )
+    event_b = DummyEvent(
+        umo="aiocqhttp:GroupMessage:group-b",
+        group_id="group-b",
+        sender_id="user-b",
+        send_log=send_log,
+        send_delay=0.03,
+    )
+
+    async def run_round(event, message):
+        async for _ in stage.process(event, ""):
+            await event.send(message)
+
+    async def run_two():
+        start = time.perf_counter()
+        await asyncio.gather(
+            run_round(event_a, "a-final"),
+            run_round(event_b, "b-final"),
+        )
+        return time.perf_counter() - start
+
+    elapsed = run(run_two())
+
+    assert elapsed < 0.085
+    assert {message for _, message in send_log} == {"a-final", "b-final"}
+
+
+def test_send_failure_releases_group_round(fake_astrbot_modules):
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert module.install() is True
+    stage = fake_astrbot_modules.internal_cls()
+    send_log = []
+    failed_event = DummyEvent(sender_id="user-a", send_log=send_log)
+    next_event = DummyEvent(sender_id="user-b", send_log=send_log)
+
+    async def failing_send(message):
+        send_log.append(("user-a", message))
+        raise RuntimeError("send failed")
+
+    failed_event.send = failing_send
+
+    async def fail_round():
+        with pytest.raises(RuntimeError, match="send failed"):
+            async for _ in stage.process(failed_event, ""):
+                await failed_event.send("a-final")
+
+    async def run_round():
+        async for _ in stage.process(next_event, ""):
+            await next_event.send("b-final")
+
+    async def run_two():
+        await asyncio.gather(fail_round(), run_round())
+
+    run(run_two())
+
+    assert [message for _, message in send_log] == ["a-final", "b-final"]
+
+
+def test_cancelled_waiter_does_not_block_next_round(fake_astrbot_modules):
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert module.install() is True
+    stage = fake_astrbot_modules.internal_cls()
+    send_log = []
+    holder = DummyEvent(sender_id="holder", send_log=send_log, send_delay=0.05)
+    cancelled = DummyEvent(sender_id="cancelled", send_log=send_log)
+    next_event = DummyEvent(sender_id="next", send_log=send_log)
+
+    async def run_round(event, message):
+        async for _ in stage.process(event, ""):
+            await event.send(message)
+
+    async def scenario():
+        holder_task = asyncio.create_task(run_round(holder, "holder-final"))
+        await asyncio.sleep(0.035)
+        cancelled_task = asyncio.create_task(
+            run_round(cancelled, "cancelled-final"),
+        )
+        await asyncio.sleep(0.005)
+        cancelled_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_task
+        await holder_task
+        await asyncio.wait_for(run_round(next_event, "next-final"), timeout=0.2)
+
+    run(scenario())
+
+    assert [message for _, message in send_log] == ["holder-final", "next-final"]
+
+
+def test_cancelled_lock_holder_releases_next_round(fake_astrbot_modules):
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert module.install() is True
+    stage = fake_astrbot_modules.internal_cls()
+    holder = DummyEvent(sender_id="holder")
+    next_event = DummyEvent(sender_id="next")
+    holder_started = asyncio.Event()
+    next_started = asyncio.Event()
+
+    async def holder_send(_message):
+        holder_started.set()
+        await asyncio.Event().wait()
+
+    async def next_send(_message):
+        next_started.set()
+
+    holder.send = holder_send
+    next_event.send = next_send
+
+    async def run_round(event, message):
+        async for _ in stage.process(event, ""):
+            await event.send(message)
+
+    async def scenario():
+        holder_task = asyncio.create_task(run_round(holder, "holder-final"))
+        await asyncio.wait_for(holder_started.wait(), timeout=0.2)
+        next_task = asyncio.create_task(run_round(next_event, "next-final"))
+        await asyncio.sleep(0.01)
+        assert not next_started.is_set()
+
+        holder_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await holder_task
+        assert not module.get_group_send_lock(holder.unified_msg_origin).locked()
+        assert not getattr(
+            holder.send,
+            "_astrna_group_sender_concurrency_send_patch",
+            False,
+        )
+        await asyncio.wait_for(next_task, timeout=0.2)
+
+    run(scenario())
+    assert next_started.is_set()
+
+
+def test_no_output_round_never_acquires_group_send_lock(fake_astrbot_modules):
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert module.install() is True
+    stage = fake_astrbot_modules.internal_cls()
+    event = DummyEvent(sender_id="silent")
+    event.set_extra("no_output", True)
+
+    async def scenario():
+        group_lock = module.get_group_send_lock(event.unified_msg_origin)
+        assert await collect_one(stage.process(event, "")) == []
+        assert not group_lock.locked()
+
+    run(scenario())
+
+
+def test_closed_waiting_round_releases_lock_acquired_after_close():
+    async def scenario():
+        group_lock = asyncio.Lock()
+        await group_lock.acquire()
+        send_round = SendRound("aiocqhttp:GroupMessage:group-1", group_lock)
+        acquire_task = asyncio.create_task(send_round.ensure_acquired())
+        await asyncio.sleep(0)
+
+        send_round.close_now()
+        group_lock.release()
+
+        assert await acquire_task is False
+        assert send_round.closed is True
+        assert send_round.acquired is False
+        assert not group_lock.locked()
+
+    run(scenario())
+
+
+def test_repeated_cancellation_cannot_interrupt_round_cleanup(
+    fake_astrbot_modules,
+):
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+
+    class ControlledStage:
+        async def process(self, _event, _provider_wake_prefix=""):
+            yield None
+            await asyncio.Event().wait()
+
+    type(module)._active_module = module
+    assert module._install_stage_process_patch(ControlledStage, third_party=False)
+    module._installed = True
+    event = DummyEvent(sender_id="user-a")
+
+    async def scenario():
+        group_lock = module.get_group_send_lock(event.unified_msg_origin)
+        await group_lock.acquire()
+        child_started = asyncio.Event()
+
+        async def owner():
+            generator = ControlledStage().process(event, "")
+            await generator.__anext__()
+
+            async def detached_send():
+                child_started.set()
+                await event.send("detached")
+
+            child = asyncio.create_task(detached_send())
+            await child_started.wait()
+            await asyncio.sleep(0)
+            try:
+                await generator.__anext__()
+            finally:
+                child.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await child
+
+        task = asyncio.create_task(owner())
+        await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=0.2)
+
+        assert not getattr(
+            event.send,
+            "_astrna_group_sender_concurrency_send_patch",
+            False,
+        )
+        group_lock.release()
+        await event.send("post-cancel")
+        assert not group_lock.locked()
+        assert event.sent == ["post-cancel"]
+
+    run(scenario())
 
 
 def test_same_group_sender_stays_serial(fake_astrbot_modules):

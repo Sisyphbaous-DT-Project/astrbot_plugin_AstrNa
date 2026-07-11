@@ -4,7 +4,8 @@ import asyncio
 import contextvars
 import inspect
 import json
-from dataclasses import dataclass
+import weakref
+from dataclasses import dataclass, field
 from typing import Any
 
 from ..utils.patching import (
@@ -26,6 +27,14 @@ _CURRENT_SAVE_CONTEXT: contextvars.ContextVar[SaveContext | None] = (
         default=None,
     )
 )
+_CURRENT_SEND_ROUND: contextvars.ContextVar[SendRound | None] = contextvars.ContextVar(
+    "astrna_group_sender_concurrency_send_round",
+    default=None,
+)
+_GROUP_SEND_LOCKS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    weakref.WeakValueDictionary[str, asyncio.Lock],
+] = weakref.WeakKeyDictionary()
 
 
 @dataclass
@@ -47,6 +56,39 @@ class SaveContext:
     base_history: list[Any]
 
 
+@dataclass
+class SendRound:
+    umo: str
+    group_lock: asyncio.Lock
+    acquired: bool = False
+    closed: bool = False
+    _state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    async def ensure_acquired(self) -> bool:
+        async with self._state_lock:
+            if self.closed:
+                return False
+            if not self.acquired:
+                await self.group_lock.acquire()
+                if self.closed:
+                    self.group_lock.release()
+                    return False
+                self.acquired = True
+            return True
+
+    async def close(self) -> None:
+        async with self._state_lock:
+            self.close_now()
+
+    def close_now(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.acquired:
+            self.group_lock.release()
+            self.acquired = False
+
+
 class GroupSenderConcurrencyModule:
     """解锁群聊内不同发送者的 LLM 并发，同时保护会话历史写入。"""
 
@@ -54,9 +96,13 @@ class GroupSenderConcurrencyModule:
     _original_acquire_lock: Any = None
     _internal_stage_cls: type | None = None
     _original_internal_process: Any = None
+    _third_party_stage_cls: type | None = None
+    _original_third_party_process: Any = None
     _original_save_to_history: Any = None
     _conversation_manager_cls: type | None = None
     _original_update_conversation: Any = None
+    _context_cls: type | None = None
+    _original_context_send_message: Any = None
     _follow_up_module: Any = None
     _internal_module: Any = None
     _original_register_active_runner: Any = None
@@ -67,8 +113,10 @@ class GroupSenderConcurrencyModule:
     _original_internal_try_capture_follow_up: Any = None
     _lock_wrapper: Any = None
     _process_wrapper: Any = None
+    _third_party_process_wrapper: Any = None
     _save_history_wrapper: Any = None
     _update_conversation_wrapper: Any = None
+    _context_send_message_wrapper: Any = None
     _register_runner_wrapper: Any = None
     _unregister_runner_wrapper: Any = None
     _try_capture_wrapper: Any = None
@@ -92,12 +140,14 @@ class GroupSenderConcurrencyModule:
         lock_installed = self._install_session_lock_patch()
         save_installed = self._install_save_history_patch()
         update_installed = self._install_update_conversation_patch()
+        context_send_installed = self._install_context_send_message_patch()
         follow_up_installed = self._install_follow_up_patch()
         if not (
             process_installed
             and lock_installed
             and save_installed
             and update_installed
+            and context_send_installed
             and follow_up_installed
         ):
             type(self).restore_patch()
@@ -122,8 +172,10 @@ class GroupSenderConcurrencyModule:
     def restore_patch(cls) -> None:
         mark_wrapper_inactive(cls._lock_wrapper)
         mark_wrapper_inactive(cls._process_wrapper)
+        mark_wrapper_inactive(cls._third_party_process_wrapper)
         mark_wrapper_inactive(cls._save_history_wrapper)
         mark_wrapper_inactive(cls._update_conversation_wrapper)
+        mark_wrapper_inactive(cls._context_send_message_wrapper)
         mark_wrapper_inactive(cls._register_runner_wrapper)
         mark_wrapper_inactive(cls._unregister_runner_wrapper)
         mark_wrapper_inactive(cls._try_capture_wrapper)
@@ -153,6 +205,16 @@ class GroupSenderConcurrencyModule:
                     )
 
         if (
+            cls._third_party_stage_cls is not None
+            and cls._original_third_party_process is not None
+        ):
+            current = getattr(cls._third_party_stage_cls, "process", None)
+            if same_callable(current, cls._third_party_process_wrapper):
+                cls._third_party_stage_cls.process = unwrap_inactive_wrapper(
+                    cls._original_third_party_process,
+                )
+
+        if (
             cls._conversation_manager_cls is not None
             and cls._original_update_conversation is not None
         ):
@@ -160,6 +222,13 @@ class GroupSenderConcurrencyModule:
             if same_callable(current, cls._update_conversation_wrapper):
                 cls._conversation_manager_cls.update_conversation = (
                     unwrap_inactive_wrapper(cls._original_update_conversation)
+                )
+
+        if cls._context_cls is not None and cls._original_context_send_message is not None:
+            current = getattr(cls._context_cls, "send_message", None)
+            if same_callable(current, cls._context_send_message_wrapper):
+                cls._context_cls.send_message = unwrap_inactive_wrapper(
+                    cls._original_context_send_message,
                 )
 
         if cls._follow_up_module is not None:
@@ -221,8 +290,12 @@ class GroupSenderConcurrencyModule:
         cls._internal_stage_cls = None
         cls._original_internal_process = None
         cls._original_save_to_history = None
+        cls._third_party_stage_cls = None
+        cls._original_third_party_process = None
         cls._conversation_manager_cls = None
         cls._original_update_conversation = None
+        cls._context_cls = None
+        cls._original_context_send_message = None
         cls._follow_up_module = None
         cls._internal_module = None
         cls._original_register_active_runner = None
@@ -233,8 +306,10 @@ class GroupSenderConcurrencyModule:
         cls._original_internal_try_capture_follow_up = None
         cls._lock_wrapper = None
         cls._process_wrapper = None
+        cls._third_party_process_wrapper = None
         cls._save_history_wrapper = None
         cls._update_conversation_wrapper = None
+        cls._context_send_message_wrapper = None
         cls._register_runner_wrapper = None
         cls._unregister_runner_wrapper = None
         cls._try_capture_wrapper = None
@@ -245,23 +320,46 @@ class GroupSenderConcurrencyModule:
 
     def _install_process_patch(self) -> bool:
         internal_stage_cls = load_internal_stage_cls()
-        if internal_stage_cls is None:
+        third_party_stage_cls = load_third_party_stage_cls()
+        if internal_stage_cls is None or third_party_stage_cls is None:
             return False
 
-        original = getattr(internal_stage_cls, "process", None)
+        return self._install_stage_process_patch(
+            internal_stage_cls,
+            third_party=False,
+        ) and self._install_stage_process_patch(
+            third_party_stage_cls,
+            third_party=True,
+        )
+
+    def _install_stage_process_patch(
+        self,
+        stage_cls: type,
+        *,
+        third_party: bool,
+    ) -> bool:
+        module_cls = type(self)
+        stage_attr = "_third_party_stage_cls" if third_party else "_internal_stage_cls"
+        original_attr = (
+            "_original_third_party_process"
+            if third_party
+            else "_original_internal_process"
+        )
+        wrapper_attr = (
+            "_third_party_process_wrapper" if third_party else "_process_wrapper"
+        )
+
+        installed_stage_cls = getattr(module_cls, stage_attr)
+        if installed_stage_cls is not None and installed_stage_cls is not stage_cls:
+            module_cls.restore_patch()
+
+        original = getattr(stage_cls, "process", None)
         if not callable(original):
             return False
 
-        module_cls = type(self)
-        if (
-            module_cls._internal_stage_cls is not None
-            and module_cls._internal_stage_cls is not internal_stage_cls
-        ):
-            module_cls.restore_patch()
-
-        if module_cls._original_internal_process is None:
-            module_cls._internal_stage_cls = internal_stage_cls
-            module_cls._original_internal_process = original
+        if getattr(module_cls, original_attr) is None:
+            setattr(module_cls, stage_attr, stage_cls)
+            setattr(module_cls, original_attr, original)
             original_process = original
 
             async def astrna_internal_process(
@@ -270,10 +368,41 @@ class GroupSenderConcurrencyModule:
                 *args: Any,
                 **kwargs: Any,
             ):
+                active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_internal_process):
+                    active_module = None
                 token = None
-                if is_wrapper_active(astrna_internal_process):
-                    token = _CURRENT_EVENT.set(event)
+                send_round = None
+                send_round_token = None
+                restore_event_sends = None
+                owner_task = asyncio.current_task()
+                task_done_callback = None
                 try:
+                    if active_module is not None:
+                        token = _CURRENT_EVENT.set(event)
+                        send_round = active_module.build_send_round(event)
+                        if send_round is not None:
+                            active_module.disable_streaming(event)
+                            send_round_token = _CURRENT_SEND_ROUND.set(send_round)
+                            restore_event_sends = active_module.install_event_send_guards(
+                                event,
+                                send_round,
+                            )
+
+                            def cleanup_on_task_done(_task: asyncio.Task[Any]) -> None:
+                                try:
+                                    send_round.close_now()
+                                except Exception as exc:  # noqa: BLE001
+                                    active_module._log(
+                                        "warning",
+                                        "AstrNa 兜底释放群聊整轮发送锁失败: %s",
+                                        exc,
+                                    )
+                                restore_event_sends()
+
+                            task_done_callback = cleanup_on_task_done
+                            if owner_task is not None:
+                                owner_task.add_done_callback(task_done_callback)
                     processed = original_process(stage_self, event, *args, **kwargs)
                     if inspect.isasyncgen(processed):
                         async for item in processed:
@@ -283,13 +412,35 @@ class GroupSenderConcurrencyModule:
                     else:
                         return
                 finally:
+                    if send_round is not None:
+                        try:
+                            send_round.close_now()
+                        except Exception as exc:  # noqa: BLE001
+                            if active_module is not None:
+                                active_module._log(
+                                    "warning",
+                                    "AstrNa 释放群聊整轮发送锁失败: %s",
+                                    exc,
+                                )
+                    if restore_event_sends is not None:
+                        restore_event_sends()
+                    if send_round_token is not None:
+                        try:
+                            _CURRENT_SEND_ROUND.reset(send_round_token)
+                        except ValueError:
+                            pass
                     if token is not None:
-                        _CURRENT_EVENT.reset(token)
+                        try:
+                            _CURRENT_EVENT.reset(token)
+                        except ValueError:
+                            pass
+                    if owner_task is not None and task_done_callback is not None:
+                        owner_task.remove_done_callback(task_done_callback)
 
             astrna_internal_process._astrna_group_sender_concurrency_patch = True
             mark_wrapper_active(astrna_internal_process, original_process)
-            module_cls._process_wrapper = astrna_internal_process
-            internal_stage_cls.process = astrna_internal_process
+            setattr(module_cls, wrapper_attr, astrna_internal_process)
+            stage_cls.process = astrna_internal_process
 
         return True
 
@@ -462,6 +613,55 @@ class GroupSenderConcurrencyModule:
             )
             module_cls._update_conversation_wrapper = astrna_update_conversation
             conversation_manager_cls.update_conversation = astrna_update_conversation
+
+        return True
+
+    def _install_context_send_message_patch(self) -> bool:
+        context_cls = load_context_cls()
+        if context_cls is None:
+            return False
+
+        original = getattr(context_cls, "send_message", None)
+        if not callable(original):
+            return False
+
+        module_cls = type(self)
+        if module_cls._context_cls is not None and module_cls._context_cls is not context_cls:
+            module_cls.restore_patch()
+
+        if module_cls._original_context_send_message is None:
+            module_cls._context_cls = context_cls
+            module_cls._original_context_send_message = original
+            original_send_message = original
+
+            async def astrna_context_send_message(
+                context_self: Any,
+                *args: Any,
+                **kwargs: Any,
+            ) -> Any:
+                active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_context_send_message):
+                    active_module = None
+                send_round = _CURRENT_SEND_ROUND.get()
+                session = args[0] if args else kwargs.get("session")
+                if (
+                    active_module is None
+                    or send_round is None
+                    or normalize_session(session) != send_round.umo
+                ):
+                    return await original_send_message(context_self, *args, **kwargs)
+                return await active_module.send_with_round(
+                    send_round,
+                    original_send_message,
+                    context_self,
+                    *args,
+                    **kwargs,
+                )
+
+            astrna_context_send_message._astrna_group_sender_concurrency_patch = True
+            mark_wrapper_active(astrna_context_send_message, original_send_message)
+            module_cls._context_send_message_wrapper = astrna_context_send_message
+            context_cls.send_message = astrna_context_send_message
 
         return True
 
@@ -668,6 +868,93 @@ class GroupSenderConcurrencyModule:
             gate = GroupConcurrencyGate()
             self._group_gates[loop_key] = gate
         return gate
+
+    def get_group_send_lock(self, umo: str) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        loop_locks = _GROUP_SEND_LOCKS.get(loop)
+        if loop_locks is None:
+            loop_locks = weakref.WeakValueDictionary()
+            _GROUP_SEND_LOCKS[loop] = loop_locks
+        lock = loop_locks.get(umo)
+        if lock is None:
+            lock = asyncio.Lock()
+            loop_locks[umo] = lock
+        return lock
+
+    def build_send_round(self, event: Any) -> SendRound | None:
+        sender_key = build_group_sender_key(event)
+        if sender_key is None:
+            return None
+        return SendRound(
+            umo=sender_key.umo,
+            group_lock=self.get_group_send_lock(sender_key.umo),
+        )
+
+    def disable_streaming(self, event: Any) -> None:
+        setter = getattr(event, "set_extra", None)
+        if callable(setter):
+            setter("enable_streaming", False)
+
+    def install_event_send_guards(self, event: Any, send_round: SendRound):
+        guards: list[tuple[str, Any, Any]] = []
+        for name in ("send", "send_streaming"):
+            original = getattr(event, name, None)
+            if not callable(original):
+                continue
+
+            def build_guard(original_send: Any) -> Any:
+                async def guarded_send(*args: Any, **kwargs: Any) -> Any:
+                    if not is_wrapper_active(guarded_send):
+                        return await maybe_await(original_send(*args, **kwargs))
+                    return await self.send_with_round(
+                        send_round,
+                        original_send,
+                        *args,
+                        **kwargs,
+                    )
+
+                guarded_send._astrna_group_sender_concurrency_send_patch = True
+                mark_wrapper_active(guarded_send, original_send)
+                return guarded_send
+
+            wrapper = build_guard(original)
+            try:
+                setattr(event, name, wrapper)
+            except Exception:  # noqa: BLE001
+                mark_wrapper_inactive(wrapper)
+                continue
+            guards.append((name, original, wrapper))
+
+        def restore() -> None:
+            for name, original, wrapper in reversed(guards):
+                mark_wrapper_inactive(wrapper)
+                try:
+                    current = getattr(event, name, None)
+                    if same_callable(current, wrapper):
+                        setattr(event, name, unwrap_inactive_wrapper(original))
+                except Exception:  # noqa: BLE001
+                    continue
+
+        return restore
+
+    async def send_with_round(
+        self,
+        send_round: SendRound,
+        original_send: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        try:
+            await send_round.ensure_acquired()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self._log(
+                "warning",
+                "AstrNa 获取群聊整轮发送锁失败，已放行原发送: %s",
+                exc,
+            )
+        return await maybe_await(original_send(*args, **kwargs))
 
     def wrap_group_lock(self, lock_scope: LockScope, original_lock: Any) -> Any:
         group_gate = self.get_group_gate(lock_scope.umo)
@@ -975,6 +1262,17 @@ def load_internal_stage_cls() -> type | None:
         return None
 
 
+def load_third_party_stage_cls() -> type | None:
+    try:
+        from astrbot.core.pipeline.process_stage.method.agent_sub_stages.third_party import (
+            ThirdPartyAgentSubStage,
+        )
+
+        return ThirdPartyAgentSubStage
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def load_internal_module() -> Any:
     try:
         from astrbot.core.pipeline.process_stage.method.agent_sub_stages import internal
@@ -1000,6 +1298,22 @@ def load_conversation_manager_cls() -> type | None:
         return ConversationManager
     except Exception:  # noqa: BLE001
         return None
+
+
+def load_context_cls() -> type | None:
+    try:
+        from astrbot.core.star.context import Context
+
+        return Context
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def normalize_session(session: Any) -> str:
+    try:
+        return str(session).strip()
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 class GroupConcurrencyGate:
