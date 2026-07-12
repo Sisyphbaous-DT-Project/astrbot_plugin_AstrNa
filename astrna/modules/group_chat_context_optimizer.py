@@ -7,8 +7,16 @@ import uuid
 import weakref
 from collections import deque
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
+from ..utils.event_stop import (
+    STOP_AWARE_COMPLETED,
+    STOP_AWARE_EVENT_STOPPED,
+    StopAwareResult,
+    StopAwareScopeToken,
+    StopAwareTaskScope,
+    event_requests_stop,
+)
 from ..utils.patching import (
     is_wrapper_active,
     mark_wrapper_active,
@@ -83,10 +91,13 @@ class GroupChatContextOptimizerModule:
         *,
         provider_id: str = "",
         kv_store: Any | None = None,
+        request_activity_end_callback: Callable[[Any], None] | None = None,
     ):
         self.context = context
         self.logger = logger
         self.kv_store = kv_store
+        self._request_activity_end_callback = request_activity_end_callback
+        self._stop_scope = StopAwareTaskScope()
         self.provider_id = normalize_provider_id(provider_id)
         self._installed = False
         self._missing_context_warned = False
@@ -102,6 +113,33 @@ class GroupChatContextOptimizerModule:
 
     def configure(self, *, provider_id: str = "") -> None:
         self.provider_id = normalize_provider_id(provider_id)
+
+    def set_request_activity_end_callback(
+        self,
+        callback: Callable[[Any], None] | None,
+    ) -> None:
+        self._request_activity_end_callback = callback
+
+    def _release_request_activity_if_stopped(self, event: Any) -> None:
+        callback = self._request_activity_end_callback
+        if callback is None:
+            return
+        try:
+            callback(event)
+        except Exception as exc:  # noqa: BLE001
+            self._log("debug", "AstrNa 释放 stop 请求活动计数失败: %s", exc)
+
+    def cancel_pending_operations(self) -> None:
+        self._stop_scope.cancel_pending()
+
+    async def drain_pending_operations(self, *, timeout: float | None = None) -> bool:
+        return await self._stop_scope.drain(timeout=timeout)
+
+    def capture_lifecycle_token(self) -> StopAwareScopeToken:
+        return self._stop_scope.capture_token()
+
+    def is_lifecycle_token_current(self, token: StopAwareScopeToken) -> bool:
+        return self._stop_scope.is_token_current(token)
 
     def install(self) -> bool:
         module_cls = type(self)
@@ -150,10 +188,12 @@ class GroupChatContextOptimizerModule:
                     active_module = None
                 if active_module is None:
                     return await original_on_req_llm(group_context_self, event, req)
+                lifecycle_token = active_module.capture_lifecycle_token()
                 return await active_module.optimize_on_req_llm(
                     group_context_self,
                     event,
                     req,
+                    lifecycle_token=lifecycle_token,
                 )
 
             astrna_group_context_on_req_llm._astrna_group_context_optimizer_patch = True
@@ -171,11 +211,37 @@ class GroupChatContextOptimizerModule:
                 active_module = module_cls._active_module
                 if not is_wrapper_active(astrna_group_context_handle_message):
                     active_module = None
-                if active_module is not None:
-                    await active_module.restore_group_context(group_context_self, event)
+                if active_module is not None and event_requests_stop(event):
+                    return None
+                lifecycle_token = (
+                    active_module.capture_lifecycle_token()
+                    if active_module is not None
+                    else None
+                )
+                if (
+                    active_module is not None
+                    and lifecycle_token is not None
+                    and active_module.is_lifecycle_token_current(lifecycle_token)
+                ):
+                    await active_module.restore_group_context(
+                        group_context_self,
+                        event,
+                        lifecycle_token=lifecycle_token,
+                    )
+                if event_requests_stop(event):
+                    return None
                 ret = await original_handle_message(group_context_self, event)
-                if active_module is not None:
-                    await active_module.persist_group_context(group_context_self, event)
+                if (
+                    active_module is not None
+                    and lifecycle_token is not None
+                    and active_module.is_lifecycle_token_current(lifecycle_token)
+                    and not event_requests_stop(event)
+                ):
+                    await active_module.persist_group_context(
+                        group_context_self,
+                        event,
+                        lifecycle_token=lifecycle_token,
+                    )
                 return ret
 
             astrna_group_context_handle_message._astrna_group_context_optimizer_patch = True
@@ -230,6 +296,7 @@ class GroupChatContextOptimizerModule:
         return True
 
     def terminate(self) -> None:
+        self.cancel_pending_operations()
         module_cls = type(self)
         if self._installed and module_cls._active_module is self:
             module_cls.restore_patch()
@@ -272,27 +339,51 @@ class GroupChatContextOptimizerModule:
         group_context: Any,
         event: Any,
         req: Any,
+        *,
+        lifecycle_token: StopAwareScopeToken | None = None,
     ) -> Any:
+        lifecycle_token = lifecycle_token or self.capture_lifecycle_token()
+        if event_requests_stop(event):
+            self._release_request_activity_if_stopped(event)
+            return None
+        if not self.is_lifecycle_token_current(lifecycle_token):
+            return None
+
         group_selection = await self.build_rolling_group_context_selection(
             group_context,
             event,
+            lifecycle_token=lifecycle_token,
         )
+        if event_requests_stop(event):
+            self._release_request_activity_if_stopped(event)
+            return None
+        if not self.is_lifecycle_token_current(lifecycle_token):
+            return None
         if not group_selection.records:
             return None
 
         current_identity = build_current_message_identity(event, req)
         fallback_records = group_selection.records[-GROUP_CONTEXT_FALLBACK_RECENT_RECORDS:]
-        ensure_extra_user_content_parts(req).append(
-            create_temp_text_part(
-                build_fallback_context_text(
-                    fallback_records,
-                    current_identity=current_identity,
-                ),
+        fallback_part = create_temp_text_part(
+            build_fallback_context_text(
+                fallback_records,
+                current_identity=current_identity,
             ),
         )
+        if event_requests_stop(event):
+            self._release_request_activity_if_stopped(event)
+            return None
+        if not self.is_lifecycle_token_current(lifecycle_token):
+            return None
 
         provider = self.resolve_compress_provider(group_context)
         if provider is None:
+            if event_requests_stop(event):
+                self._release_request_activity_if_stopped(event)
+                return None
+            if not self.is_lifecycle_token_current(lifecycle_token):
+                return None
+            ensure_extra_user_content_parts(req).append(fallback_part)
             return None
 
         prompt = build_compression_prompt(
@@ -302,18 +393,44 @@ class GroupChatContextOptimizerModule:
             ),
             group_context=format_group_history_block(group_selection.records),
         )
-        compressed = await self.compress_with_provider(provider, prompt)
-        if not is_valid_compression_output(compressed):
+        if event_requests_stop(event):
+            self._release_request_activity_if_stopped(event)
+            return None
+        if not self.is_lifecycle_token_current(lifecycle_token):
             return None
 
-        ensure_extra_user_content_parts(req).append(
-            create_temp_text_part(
-                build_injected_context_text(
-                    compressed,
-                    current_identity=current_identity,
-                ),
-            ),
+        compression_result = await self.compress_with_provider(
+            provider,
+            prompt,
+            event,
+            lifecycle_token=lifecycle_token,
         )
+        if compression_result.status != STOP_AWARE_COMPLETED:
+            if compression_result.status == STOP_AWARE_EVENT_STOPPED:
+                self._release_request_activity_if_stopped(event)
+            return None
+
+        compressed = str(compression_result.value or "")
+        parts = [fallback_part]
+        if is_valid_compression_output(compressed):
+            parts.append(
+                create_temp_text_part(
+                    build_injected_context_text(
+                        compressed,
+                        current_identity=current_identity,
+                    ),
+                )
+            )
+        if event_requests_stop(event):
+            self._release_request_activity_if_stopped(event)
+            return None
+        if not self.is_lifecycle_token_current(lifecycle_token):
+            return None
+
+        # 最后一次检查和提交之间不允许 await，避免 stop 后写入半成品。
+        ensure_extra_user_content_parts(req).extend(parts)
+        if len(parts) == 1:
+            return None
         self._log(
             "debug",
             "AstrNa 已压缩群聊上下文: session=%s",
@@ -321,7 +438,18 @@ class GroupChatContextOptimizerModule:
         )
         return None
 
-    async def persist_group_context(self, group_context: Any, event: Any) -> None:
+    async def persist_group_context(
+        self,
+        group_context: Any,
+        event: Any,
+        *,
+        lifecycle_token: StopAwareScopeToken | None = None,
+    ) -> None:
+        lifecycle_token = lifecycle_token or self.capture_lifecycle_token()
+        if event_requests_stop(event):
+            return
+        if not self.is_lifecycle_token_current(lifecycle_token):
+            return
         umo = getattr(event, "unified_msg_origin", "")
         if not umo:
             return
@@ -339,19 +467,47 @@ class GroupChatContextOptimizerModule:
                 else:
                     async with group_lock:
                         snapshot = build_snapshot_locked()
-                if snapshot is not None:
-                    await self.put_persisted_session(umo, snapshot)
+                if (
+                    snapshot is not None
+                    and not event_requests_stop(event)
+                    and self.is_lifecycle_token_current(lifecycle_token)
+                ):
+                    await self.put_persisted_session(
+                        umo,
+                        snapshot,
+                        event=event,
+                        lifecycle_token=lifecycle_token,
+                    )
         except Exception as exc:  # noqa: BLE001
             self._log("debug", "AstrNa 持久化群聊上下文失败: %s", exc)
 
-    async def restore_group_context(self, group_context: Any, event: Any) -> None:
+    async def restore_group_context(
+        self,
+        group_context: Any,
+        event: Any,
+        *,
+        lifecycle_token: StopAwareScopeToken | None = None,
+    ) -> None:
+        lifecycle_token = lifecycle_token or self.capture_lifecycle_token()
+        if event_requests_stop(event):
+            return
+        if not self.is_lifecycle_token_current(lifecycle_token):
+            return
         umo = getattr(event, "unified_msg_origin", "")
         if not umo:
             return
 
         try:
             async with self.get_session_persistence_lock(umo):
-                session = await self.get_persisted_session(umo)
+                session = await self.get_persisted_session(
+                    umo,
+                    event=event,
+                    lifecycle_token=lifecycle_token,
+                )
+                if event_requests_stop(event) or not self.is_lifecycle_token_current(
+                    lifecycle_token,
+                ):
+                    return
                 records = sanitize_string_list(
                     get_config_value(session, "records", []),
                 )
@@ -371,6 +527,10 @@ class GroupChatContextOptimizerModule:
                 group_lock = lock_getter(umo) if callable(lock_getter) else None
 
                 def restore_locked() -> bool:
+                    if event_requests_stop(event) or not self.is_lifecycle_token_current(
+                        lifecycle_token,
+                    ):
+                        return False
                     raw_map = getattr(group_context, "raw_records", None)
                     ids_map = getattr(group_context, "_record_ids", None)
                     if raw_map is None:
@@ -471,9 +631,47 @@ class GroupChatContextOptimizerModule:
                 pass
         return 300
 
-    async def get_persisted_session(self, umo: str) -> dict[str, Any] | None:
+    def _persistence_operation_current(
+        self,
+        *,
+        event: Any | None = None,
+        lifecycle_token: StopAwareScopeToken | None = None,
+    ) -> bool:
+        if event is not None and event_requests_stop(event):
+            return False
+        if lifecycle_token is not None and not self.is_lifecycle_token_current(
+            lifecycle_token,
+        ):
+            return False
+        return True
+
+    async def get_persisted_session(
+        self,
+        umo: str,
+        *,
+        event: Any | None = None,
+        lifecycle_token: StopAwareScopeToken | None = None,
+    ) -> dict[str, Any] | None:
+        if not self._persistence_operation_current(
+            event=event,
+            lifecycle_token=lifecycle_token,
+        ):
+            return None
         async with self._persisted_state_lock:
-            state = await self._ensure_persisted_state_loaded_locked()
+            if not self._persistence_operation_current(
+                event=event,
+                lifecycle_token=lifecycle_token,
+            ):
+                return None
+            state = await self._ensure_persisted_state_loaded_locked(
+                event=event,
+                lifecycle_token=lifecycle_token,
+            )
+            if not self._persistence_operation_current(
+                event=event,
+                lifecycle_token=lifecycle_token,
+            ):
+                return None
             sessions = get_config_value(state, "sessions", {})
             if isinstance(sessions, dict):
                 session = sessions.get(umo)
@@ -481,15 +679,49 @@ class GroupChatContextOptimizerModule:
                     return normalize_persisted_session(session)
         return None
 
-    async def put_persisted_session(self, umo: str, session: dict[str, Any]) -> None:
+    async def put_persisted_session(
+        self,
+        umo: str,
+        session: dict[str, Any],
+        *,
+        event: Any | None = None,
+        lifecycle_token: StopAwareScopeToken | None = None,
+    ) -> None:
+        if not self._persistence_operation_current(
+            event=event,
+            lifecycle_token=lifecycle_token,
+        ):
+            return
         async with self._persisted_state_lock:
-            state = await self._ensure_persisted_state_loaded_locked()
+            if not self._persistence_operation_current(
+                event=event,
+                lifecycle_token=lifecycle_token,
+            ):
+                return
+            state = await self._ensure_persisted_state_loaded_locked(
+                event=event,
+                lifecycle_token=lifecycle_token,
+            )
+            if not self._persistence_operation_current(
+                event=event,
+                lifecycle_token=lifecycle_token,
+            ):
+                return
             sessions = get_config_value(state, "sessions", {})
             if not isinstance(sessions, dict):
                 sessions = {}
             sessions[umo] = session
             state["sessions"] = trim_persisted_sessions(sessions)
-            await self._save_persisted_state_locked(state)
+            if not self._persistence_operation_current(
+                event=event,
+                lifecycle_token=lifecycle_token,
+            ):
+                return
+            await self._save_persisted_state_locked(
+                state,
+                event=event,
+                lifecycle_token=lifecycle_token,
+            )
 
     async def remove_persisted_session(self, umo: str) -> None:
         async with self._persisted_state_lock:
@@ -505,8 +737,19 @@ class GroupChatContextOptimizerModule:
         async with self._persisted_state_lock:
             return await self._ensure_persisted_state_loaded_locked()
 
-    async def _ensure_persisted_state_loaded_locked(self) -> dict[str, Any]:
+    async def _ensure_persisted_state_loaded_locked(
+        self,
+        *,
+        event: Any | None = None,
+        lifecycle_token: StopAwareScopeToken | None = None,
+    ) -> dict[str, Any]:
         if self._persisted_state_loaded:
+            return self._persisted_state
+
+        if not self._persistence_operation_current(
+            event=event,
+            lifecycle_token=lifecycle_token,
+        ):
             return self._persisted_state
 
         getter = getattr(self.kv_store, "get_kv_data", None)
@@ -520,6 +763,12 @@ class GroupChatContextOptimizerModule:
             self._log("debug", "AstrNa 读取持久化群聊上下文失败: %s", exc)
             state = None
 
+        if not self._persistence_operation_current(
+            event=event,
+            lifecycle_token=lifecycle_token,
+        ):
+            return self._persisted_state
+
         self._persisted_state = normalize_persisted_state(state)
         self._persisted_state_loaded = True
         return self._persisted_state
@@ -528,10 +777,26 @@ class GroupChatContextOptimizerModule:
         async with self._persisted_state_lock:
             await self._save_persisted_state_locked(state)
 
-    async def _save_persisted_state_locked(self, state: dict[str, Any]) -> None:
+    async def _save_persisted_state_locked(
+        self,
+        state: dict[str, Any],
+        *,
+        event: Any | None = None,
+        lifecycle_token: StopAwareScopeToken | None = None,
+    ) -> None:
+        if not self._persistence_operation_current(
+            event=event,
+            lifecycle_token=lifecycle_token,
+        ):
+            return
         self._persisted_state = normalize_persisted_state(state)
         putter = getattr(self.kv_store, "put_kv_data", None)
         if not callable(putter):
+            return
+        if not self._persistence_operation_current(
+            event=event,
+            lifecycle_token=lifecycle_token,
+        ):
             return
         try:
             await putter(GROUP_CONTEXT_PERSISTENCE_KEY, self._persisted_state)
@@ -580,10 +845,13 @@ class GroupChatContextOptimizerModule:
         self,
         group_context: Any,
         event: Any,
+        *,
+        lifecycle_token: StopAwareScopeToken | None = None,
     ) -> str:
         selection = await self.build_rolling_group_context_selection(
             group_context,
             event,
+            lifecycle_token=lifecycle_token,
         )
         if not selection.records:
             return ""
@@ -593,9 +861,24 @@ class GroupChatContextOptimizerModule:
         self,
         group_context: Any,
         event: Any,
+        *,
+        lifecycle_token: StopAwareScopeToken | None = None,
     ) -> RollingGroupContextSelection:
+        lifecycle_token = lifecycle_token or self.capture_lifecycle_token()
         umo = getattr(event, "unified_msg_origin", "")
-        await self.restore_group_context(group_context, event)
+        if event_requests_stop(event):
+            return RollingGroupContextSelection([])
+        if not self.is_lifecycle_token_current(lifecycle_token):
+            return RollingGroupContextSelection([])
+        await self.restore_group_context(
+            group_context,
+            event,
+            lifecycle_token=lifecycle_token,
+        )
+        if event_requests_stop(event):
+            return RollingGroupContextSelection([])
+        if not self.is_lifecycle_token_current(lifecycle_token):
+            return RollingGroupContextSelection([])
         record_id = get_event_extra(event, "_group_context_record_id", None)
         prompt_idx = get_event_extra(event, "_group_context_raw_idx", -1)
 
@@ -617,6 +900,10 @@ class GroupChatContextOptimizerModule:
             return RollingGroupContextSelection(await read_records())
 
         async with lock:
+            if event_requests_stop(event) or not self.is_lifecycle_token_current(
+                lifecycle_token,
+            ):
+                return RollingGroupContextSelection([])
             return RollingGroupContextSelection(await read_records())
 
     def _read_rolling_group_context_locked(
@@ -693,28 +980,51 @@ class GroupChatContextOptimizerModule:
                 return provider
         return None
 
-    async def compress_with_provider(self, provider: Any, prompt: str) -> str:
+    async def compress_with_provider(
+        self,
+        provider: Any,
+        prompt: str,
+        event: Any,
+        *,
+        lifecycle_token: StopAwareScopeToken | None = None,
+    ) -> StopAwareResult[str]:
+        lifecycle_token = lifecycle_token or self.capture_lifecycle_token()
         text_chat = getattr(provider, "text_chat", None)
         if not callable(text_chat):
-            return ""
+            return StopAwareResult(STOP_AWARE_COMPLETED, "")
         try:
-            response = await asyncio.wait_for(
-                text_chat(
+            result = await self._stop_scope.run(
+                event,
+                lambda: text_chat(
                     prompt=prompt,
                     session_id=f"astrna_group_context_{uuid.uuid4().hex}",
                     contexts=[],
                     persist=False,
                 ),
                 timeout=GROUP_CONTEXT_COMPRESS_TIMEOUT_SECONDS,
+                token=lifecycle_token,
             )
+            if result.status != STOP_AWARE_COMPLETED:
+                return StopAwareResult(result.status)
+            response = result.value
+        except asyncio.TimeoutError as exc:
+            self._log(
+                "debug",
+                "AstrNa 群聊上下文压缩失败，本轮不注入原始群聊流水账: %s",
+                exc,
+            )
+            return StopAwareResult(STOP_AWARE_COMPLETED, "")
         except Exception as exc:  # noqa: BLE001
             self._log(
                 "debug",
                 "AstrNa 群聊上下文压缩失败，本轮不注入原始群聊流水账: %s",
                 exc,
             )
-            return ""
-        return str(getattr(response, "completion_text", "") or "").strip()
+            return StopAwareResult(STOP_AWARE_COMPLETED, "")
+        return StopAwareResult(
+            STOP_AWARE_COMPLETED,
+            str(getattr(response, "completion_text", "") or "").strip(),
+        )
 
     def _log(self, level: str, *args: Any) -> None:
         log = getattr(self.logger, level, None)

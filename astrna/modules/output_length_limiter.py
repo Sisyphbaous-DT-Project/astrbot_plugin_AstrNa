@@ -6,6 +6,15 @@ import re
 import uuid
 from typing import Any
 
+from ..utils.event_stop import (
+    STOP_AWARE_COMPLETED,
+    STOP_AWARE_EVENT_STOPPED,
+    STOP_AWARE_SCOPE_CANCELLED,
+    StopAwareResult,
+    StopAwareScopeToken,
+    StopAwareTaskScope,
+    event_requests_stop,
+)
 from ..utils.patching import (
     is_wrapper_active,
     mark_wrapper_active,
@@ -40,6 +49,7 @@ class OutputLengthLimiterModule:
         max_chars: int = DEFAULT_OUTPUT_LENGTH_LIMIT,
         provider_id: str = "",
         persona_id: str = "",
+        request_activity_end_callback: Any | None = None,
     ):
         self.context = context
         self.logger = logger
@@ -47,6 +57,8 @@ class OutputLengthLimiterModule:
         self.max_chars = parse_positive_int(max_chars, DEFAULT_OUTPUT_LENGTH_LIMIT)
         self.provider_id = normalize_optional_text(provider_id)
         self.persona_id = normalize_optional_text(persona_id)
+        self._request_activity_end_callback = request_activity_end_callback
+        self._stop_scope = StopAwareTaskScope()
         self._installed = False
 
     def configure(
@@ -62,6 +74,30 @@ class OutputLengthLimiterModule:
         self.provider_id = normalize_optional_text(provider_id)
         self.persona_id = normalize_optional_text(persona_id)
 
+    def set_request_activity_end_callback(self, callback: Any | None) -> None:
+        self._request_activity_end_callback = callback
+
+    def _release_request_activity_if_stopped(self, event: Any) -> None:
+        callback = self._request_activity_end_callback
+        if callback is None:
+            return
+        try:
+            callback(event)
+        except Exception as exc:  # noqa: BLE001
+            self._log("debug", "AstrNa 释放 stop 请求活动计数失败: %s", exc)
+
+    def cancel_pending_operations(self) -> None:
+        self._stop_scope.cancel_pending()
+
+    async def drain_pending_operations(self, *, timeout: float | None = None) -> bool:
+        return await self._stop_scope.drain(timeout=timeout)
+
+    def capture_lifecycle_token(self) -> StopAwareScopeToken:
+        return self._stop_scope.capture_token()
+
+    def is_lifecycle_token_current(self, token: StopAwareScopeToken) -> bool:
+        return self._stop_scope.is_token_current(token)
+
     def install(self) -> bool:
         if self._installed and type(self)._active_module is self:
             return True
@@ -76,8 +112,10 @@ class OutputLengthLimiterModule:
         self._log("info", "AstrNa 已启用输出字数限制。")
         return True
 
-    def terminate(self) -> None:
+    def terminate(self, *, cancel_pending: bool = True) -> None:
         module_cls = type(self)
+        if cancel_pending:
+            self.cancel_pending_operations()
         if self._installed and module_cls._active_module is self:
             module_cls.restore_patch()
         self._installed = False
@@ -149,11 +187,20 @@ class OutputLengthLimiterModule:
                 active_module = module_cls._active_module
                 if not is_wrapper_active(astrna_iter_llm_responses_with_fallback):
                     active_module = None
+                lifecycle_token = (
+                    active_module.capture_lifecycle_token()
+                    if active_module is not None
+                    else None
+                )
                 async for llm_response in original_method(runner_self):
-                    if active_module is None:
+                    if active_module is None or lifecycle_token is None:
                         yield llm_response
                         continue
-                    yield await active_module.optimize_response(runner_self, llm_response)
+                    yield await active_module.optimize_response(
+                        runner_self,
+                        llm_response,
+                        lifecycle_token=lifecycle_token,
+                    )
 
             astrna_iter_llm_responses_with_fallback._astrna_output_length_limiter_patch = True
             mark_wrapper_active(astrna_iter_llm_responses_with_fallback, original)
@@ -215,12 +262,42 @@ class OutputLengthLimiterModule:
         if callable(setter):
             setter("enable_streaming", False)
 
-    async def optimize_response(self, runner: Any, llm_response: Any) -> Any:
+    async def optimize_response(
+        self,
+        runner: Any,
+        llm_response: Any,
+        *,
+        lifecycle_token: StopAwareScopeToken | None = None,
+    ) -> Any:
+        event = get_runner_event(runner)
+        lifecycle_token = lifecycle_token or self.capture_lifecycle_token()
+        if not self.is_lifecycle_token_current(lifecycle_token):
+            return llm_response
+        if event_requests_stop(event):
+            self._handle_event_stop(runner, event)
+            return llm_response
         if not self.should_limit_response(runner, llm_response):
             return llm_response
 
         original_text = str(getattr(llm_response, "completion_text", "") or "")
-        cleaned_text = await self.clean_text(runner, llm_response, original_text)
+        clean_result = await self.clean_text(
+            runner,
+            llm_response,
+            original_text,
+            lifecycle_token=lifecycle_token,
+        )
+        if not self.is_lifecycle_token_current(lifecycle_token):
+            return llm_response
+        if clean_result.status == STOP_AWARE_EVENT_STOPPED:
+            self._handle_event_stop(runner, event)
+            return llm_response
+        if clean_result.status == STOP_AWARE_SCOPE_CANCELLED:
+            return llm_response
+        if event_requests_stop(event):
+            self._handle_event_stop(runner, event)
+            return llm_response
+
+        cleaned_text = str(clean_result.value or "")
         if not cleaned_text:
             cleaned_text = hard_truncate(original_text, self.max_chars)
 
@@ -231,6 +308,15 @@ class OutputLengthLimiterModule:
             len(cleaned_text),
         )
         return clone_as_assistant_response_without_reasoning(llm_response, cleaned_text)
+
+    def _handle_event_stop(self, runner: Any, event: Any) -> None:
+        request_stop = getattr(runner, "request_stop", None)
+        if callable(request_stop):
+            try:
+                request_stop()
+            except Exception as exc:  # noqa: BLE001
+                self._log("debug", "AstrNa 请求 runner stop 失败: %s", exc)
+        self._release_request_activity_if_stopped(event)
 
     def should_limit_response(self, runner: Any, llm_response: Any) -> bool:
         event = get_runner_event(runner)
@@ -249,13 +335,38 @@ class OutputLengthLimiterModule:
         text = str(getattr(llm_response, "completion_text", "") or "")
         return len(text) > self.max_chars
 
-    async def clean_text(self, runner: Any, llm_response: Any, original_text: str) -> str:
+    async def clean_text(
+        self,
+        runner: Any,
+        llm_response: Any,
+        original_text: str,
+        *,
+        lifecycle_token: StopAwareScopeToken | None = None,
+    ) -> StopAwareResult[str]:
+        event = get_runner_event(runner)
+        lifecycle_token = lifecycle_token or self.capture_lifecycle_token()
+        if event_requests_stop(event):
+            return StopAwareResult(STOP_AWARE_EVENT_STOPPED)
+        if not self.is_lifecycle_token_current(lifecycle_token):
+            return StopAwareResult(STOP_AWARE_SCOPE_CANCELLED)
+
         provider = self.resolve_provider()
         if provider is None:
             self._log("debug", "AstrNa 未配置或未找到输出清洗模型，将硬截断超长输出。")
-            return ""
+            return StopAwareResult(STOP_AWARE_COMPLETED, "")
 
-        persona_prompt = await self.resolve_persona_prompt(runner)
+        persona_result = await self._stop_scope.run(
+            event,
+            lambda: self.resolve_persona_prompt(runner),
+            token=lifecycle_token,
+        )
+        if persona_result.status != STOP_AWARE_COMPLETED:
+            return StopAwareResult(persona_result.status)
+        persona_prompt = str(persona_result.value or "")
+        if event_requests_stop(event):
+            return StopAwareResult(STOP_AWARE_EVENT_STOPPED)
+        if not self.is_lifecycle_token_current(lifecycle_token):
+            return StopAwareResult(STOP_AWARE_SCOPE_CANCELLED)
         reasoning_content = str(getattr(llm_response, "reasoning_content", "") or "").strip()
         prompt = build_cleaning_prompt(
             persona_prompt=persona_prompt,
@@ -265,7 +376,7 @@ class OutputLengthLimiterModule:
         )
         text_chat = getattr(provider, "text_chat", None)
         if not callable(text_chat):
-            return ""
+            return StopAwareResult(STOP_AWARE_COMPLETED, "")
 
         call_kwargs = {
             "prompt": prompt,
@@ -275,31 +386,56 @@ class OutputLengthLimiterModule:
             "persist": False,
         }
         try:
-            response = await asyncio.wait_for(
-                text_chat(**filter_callable_kwargs(text_chat, call_kwargs)),
+            result = await self._stop_scope.run(
+                event,
+                lambda: text_chat(**filter_callable_kwargs(text_chat, call_kwargs)),
                 timeout=OUTPUT_LENGTH_CLEAN_TIMEOUT_SECONDS,
+                token=lifecycle_token,
             )
+            if result.status != STOP_AWARE_COMPLETED:
+                return StopAwareResult(result.status)
+            response = result.value
         except TypeError as exc:
             if "persist" not in call_kwargs or not is_unexpected_keyword_error(exc, "persist"):
                 self._log("debug", "AstrNa 输出字数清洗失败，将硬截断: %s", exc)
-                return ""
+                return StopAwareResult(STOP_AWARE_COMPLETED, "")
             call_kwargs.pop("persist", None)
+            if event_requests_stop(event):
+                return StopAwareResult(STOP_AWARE_EVENT_STOPPED)
+            if not self.is_lifecycle_token_current(lifecycle_token):
+                return StopAwareResult(STOP_AWARE_SCOPE_CANCELLED)
             try:
-                response = await asyncio.wait_for(
-                    text_chat(**filter_callable_kwargs(text_chat, call_kwargs)),
+                result = await self._stop_scope.run(
+                    event,
+                    lambda: text_chat(**filter_callable_kwargs(text_chat, call_kwargs)),
                     timeout=OUTPUT_LENGTH_CLEAN_TIMEOUT_SECONDS,
+                    token=lifecycle_token,
                 )
+                if result.status != STOP_AWARE_COMPLETED:
+                    return StopAwareResult(result.status)
+                response = result.value
+            except asyncio.TimeoutError as retry_exc:
+                self._log("debug", "AstrNa 输出字数清洗重试失败，将硬截断: %s", retry_exc)
+                return StopAwareResult(STOP_AWARE_COMPLETED, "")
             except Exception as retry_exc:  # noqa: BLE001
                 self._log("debug", "AstrNa 输出字数清洗重试失败，将硬截断: %s", retry_exc)
-                return ""
+                return StopAwareResult(STOP_AWARE_COMPLETED, "")
+        except asyncio.TimeoutError as exc:
+            self._log("debug", "AstrNa 输出字数清洗失败，将硬截断: %s", exc)
+            return StopAwareResult(STOP_AWARE_COMPLETED, "")
         except Exception as exc:  # noqa: BLE001
             self._log("debug", "AstrNa 输出字数清洗失败，将硬截断: %s", exc)
-            return ""
+            return StopAwareResult(STOP_AWARE_COMPLETED, "")
 
+        if event_requests_stop(event):
+            return StopAwareResult(STOP_AWARE_EVENT_STOPPED)
         if getattr(response, "role", None) == "err":
             self._log("debug", "AstrNa 输出字数清洗模型返回错误响应，将硬截断。")
-            return ""
-        return str(getattr(response, "completion_text", "") or "").strip()
+            return StopAwareResult(STOP_AWARE_COMPLETED, "")
+        return StopAwareResult(
+            STOP_AWARE_COMPLETED,
+            str(getattr(response, "completion_text", "") or "").strip(),
+        )
 
     def resolve_provider(self) -> Any | None:
         provider_id = self.provider_id
