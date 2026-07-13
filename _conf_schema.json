@@ -96,6 +96,12 @@
     "hint": "开启后，AstrNa 会在每轮 LLM 请求前清理会话历史里的旧图片 base64，并在 AstrBot 保存历史前阻止新的 data:image/...;base64 图片块落库：旧图片会替换成“[历史图片：已省略原始图像，仅保留占位符]”，普通文本、图片说明和其他上下文保持不变。本轮用户新发图片、当前引用图片仍会照常进入视觉模型或图片转述流程；该功能只处理已进入 conversation history 的历史图片，避免旧图在普通后续对话里反复撑爆 token。默认关闭。",
     "default": false
   },
+  "optimize_tool_history_context": {
+    "type": "bool",
+    "description": "优化工具调用历史上下文",
+    "hint": "开启后，AstrNa 会在每轮 LLM 请求前把已完成的历史工具结果替换为轻量占位符，并在 AstrBot 保存历史前阻止新的完整工具结果继续落库；当前轮正在执行的工具调用及其结果保持完整，模型仍可据此生成最终回答。会保留 assistant 的 tool_calls、tool_call_id、role=tool、并行调用结构和最终回答，只省略旧 tool.content，避免搜索、网页读取、RAG 等大结果在后续普通对话中反复增加输入 token。只有后续 assistant 给出可落库的非空文本或继续发起合法的新 tool_calls 时才会压缩；空回复、纯思考/图片/音频、临时内容、AstrBot /stop 中断提示和未闭合的 max_step 工具链都会保留原文。开启后无法直接追问已省略结果中的细节，必要时模型需重新调用工具；该功能不移除每轮固定发送的工具定义 schema，也不会阻止普通对话历史随轮数正常增长。默认关闭。",
+    "default": false
+  },
   "optimize_quoted_image_input": {
     "type": "bool",
     "description": "优化引用图片视觉输入",

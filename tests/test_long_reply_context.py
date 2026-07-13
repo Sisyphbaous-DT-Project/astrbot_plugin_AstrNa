@@ -429,6 +429,25 @@ def test_terminate_clears_group_context_persist_callback():
     assert module.group_context_persist_callback is None
 
 
+def test_state_preserving_terminate_keeps_pending_reply_and_callback():
+    module = LongReplyContextModule(logger=DummyLogger())
+
+    def callback(group_context, event):
+        return None
+
+    module._pending["pending"] = {"text": "待保存正文"}
+    module.group_context_persist_callback = callback
+
+    module.terminate(preserve_state=True)
+
+    assert module._pending["pending"]["text"] == "待保存正文"
+    assert module.group_context_persist_callback is callback
+
+    module.terminate()
+    assert module._pending == {}
+    assert module.group_context_persist_callback is None
+
+
 def test_install_is_idempotent(astrbot_modules):
     module = LongReplyContextModule(logger=DummyLogger())
     assert module.install() is True

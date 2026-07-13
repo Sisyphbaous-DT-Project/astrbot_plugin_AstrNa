@@ -471,6 +471,86 @@ def test_runtime_dynamic_long_reply_keeps_group_sender_outer_wrapper(
     assert fake_astrbot_modules.internal_cls._save_to_history is original_save
 
 
+def test_runtime_tool_history_toggle_rebuilds_long_and_group_outer_wrappers(
+    fakes,
+    fake_astrbot_modules,
+):
+    runtime = fakes.build_runtime(
+        {
+            "optimize_long_reply_context": True,
+            "unlock_group_sender_concurrency": True,
+            "optimize_group_chat_context": True,
+        }
+    )
+
+    runtime.long_reply_context._pending["pending"] = {"text": "待保存正文"}
+    runtime.group_sender_concurrency._active_runners[("group", "sender")] = object()
+    runtime.group_sender_concurrency._group_gates[(1, "group")] = object()
+    runtime.group_sender_concurrency._write_locks[(1, "group")] = object()
+
+    runtime.config["optimize_tool_history_context"] = True
+    run(runtime.sanitize_request(DummyEvent(), fakes.Request([])))
+
+    assert "pending" in runtime.long_reply_context._pending
+    assert runtime.long_reply_context.group_context_persist_callback is not None
+    assert ("group", "sender") in runtime.group_sender_concurrency._active_runners
+    assert (1, "group") in runtime.group_sender_concurrency._group_gates
+    assert (1, "group") in runtime.group_sender_concurrency._write_locks
+
+    current = fake_astrbot_modules.internal_cls._save_to_history
+    long_wrapper = getattr(current, "_astrna_wrapped_original", None)
+    tool_wrapper = getattr(long_wrapper, "_astrna_wrapped_original", None)
+    assert getattr(current, "_astrna_group_sender_concurrency_patch", False)
+    assert getattr(long_wrapper, "_astrna_long_reply_context_patch", False)
+    assert getattr(tool_wrapper, "_astrna_tool_history_context_patch", False)
+
+    runtime.config["optimize_tool_history_context"] = False
+    run(runtime.sanitize_request(DummyEvent(), fakes.Request([])))
+
+    current = fake_astrbot_modules.internal_cls._save_to_history
+    long_wrapper = getattr(current, "_astrna_wrapped_original", None)
+    assert getattr(current, "_astrna_group_sender_concurrency_patch", False)
+    assert getattr(long_wrapper, "_astrna_long_reply_context_patch", False)
+    assert not getattr(
+        getattr(long_wrapper, "_astrna_wrapped_original", None),
+        "_astrna_tool_history_context_patch",
+        False,
+    )
+
+    runtime.config["optimize_image_history_context"] = True
+    run(runtime.sanitize_request(DummyEvent(), fakes.Request([])))
+
+    current = fake_astrbot_modules.internal_cls._save_to_history
+    long_wrapper = getattr(current, "_astrna_wrapped_original", None)
+    image_wrapper = getattr(long_wrapper, "_astrna_wrapped_original", None)
+    assert getattr(current, "_astrna_group_sender_concurrency_patch", False)
+    assert getattr(long_wrapper, "_astrna_long_reply_context_patch", False)
+    assert getattr(image_wrapper, "_astrna_image_history_context_patch", False)
+
+    run(runtime.terminate())
+
+
+def test_state_preserving_terminate_keeps_group_runtime_state():
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    runner = object()
+    gate = object()
+    write_lock = object()
+    module._active_runners[("group", "sender")] = runner
+    module._group_gates[(1, "group")] = gate
+    module._write_locks[(1, "group")] = write_lock
+
+    module.terminate(preserve_state=True)
+
+    assert module._active_runners[("group", "sender")] is runner
+    assert module._group_gates[(1, "group")] is gate
+    assert module._write_locks[(1, "group")] is write_lock
+
+    module.terminate()
+    assert module._active_runners == {}
+    assert module._group_gates == {}
+    assert module._write_locks == {}
+
+
 def test_install_and_terminate_restore_patch(fake_astrbot_modules):
     module = GroupSenderConcurrencyModule(logger=DummyLogger())
     original_lock = fake_astrbot_modules.session_lock.acquire_lock

@@ -28,6 +28,7 @@ from .modules.output_length_limiter import (
 from .modules.quoted_image_input import QuotedImageInputModule
 from .modules.reply_target_history import ReplyTargetHistoryModule
 from .modules.send_message_to_user import SendMessageToUserModule
+from .modules.tool_history_context import ToolHistoryContextModule
 
 
 DEFAULT_CONFIG = {
@@ -42,6 +43,7 @@ DEFAULT_CONFIG = {
     "forward_node_hard_limit": FORWARD_NODE_HARD_LIMIT_DEFAULT,
     "optimize_dynamic_system_prompt": False,
     "optimize_image_history_context": False,
+    "optimize_tool_history_context": False,
     "optimize_quoted_image_input": False,
     "optimize_group_chat_context": False,
     "group_chat_context_compress_provider_id": "",
@@ -94,6 +96,7 @@ class AstrNaRuntime:
             kv_store=kv_store,
         )
         self.image_history_context = ImageHistoryContextModule(logger=logger)
+        self.tool_history_context = ToolHistoryContextModule(logger=logger)
         self.quoted_image_input = QuotedImageInputModule(logger=logger)
         self.image_caption = ImageCaptionModule(logger=logger)
         self.send_message_to_user = SendMessageToUserModule(logger=logger)
@@ -147,9 +150,11 @@ class AstrNaRuntime:
             self.forward_nodes.install()
         if self.config.get("optimize_dynamic_system_prompt", False):
             self.dynamic_system_prompt.install()
+        self.reply_target_history.install()
         if self.config.get("optimize_image_history_context", False):
             self.image_history_context.install()
-        self.reply_target_history.install()
+        if self.config.get("optimize_tool_history_context", False):
+            self.tool_history_context.install()
         if self.config.get("fix_deepseek_v4_400", False):
             self.deepseek_v4_400.install()
         if self.config.get("optimize_image_caption", False):
@@ -172,11 +177,51 @@ class AstrNaRuntime:
 
     async def sanitize_request(self, event: Any, req: Any) -> None:
         self.begin_request_activity(event)
-        if self.config.get("optimize_image_history_context", False):
+        self.reply_target_history.set_semantic_enabled(
+            self.config.get("optimize_reply_target_history", False),
+        )
+        self.reply_target_history.install()
+        image_history_enabled = bool(
+            self.config.get("optimize_image_history_context", False)
+        )
+        tool_history_enabled = bool(
+            self.config.get("optimize_tool_history_context", False)
+        )
+        long_reply_enabled = bool(
+            self.config.get("optimize_long_reply_context", False)
+        )
+        group_concurrency_enabled = bool(
+            self.config.get("unlock_group_sender_concurrency", False)
+        )
+        image_history_will_change = (
+            bool(getattr(self.image_history_context, "_installed", False))
+            != image_history_enabled
+        )
+        tool_history_will_change = (
+            bool(getattr(self.tool_history_context, "_installed", False))
+            != tool_history_enabled
+        )
+        if image_history_will_change or tool_history_will_change:
+            self._rebuild_history_save_chain(
+                image_history_enabled=image_history_enabled,
+                tool_history_enabled=tool_history_enabled,
+                long_reply_enabled=long_reply_enabled,
+                group_concurrency_enabled=group_concurrency_enabled,
+            )
+        elif image_history_enabled:
             self.image_history_context.install()
-            self.image_history_context.sanitize_request(req)
         else:
             self.image_history_context.terminate()
+
+        if tool_history_enabled:
+            self.tool_history_context.install()
+        else:
+            self.tool_history_context.terminate()
+
+        if image_history_enabled:
+            self.image_history_context.sanitize_request(req)
+        if tool_history_enabled:
+            self.tool_history_context.sanitize_request(req)
 
         if self.config.get("optimize_quoted_image_input", False):
             await self.quoted_image_input.optimize(event, req)
@@ -192,10 +237,6 @@ class AstrNaRuntime:
         )
         output_length_limit_enabled = self.config.get(
             "output_length_limit_enabled",
-            False,
-        )
-        group_concurrency_enabled = self.config.get(
-            "unlock_group_sender_concurrency",
             False,
         )
         if output_length_limit_enabled:
@@ -218,7 +259,9 @@ class AstrNaRuntime:
             != output_length_limit_enabled
         )
         if send_message_to_user_will_change or output_length_limit_will_change:
-            self.group_sender_concurrency.terminate()
+            self.group_sender_concurrency.terminate(
+                preserve_state=group_concurrency_enabled,
+            )
             if output_length_limit_enabled and (
                 send_message_to_user_will_change or output_length_limit_will_change
             ):
@@ -247,10 +290,6 @@ class AstrNaRuntime:
         self._configure_issue_assistant()
         await self.issue_assistant.prepare_request(event, req)
 
-        self.reply_target_history.set_semantic_enabled(
-            self.config.get("optimize_reply_target_history", False),
-        )
-        self.reply_target_history.install()
         self.reply_target_history.sanitize_request(req)
 
         if self.config.get("fix_deepseek_v4_400", False):
@@ -260,7 +299,9 @@ class AstrNaRuntime:
             self.deepseek_v4_400.terminate()
 
         forward_nodes_enabled = self.config.get("optimize_forward_nodes", False)
-        long_reply_enabled = self.config.get("optimize_long_reply_context", False)
+        long_reply_enabled = bool(
+            self.config.get("optimize_long_reply_context", False)
+        )
         forward_nodes_will_change = (
             bool(getattr(self.forward_nodes, "_installed", False))
             != forward_nodes_enabled
@@ -270,8 +311,12 @@ class AstrNaRuntime:
             != long_reply_enabled
         )
         if forward_nodes_will_change or long_reply_will_change:
-            self.group_sender_concurrency.terminate()
-            self.long_reply_context.terminate()
+            self.group_sender_concurrency.terminate(
+                preserve_state=group_concurrency_enabled,
+            )
+            self.long_reply_context.terminate(
+                preserve_state=long_reply_enabled,
+            )
             self.forward_nodes.terminate()
             if forward_nodes_enabled:
                 self.forward_nodes.install()
@@ -404,6 +449,35 @@ class AstrNaRuntime:
         else:
             self.long_reply_context.group_context_persist_callback = None
 
+    def _rebuild_history_save_chain(
+        self,
+        *,
+        image_history_enabled: bool,
+        tool_history_enabled: bool,
+        long_reply_enabled: bool,
+        group_concurrency_enabled: bool,
+    ) -> None:
+        """在历史清理开关变化时重建共享保存 wrapper 的外层顺序。"""
+
+        # 先拆掉共享外层，再重新按 group -> long reply -> history cleaners 安装。
+        self.group_sender_concurrency.terminate(
+            preserve_state=group_concurrency_enabled,
+        )
+        self.long_reply_context.terminate(
+            preserve_state=long_reply_enabled,
+        )
+        self.tool_history_context.terminate()
+        self.image_history_context.terminate()
+
+        if image_history_enabled:
+            self.image_history_context.install()
+        if tool_history_enabled:
+            self.tool_history_context.install()
+        if long_reply_enabled:
+            self.long_reply_context.install()
+        if group_concurrency_enabled:
+            self.group_sender_concurrency.install()
+
     def _configure_auto_cache_cleanup(self) -> None:
         enabled = self.config.get("auto_cleanup_astrbot_cache", False)
         self.auto_cache_cleanup.configure(enabled=enabled)
@@ -489,6 +563,7 @@ class AstrNaRuntime:
         self.long_reply_context.terminate()
         self.forward_nodes.terminate()
         self.dynamic_system_prompt.terminate()
+        self.tool_history_context.terminate()
         self.image_history_context.terminate()
         self.image_caption.terminate()
         self.send_message_to_user.terminate()
