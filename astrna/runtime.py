@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import weakref
 from typing import Any
 
 from .modules.auto_cache_cleanup import AutoCacheCleanupModule
@@ -79,6 +81,9 @@ class AstrNaRuntime:
         self.context = context
         self.config = merge_config(config)
         self.logger = logger
+        # 每个 Runtime 使用独立令牌，避免旧实例或并发事件误释放当前实例的计数。
+        self._request_activity_owner_token = object()
+        self._request_activity_events: dict[int, tuple[object, Any]] = {}
         self.deepseek_v4_400 = DeepSeekV4400Module(logger=logger)
         self.identity_metadata = IdentityMetadataModule(logger=logger)
         self.forward_nodes = ForwardNodesModule(
@@ -105,6 +110,7 @@ class AstrNaRuntime:
             ),
             provider_id=self.config.get("output_length_limit_provider_id", ""),
             persona_id=self.config.get("output_length_limit_persona_id", ""),
+            request_activity_end_callback=self.end_request_activity,
         )
         self.group_identity_tools = GroupIdentityToolsModule(
             context=context,
@@ -117,6 +123,7 @@ class AstrNaRuntime:
             logger=logger,
             provider_id=self.config.get("group_chat_context_compress_provider_id", ""),
             kv_store=kv_store,
+            request_activity_end_callback=self.end_request_activity,
         )
         self.auto_cache_cleanup = AutoCacheCleanupModule(logger=logger)
         self.builtin_command_allowlist = BuiltinCommandAllowlistModule(
@@ -169,7 +176,7 @@ class AstrNaRuntime:
         self._configure_auto_cache_cleanup()
 
     async def sanitize_request(self, event: Any, req: Any) -> None:
-        self.begin_request_activity()
+        self.begin_request_activity(event)
         if self.config.get("optimize_image_history_context", False):
             self.image_history_context.install()
             self.image_history_context.sanitize_request(req)
@@ -223,8 +230,18 @@ class AstrNaRuntime:
         )
         if send_message_to_user_will_change or output_length_limit_will_change:
             self.group_sender_concurrency.terminate()
-            self.output_length_limiter.terminate()
-            self.send_message_to_user.terminate()
+            if output_length_limit_enabled and (
+                send_message_to_user_will_change or output_length_limit_will_change
+            ):
+                # 共享链重排时需要让输出清洗重新位于 send_message_to_user 外层，
+                # 但不能取消已经在等待清洗模型的旧请求。
+                self.output_length_limiter.terminate(
+                    cancel_pending=False,
+                )
+            elif output_length_limit_will_change:
+                self.output_length_limiter.terminate(cancel_pending=True)
+            if send_message_to_user_will_change:
+                self.send_message_to_user.terminate()
             if send_message_to_user_enabled:
                 self.send_message_to_user.install()
             if output_length_limit_enabled:
@@ -429,10 +446,45 @@ class AstrNaRuntime:
     def end_activity(self) -> None:
         self.auto_cache_cleanup.end_activity()
 
-    def begin_request_activity(self) -> None:
-        self.auto_cache_cleanup.begin_request_activity()
+    def begin_request_activity(self, event: Any | None = None) -> None:
+        if event is None:
+            self.auto_cache_cleanup.begin_request_activity()
+            return
+        key = id(event)
+        current = self._request_activity_events.get(key)
+        if current is not None and _event_reference(current[1]) is event:
+            return
 
-    def end_request_activity(self) -> None:
+        self.auto_cache_cleanup.begin_request_activity()
+        owner_token = self._request_activity_owner_token
+        runtime_ref = weakref.ref(self)
+
+        def on_event_gc(_event_ref: Any) -> None:
+            runtime = runtime_ref()
+            if runtime is None:
+                return
+            marker = runtime._request_activity_events.get(key)
+            if marker is not None and marker[0] is owner_token and marker[1] is _event_ref:
+                runtime._request_activity_events.pop(key, None)
+
+        try:
+            event_ref: Any = weakref.ref(event, on_event_gc)
+        except TypeError:
+            # 少数兼容桩不可弱引用时，直到对应 end hook 到达前保留强引用。
+            event_ref = event
+        self._request_activity_events[key] = (owner_token, event_ref)
+
+    def end_request_activity(self, event: Any | None = None) -> None:
+        if event is None:
+            self.auto_cache_cleanup.end_request_activity()
+            return
+        key = id(event)
+        marker = self._request_activity_events.get(key)
+        if marker is None or marker[0] is not self._request_activity_owner_token:
+            return
+        if _event_reference(marker[1]) is not event:
+            return
+        self._request_activity_events.pop(key, None)
         self.auto_cache_cleanup.end_request_activity()
 
     def begin_send_activity(self) -> None:
@@ -457,7 +509,13 @@ class AstrNaRuntime:
         self.reply_target_history.terminate()
         self.deepseek_v4_400.terminate()
         self.auto_cache_cleanup.terminate()
+        self._request_activity_events.clear()
         self.builtin_command_allowlist.terminate()
+        await asyncio.gather(
+            self.group_chat_context_optimizer.drain_pending_operations(timeout=0.05),
+            self.output_length_limiter.drain_pending_operations(timeout=0.05),
+            return_exceptions=True,
+        )
 
 
 def merge_config(config: dict | None) -> dict[str, Any]:
@@ -477,3 +535,12 @@ def merge_config(config: dict | None) -> dict[str, Any]:
             merged[key] = config[key]
 
     return merged
+
+
+def _event_reference(reference: Any) -> Any:
+    if isinstance(reference, weakref.ReferenceType):
+        try:
+            return reference()
+        except Exception:  # noqa: BLE001
+            return None
+    return reference

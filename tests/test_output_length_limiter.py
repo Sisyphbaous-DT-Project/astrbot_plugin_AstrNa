@@ -681,6 +681,329 @@ def test_reinstall_send_message_under_limiter_after_middle_terminate_does_not_re
     limiter.terminate()
 
 
+def test_stop_before_cleaning_returns_original_and_requests_runner_stop(
+    astrbot_runner_modules,
+):
+    provider = DummyProvider("清洗后")
+    runtime = build_runtime(
+        {
+            "output_length_limit_enabled": True,
+            "output_length_limit_provider_id": "clean",
+            "output_length_limit_max_chars": 4,
+        },
+        providers={"clean": provider},
+    )
+    event = DummyEvent()
+    event.set_extra("agent_stop_requested", True)
+    response = long_response()
+    runner = build_runner(response, event=event)
+    runner.stop_requested = False
+    runner.request_stop = lambda: setattr(runner, "stop_requested", True)
+
+    [actual] = asyncio.run(collect_runner_responses(runner))
+
+    assert actual is response
+    assert runner.stop_requested is True
+    assert provider.calls == []
+    asyncio.run(runtime.terminate())
+
+
+def test_stop_during_cleaning_returns_original_without_clone(
+    astrbot_runner_modules,
+):
+    class BlockingProvider:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.cancelled = asyncio.Event()
+            self.calls = []
+
+        async def text_chat(self, **kwargs):
+            self.calls.append(kwargs)
+            self.started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            return SimpleNamespace(role="assistant", completion_text="清洗后")
+
+    async def exercise():
+        provider = BlockingProvider()
+        module = OutputLengthLimiterModule(
+            context=DummyContext(providers={"clean": provider}),
+            logger=DummyLogger(),
+            max_chars=4,
+            provider_id="clean",
+        )
+        event = DummyEvent()
+        response = long_response()
+        runner = build_runner(response, event=event)
+        runner.stop_requested = False
+        runner.request_stop = lambda: setattr(runner, "stop_requested", True)
+
+        task = asyncio.create_task(module.optimize_response(runner, response))
+        await provider.started.wait()
+        event.set_extra("agent_stop_requested", True)
+        actual = await asyncio.wait_for(task, 0.5)
+
+        assert actual is response
+        assert runner.stop_requested is True
+        assert provider.cancelled.is_set()
+
+        provider.release.set()
+        module.cancel_pending_operations()
+        await module.drain_pending_operations(timeout=0.2)
+
+    asyncio.run(exercise())
+
+
+def test_scope_cancellation_does_not_request_runner_stop(
+    astrbot_runner_modules,
+):
+    class BlockingProvider:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def text_chat(self, **kwargs):
+            self.started.set()
+            await self.release.wait()
+            return SimpleNamespace(role="assistant", completion_text="清洗后")
+
+    async def exercise():
+        provider = BlockingProvider()
+        module = OutputLengthLimiterModule(
+            context=DummyContext(providers={"clean": provider}),
+            logger=DummyLogger(),
+            max_chars=4,
+            provider_id="clean",
+        )
+        event = DummyEvent()
+        response = long_response()
+        runner = build_runner(response, event=event)
+        runner.stop_requested = False
+        runner.request_stop = lambda: setattr(runner, "stop_requested", True)
+
+        task = asyncio.create_task(module.optimize_response(runner, response))
+        await provider.started.wait()
+        module.cancel_pending_operations()
+        actual = await asyncio.wait_for(task, 0.5)
+
+        assert actual is response
+        assert runner.stop_requested is False
+        provider.release.set()
+        await module.drain_pending_operations(timeout=0.2)
+
+    asyncio.run(exercise())
+
+
+def test_cleaning_stop_wins_when_provider_returns_after_setting_stop(
+    astrbot_runner_modules,
+):
+    provider = DummyProvider("清洗后")
+    runtime = build_runtime(
+        {
+            "output_length_limit_enabled": True,
+            "output_length_limit_provider_id": "clean",
+            "output_length_limit_max_chars": 4,
+        },
+        providers={"clean": provider},
+    )
+    event = DummyEvent()
+
+    async def stop_then_return(**kwargs):
+        event.set_extra("agent_stop_requested", True)
+        return SimpleNamespace(role="assistant", completion_text="清洗后")
+
+    provider.text_chat = stop_then_return
+    response = long_response()
+    runner = build_runner(response, event=event)
+    runner.stop_requested = False
+    runner.request_stop = lambda: setattr(runner, "stop_requested", True)
+
+    [actual] = asyncio.run(collect_runner_responses(runner))
+
+    assert actual is response
+    assert runner.stop_requested is True
+    asyncio.run(runtime.terminate())
+
+
+def test_runtime_wrapper_rebuild_keeps_enabled_cleaning_in_flight(
+    astrbot_runner_modules,
+):
+    class BlockingProvider:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.cancelled = asyncio.Event()
+
+        async def text_chat(self, **kwargs):
+            self.started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            return SimpleNamespace(role="assistant", completion_text="清洗后")
+
+    async def exercise():
+        provider = BlockingProvider()
+        runtime = build_runtime(
+            {
+                "output_length_limit_enabled": True,
+                "output_length_limit_provider_id": "clean",
+                "output_length_limit_max_chars": 4,
+            },
+            providers={"clean": provider},
+        )
+        event = DummyEvent()
+        runner = build_runner(long_response(), event=event)
+        task = asyncio.create_task(
+            runtime.output_length_limiter.optimize_response(
+                runner,
+                runner.response,
+            ),
+        )
+        await provider.started.wait()
+
+        runtime.config["optimize_send_message_to_user"] = True
+        req = SimpleNamespace(func_tool=SimpleNamespace(get_tool=lambda name: object()))
+        await runtime.sanitize_request(event, req)
+        assert provider.cancelled.is_set() is False
+
+        provider.release.set()
+        result = await asyncio.wait_for(task, 0.5)
+        assert result is not runner.response
+        assert result.completion_text == "清洗后"
+        await runtime.terminate()
+
+    asyncio.run(exercise())
+
+
+def test_terminate_invalidates_wrapper_waiting_for_main_provider(
+    astrbot_runner_modules,
+):
+    async def exercise():
+        original_method = DummyRunner._iter_llm_responses_with_fallback
+        cleaning_provider = DummyProvider("清洗后")
+
+        async def blocking_main_provider(runner):
+            runner.main_started.set()
+            await runner.main_release.wait()
+            yield runner.response
+
+        DummyRunner._iter_llm_responses_with_fallback = blocking_main_provider
+        module = OutputLengthLimiterModule(
+            context=DummyContext(providers={"clean": cleaning_provider}),
+            logger=DummyLogger(),
+            max_chars=4,
+            provider_id="clean",
+        )
+        event = DummyEvent()
+        response = long_response()
+        runner = build_runner(response, event=event)
+        runner.main_started = asyncio.Event()
+        runner.main_release = asyncio.Event()
+        generator = None
+        try:
+            assert module.install() is True
+            generator = runner._iter_llm_responses_with_fallback()
+            response_task = asyncio.create_task(anext(generator))
+            await runner.main_started.wait()
+            module.terminate()
+            runner.main_release.set()
+            actual = await asyncio.wait_for(response_task, 0.5)
+            assert actual is response
+            assert cleaning_provider.calls == []
+        finally:
+            runner.main_release.set()
+            if generator is not None:
+                await generator.aclose()
+            OutputLengthLimiterModule.restore_patch()
+            DummyRunner._iter_llm_responses_with_fallback = original_method
+            module.cancel_pending_operations()
+            await module.drain_pending_operations(timeout=0.2)
+
+    asyncio.run(exercise())
+
+
+def test_rebuild_keeps_wrapper_waiting_for_main_provider_enabled(
+    astrbot_runner_modules,
+):
+    async def exercise():
+        original_method = DummyRunner._iter_llm_responses_with_fallback
+        cleaning_provider = DummyProvider("清洗后")
+
+        async def blocking_main_provider(runner):
+            runner.main_started.set()
+            await runner.main_release.wait()
+            yield runner.response
+
+        DummyRunner._iter_llm_responses_with_fallback = blocking_main_provider
+        module = OutputLengthLimiterModule(
+            context=DummyContext(providers={"clean": cleaning_provider}),
+            logger=DummyLogger(),
+            max_chars=4,
+            provider_id="clean",
+        )
+        event = DummyEvent()
+        response = long_response()
+        runner = build_runner(response, event=event)
+        runner.main_started = asyncio.Event()
+        runner.main_release = asyncio.Event()
+        generator = None
+        try:
+            assert module.install() is True
+            generator = runner._iter_llm_responses_with_fallback()
+            response_task = asyncio.create_task(anext(generator))
+            await runner.main_started.wait()
+            module.terminate(cancel_pending=False)
+            assert module.install() is True
+            runner.main_release.set()
+            actual = await asyncio.wait_for(response_task, 0.5)
+            assert actual is not response
+            assert actual.completion_text == "清洗后"
+            assert len(cleaning_provider.calls) == 1
+        finally:
+            runner.main_release.set()
+            if generator is not None:
+                await generator.aclose()
+            module.terminate()
+            DummyRunner._iter_llm_responses_with_fallback = original_method
+
+    asyncio.run(exercise())
+
+
+def test_stale_output_lifecycle_does_not_request_runner_stop(
+    astrbot_runner_modules,
+):
+    module = OutputLengthLimiterModule(
+        context=DummyContext(),
+        logger=DummyLogger(),
+        max_chars=4,
+    )
+    event = DummyEvent()
+    response = long_response()
+    runner = build_runner(response, event=event)
+    runner.stop_requested = False
+    runner.request_stop = lambda: setattr(runner, "stop_requested", True)
+    lifecycle_token = module.capture_lifecycle_token()
+
+    module.terminate()
+    event.set_extra("agent_stop_requested", True)
+    actual = asyncio.run(
+        module.optimize_response(
+            runner,
+            response,
+            lifecycle_token=lifecycle_token,
+        ),
+    )
+
+    assert actual is response
+    assert runner.stop_requested is False
+
+
 async def collect_runner_responses(runner):
     return [
         response

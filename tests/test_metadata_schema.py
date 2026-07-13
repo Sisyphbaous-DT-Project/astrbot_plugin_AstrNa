@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.4.2"
+    assert metadata["version"] == "1.4.4"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -257,6 +257,9 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
     )
     assert "⚠️" in schema["unlock_group_sender_concurrency"]["hint"]
     assert "防抖" in schema["unlock_group_sender_concurrency"]["hint"]
+    assert "后台并发" in schema["unlock_group_sender_concurrency"]["hint"]
+    assert "按整轮串行" in schema["unlock_group_sender_concurrency"]["hint"]
+    assert "关闭本轮流式输出" in schema["unlock_group_sender_concurrency"]["hint"]
     assert schema["unlock_group_sender_concurrency"]["default"] is False
     assert schema["auto_cleanup_astrbot_cache"]["type"] == "bool"
     assert (
@@ -385,5 +388,7 @@ def test_changelog_contains_release_notes():
     assert "## 1.3.9" in changelog
     assert "## 1.4.1" in changelog
     assert "## 1.4.2" in changelog
+    assert "## 1.4.3" in changelog
+    assert "## 1.4.4" in changelog
     assert "## 1.2.5" in changelog
     assert "## 1.2.4" in changelog

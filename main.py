@@ -38,7 +38,7 @@ class AstrNa(Star):
 
     @filter.on_llm_response(priority=1000)
     async def record_llm_response(self, event: AstrMessageEvent, response) -> None:
-        self.runtime.end_request_activity()
+        self.runtime.end_request_activity(event)
 
     @filter.on_agent_begin(priority=1000)
     async def record_agent_begin(self, event: AstrMessageEvent, run_context) -> None:
@@ -51,6 +51,7 @@ class AstrNa(Star):
         run_context,
         response,
     ) -> None:
+        self.runtime.end_request_activity(event)
         self.runtime.end_activity()
 
     @filter.on_decorating_result(priority=1000)

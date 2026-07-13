@@ -271,3 +271,38 @@ def test_runtime_activity_hooks_update_idle_state(fakes):
 
     runtime.end_activity()
     assert runtime.auto_cache_cleanup._active_count == 0
+
+
+def test_runtime_request_activity_is_event_idempotent_and_event_scoped(fakes):
+    runtime = fakes.build_runtime({"auto_cleanup_astrbot_cache": True})
+    event_a = fakes.Event()
+    event_b = fakes.Event()
+
+    runtime.begin_request_activity(event_a)
+    runtime.begin_request_activity(event_a)
+    runtime.begin_request_activity(event_b)
+    assert runtime.auto_cache_cleanup._active_count == 2
+
+    runtime.end_request_activity(event_a)
+    runtime.end_request_activity(event_a)
+    assert runtime.auto_cache_cleanup._active_count == 1
+
+    runtime.end_request_activity(fakes.Event())
+    assert runtime.auto_cache_cleanup._active_count == 1
+    runtime.end_request_activity(event_b)
+    assert runtime.auto_cache_cleanup._active_count == 0
+
+
+def test_runtime_request_activity_owner_token_does_not_cross_instances(fakes):
+    first = fakes.build_runtime({"auto_cleanup_astrbot_cache": True})
+    second = fakes.build_runtime({"auto_cleanup_astrbot_cache": True})
+    event = fakes.Event()
+
+    first.begin_request_activity(event)
+    second.begin_request_activity(event)
+    first.end_request_activity(event)
+
+    assert first.auto_cache_cleanup._active_count == 0
+    assert second.auto_cache_cleanup._active_count == 1
+    second.end_request_activity(event)
+    assert second.auto_cache_cleanup._active_count == 0

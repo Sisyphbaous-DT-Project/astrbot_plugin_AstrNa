@@ -1489,3 +1489,269 @@ def test_create_temp_text_part_sets_no_save_when_textpart_is_available(
 
 def test_timeout_constant_is_reasonable():
     assert GROUP_CONTEXT_COMPRESS_TIMEOUT_SECONDS == 300
+
+
+def test_stop_before_group_context_optimization_does_not_mutate_request(
+    astrbot_group_context_modules,
+):
+    provider = DummyProvider(valid_compressed_text())
+    module = build_module(provider)
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    event.set_extra("agent_stop_requested", True)
+    seed_group_records(group_context, event)
+    req = DummyReq()
+    existing = TextPart("已有临时内容")
+    req.extra_user_content_parts.append(existing)
+
+    run(module.optimize_on_req_llm(group_context, event, req))
+
+    assert req.extra_user_content_parts == [existing]
+    assert provider.calls == []
+
+
+def test_stop_during_group_context_compression_cancels_and_discards_late_result(
+    astrbot_group_context_modules,
+):
+    class BlockingProvider:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.cancelled = asyncio.Event()
+            self.calls = []
+
+        async def text_chat(self, **kwargs):
+            self.calls.append(kwargs)
+            self.started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            return DummyResponse(valid_compressed_text())
+
+    async def exercise():
+        provider = BlockingProvider()
+        module = build_module(provider)
+        group_context = astrbot_group_context_modules.group_context_cls()
+        event = DummyEvent()
+        seed_group_records(group_context, event)
+        req = DummyReq()
+        task = asyncio.create_task(
+            module.optimize_on_req_llm(group_context, event, req),
+        )
+
+        await provider.started.wait()
+        event.set_extra("agent_stop_requested", True)
+        await asyncio.wait_for(task, 0.5)
+
+        assert provider.cancelled.is_set()
+        assert req.extra_user_content_parts == []
+
+        provider.release.set()
+        module.cancel_pending_operations()
+        await module.drain_pending_operations(timeout=0.2)
+
+    run(exercise())
+
+
+def test_terminate_invalidates_handler_waiting_before_provider_scope(
+    astrbot_group_context_modules,
+):
+    async def exercise():
+        provider = DummyProvider(valid_compressed_text())
+        module = build_module(provider)
+        group_context = astrbot_group_context_modules.group_context_cls()
+        event = DummyEvent()
+        seed_group_records(group_context, event)
+        req = DummyReq()
+        existing = TextPart("已有临时内容")
+        req.extra_user_content_parts.append(existing)
+        lock = group_context._get_lock(event.unified_msg_origin)
+        await lock.acquire()
+        task = None
+        try:
+            module.install()
+            task = asyncio.create_task(group_context.on_req_llm(event, req))
+            for _ in range(50):
+                if getattr(lock, "_waiters", None):
+                    break
+                await asyncio.sleep(0)
+            assert getattr(lock, "_waiters", None)
+            module.terminate()
+            lock.release()
+            await asyncio.wait_for(task, 0.5)
+            assert req.extra_user_content_parts == [existing]
+            assert provider.calls == []
+        finally:
+            if lock.locked():
+                lock.release()
+            if task is not None and not task.done():
+                task.cancel()
+                await task
+            module.cancel_pending_operations()
+            await module.drain_pending_operations(timeout=0.2)
+
+    run(exercise())
+
+
+def test_stop_after_restore_wait_skips_original_handle_message(
+    astrbot_group_context_modules,
+):
+    class BlockingKV:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.put_calls = 0
+
+        async def get_kv_data(self, key, default):
+            self.started.set()
+            await self.release.wait()
+            return {
+                "sessions": {
+                    "aiocqhttp:GroupMessage:123456": {
+                        "records": ["[历史/12:00:00]:  历史消息"],
+                        "record_ids": ["history-1"],
+                    },
+                },
+            }
+
+        async def put_kv_data(self, key, value):
+            self.put_calls += 1
+
+    async def exercise():
+        kv_store = BlockingKV()
+        module = build_module_with_kv(
+            DummyProvider(valid_compressed_text()),
+            kv_store=kv_store,
+        )
+        module.install()
+        group_context = astrbot_group_context_modules.group_context_cls()
+        event = DummyEvent()
+        task = asyncio.create_task(group_context.handle_message(event))
+        await kv_store.started.wait()
+        event.extra["agent_stop_requested"] = True
+        kv_store.release.set()
+        await asyncio.wait_for(task, 0.5)
+        assert group_context.handle_calls == []
+        assert group_context.raw_records == {}
+        assert kv_store.put_calls == 0
+
+    run(exercise())
+
+
+def test_group_context_stop_wins_when_compression_finishes_in_same_turn(
+    astrbot_group_context_modules,
+):
+    class StopBeforeReturnProvider(DummyProvider):
+        async def text_chat(self, **kwargs):
+            self.calls.append(kwargs)
+            event.set_extra("agent_stop_requested", True)
+            return DummyResponse(valid_compressed_text())
+
+    provider = StopBeforeReturnProvider(valid_compressed_text())
+    module = build_module(provider)
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_group_records(group_context, event)
+    req = DummyReq()
+
+    run(module.optimize_on_req_llm(group_context, event, req))
+
+    assert req.extra_user_content_parts == []
+    assert len(provider.calls) == 1
+
+
+def test_terminate_while_persistence_state_lock_is_waited_drops_kv_write(
+    astrbot_group_context_modules,
+):
+    class TrackingKV:
+        def __init__(self):
+            self.put_calls = []
+
+        async def put_kv_data(self, key, value):
+            self.put_calls.append((key, value))
+
+    async def exercise():
+        kv_store = TrackingKV()
+        module = build_module_with_kv(
+            DummyProvider(valid_compressed_text()),
+            kv_store=kv_store,
+        )
+        module._persisted_state_loaded = True
+        group_context = astrbot_group_context_modules.group_context_cls()
+        event = DummyEvent()
+        seed_group_records(group_context, event)
+        state_lock = module._persisted_state_lock
+        await state_lock.acquire()
+        task = asyncio.create_task(module.persist_group_context(group_context, event))
+        await asyncio.sleep(0)
+        module.terminate()
+        state_lock.release()
+        await asyncio.wait_for(task, 0.5)
+        assert kv_store.put_calls == []
+
+    run(exercise())
+
+
+def test_stop_while_persistence_state_lock_is_waited_drops_kv_write(
+    astrbot_group_context_modules,
+):
+    class TrackingKV:
+        def __init__(self):
+            self.put_calls = []
+
+        async def put_kv_data(self, key, value):
+            self.put_calls.append((key, value))
+
+    async def exercise():
+        kv_store = TrackingKV()
+        module = build_module_with_kv(
+            DummyProvider(valid_compressed_text()),
+            kv_store=kv_store,
+        )
+        module._persisted_state_loaded = True
+        group_context = astrbot_group_context_modules.group_context_cls()
+        event = DummyEvent()
+        seed_group_records(group_context, event)
+        state_lock = module._persisted_state_lock
+        await state_lock.acquire()
+        task = asyncio.create_task(module.persist_group_context(group_context, event))
+        await asyncio.sleep(0)
+        event.set_extra("agent_stop_requested", True)
+        state_lock.release()
+        await asyncio.wait_for(task, 0.5)
+        assert kv_store.put_calls == []
+
+    run(exercise())
+
+
+def test_terminate_while_persistence_state_lock_is_waited_skips_kv_read(
+    astrbot_group_context_modules,
+):
+    class TrackingKV:
+        def __init__(self):
+            self.get_calls = []
+
+        async def get_kv_data(self, key, default):
+            self.get_calls.append((key, default))
+            return {"sessions": {}}
+
+    async def exercise():
+        kv_store = TrackingKV()
+        module = build_module_with_kv(
+            DummyProvider(valid_compressed_text()),
+            kv_store=kv_store,
+        )
+        group_context = astrbot_group_context_modules.group_context_cls()
+        event = DummyEvent()
+        state_lock = module._persisted_state_lock
+        await state_lock.acquire()
+        task = asyncio.create_task(module.restore_group_context(group_context, event))
+        await asyncio.sleep(0)
+        module.terminate()
+        state_lock.release()
+        await asyncio.wait_for(task, 0.5)
+        assert kv_store.get_calls == []
+
+    run(exercise())
