@@ -159,14 +159,15 @@ class GroupSenderConcurrencyModule:
         self._log("info", "AstrNa 已启用解锁群聊并发功能（实验性）。")
         return True
 
-    def terminate(self) -> None:
+    def terminate(self, *, preserve_state: bool = False) -> None:
         module_cls = type(self)
         if self._installed and module_cls._active_module is self:
             module_cls.restore_patch()
         self._installed = False
-        self._group_gates.clear()
-        self._write_locks.clear()
-        self._active_runners.clear()
+        if not preserve_state:
+            self._group_gates.clear()
+            self._write_locks.clear()
+            self._active_runners.clear()
 
     @classmethod
     def restore_patch(cls) -> None:

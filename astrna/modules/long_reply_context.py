@@ -69,13 +69,14 @@ class LongReplyContextModule:
         self._log("info", "AstrNa 已启用优化超长回复上下文。")
         return True
 
-    def terminate(self) -> None:
+    def terminate(self, *, preserve_state: bool = False) -> None:
         module_cls = type(self)
         if self._installed and module_cls._active_module is self:
             module_cls.restore_patch()
         self._installed = False
-        self._pending.clear()
-        self.group_context_persist_callback = None
+        if not preserve_state:
+            self._pending.clear()
+            self.group_context_persist_callback = None
 
     @classmethod
     def restore_patch(cls) -> None:

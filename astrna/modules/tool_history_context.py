@@ -23,6 +23,10 @@ from .image_history_context import (
 TOOL_HISTORY_PLACEHOLDER = "[历史工具结果：已省略原始内容，最终结论见后续助手回复]"
 
 
+class _ToolHistoryScanError(Exception):
+    """工具历史扫描无法安全完成。"""
+
+
 class ToolHistoryContextModule:
     """压缩已完成回合里的工具结果，避免它们在后续请求中反复占用 token。"""
 
@@ -176,19 +180,26 @@ def sanitize_contexts(contexts: list[Any]) -> tuple[list[Any], bool]:
 
 
 def sanitize_messages(messages: list[Any]) -> tuple[list[Any], bool]:
+    # 外部插件可能提供异常的消息容器；扫描失败时保留原历史。
+    try:
+        return _sanitize_messages(messages)
+    except Exception:  # noqa: BLE001
+        return messages, False
+
+
+def _sanitize_messages(messages: list[Any]) -> tuple[list[Any], bool]:
     groups = find_completed_tool_result_groups(messages)
     if not groups:
         return messages, False
 
-    changed = False
-    sanitized_messages = list(messages)
+    replacements: dict[int, Any] = {}
     for indexes in groups:
-        replacements: dict[int, Any] = {}
+        group_replacements: dict[int, Any] = {}
         group_changed = False
-        group_failed = False
         for index in indexes:
             message = messages[index]
-            if message_value(message, "content") == TOOL_HISTORY_PLACEHOLDER:
+            content = message_value(message, "content")
+            if content == TOOL_HISTORY_PLACEHOLDER:
                 sanitized_message = message
                 message_changed = False
             elif isinstance(message, dict):
@@ -201,17 +212,20 @@ def sanitize_messages(messages: list[Any]) -> tuple[list[Any], bool]:
                     TOOL_HISTORY_PLACEHOLDER,
                 )
                 if sanitized_message is None:
-                    group_failed = True
-                    break
+                    raise _ToolHistoryScanError("无法安全复制工具结果消息")
                 message_changed = True
-            replacements[index] = sanitized_message
+            group_replacements[index] = sanitized_message
             group_changed = group_changed or message_changed
-        if group_failed or not group_changed:
-            continue
-        for index, sanitized_message in replacements.items():
-            sanitized_messages[index] = sanitized_message
-        changed = True
-    return (sanitized_messages if changed else messages), changed
+        if group_changed:
+            replacements.update(group_replacements)
+
+    if not replacements:
+        return messages, False
+
+    sanitized_messages = list(messages)
+    for index, sanitized_message in replacements.items():
+        sanitized_messages[index] = sanitized_message
+    return sanitized_messages, True
 
 
 def find_completed_tool_result_groups(messages: list[Any]) -> list[list[int]]:
@@ -221,6 +235,9 @@ def find_completed_tool_result_groups(messages: list[Any]) -> list[list[int]]:
     expected_ids: set[str] | None = None
     result_indexes: dict[str, int] = {}
     pending_invalid = False
+    max_steps_prompt, interruption_prompt = load_tool_loop_prompt_constants()
+    if max_steps_prompt is None or interruption_prompt is None:
+        return groups
 
     def reset_pending() -> None:
         nonlocal expected_ids, result_indexes, pending_invalid
@@ -236,14 +253,15 @@ def find_completed_tool_result_groups(messages: list[Any]) -> list[list[int]]:
                 expected_ids
                 and not pending_invalid
                 and set(result_indexes) == expected_ids
-                and not message_no_save(message)
+                and is_valid_consumer_assistant(message, interruption_prompt)
+                and not message_checkpoint_after(message)
             ):
                 groups.append(sorted(result_indexes.values()))
 
             reset_pending()
             if not message_no_save(message) and not message_checkpoint_after(message):
                 tool_call_ids = extract_tool_call_ids(message)
-                if tool_call_ids:
+                if isinstance(tool_call_ids, list) and tool_call_ids:
                     expected_ids = set(tool_call_ids)
             continue
 
@@ -256,18 +274,19 @@ def find_completed_tool_result_groups(messages: list[Any]) -> list[list[int]]:
                 tool_call_id = message_value(message, "tool_call_id")
                 if (
                     not isinstance(tool_call_id, str)
-                    or not tool_call_id
+                    or not tool_call_id.strip()
                     or tool_call_id not in expected_ids
                     or tool_call_id in result_indexes
                 ):
                     pending_invalid = True
                 else:
                     result_indexes[tool_call_id] = index
-            elif not (
-                role == "user"
-                and set(result_indexes) == expected_ids
-                and is_tool_image_user_message(message)
+            elif role == "user" and set(result_indexes) == expected_ids and (
+                is_tool_image_user_message(message)
+                or is_max_steps_prompt_message(message, max_steps_prompt)
             ):
+                pass
+            else:
                 reset_pending()
 
         if message_checkpoint_after(message):
@@ -305,12 +324,17 @@ def clone_message_with_content(message: Any, content: str) -> Any | None:
     except Exception:  # noqa: BLE001
         pass
 
-    if hasattr(message, "model_copy"):
+    try:
+        model_copy = getattr(message, "model_copy", None)
+    except Exception:  # noqa: BLE001
+        return None
+
+    if callable(model_copy):
         try:
-            return message.model_copy(update={"content": content}, deep=True)
+            return model_copy(update={"content": content}, deep=True)
         except TypeError:
             try:
-                return message.model_copy(update={"content": content})
+                return model_copy(update={"content": content})
             except Exception:  # noqa: BLE001
                 pass
         except Exception:  # noqa: BLE001
@@ -325,13 +349,20 @@ def clone_message_with_content(message: Any, content: str) -> Any | None:
 
 
 def message_value(message: Any, name: str) -> Any:
-    if isinstance(message, dict):
-        return message.get(name)
-    return getattr(message, name, None)
+    try:
+        if isinstance(message, dict):
+            return message.get(name)
+        return getattr(message, name, None)
+    except Exception as exc:  # noqa: BLE001
+        raise _ToolHistoryScanError(f"读取消息属性 {name} 失败") from exc
 
 
 def message_no_save(message: Any) -> bool:
-    return bool(message_value(message, "_no_save"))
+    value = message_value(message, "_no_save")
+    try:
+        return bool(value)
+    except Exception as exc:  # noqa: BLE001
+        raise _ToolHistoryScanError("读取消息临时标记失败") from exc
 
 
 def message_checkpoint_after(message: Any) -> bool:
@@ -346,12 +377,115 @@ def extract_tool_call_ids(message: Any) -> list[str] | None:
     tool_call_ids: list[str] = []
     for tool_call in tool_calls:
         tool_call_id = message_value(tool_call, "id")
-        if not isinstance(tool_call_id, str) or not tool_call_id:
+        if not isinstance(tool_call_id, str) or not tool_call_id.strip():
             return None
         tool_call_ids.append(tool_call_id)
     if len(set(tool_call_ids)) != len(tool_call_ids):
         return None
     return tool_call_ids
+
+
+def load_tool_loop_prompt_constants() -> tuple[str | None, str | None]:
+    """延迟读取 AstrBot 工具循环的内部提示，导入失败时保持保守行为。"""
+
+    try:
+        from astrbot.core.agent.runners.tool_loop_agent_runner import (
+            ToolLoopAgentRunner,
+        )
+
+        max_steps_prompt = getattr(ToolLoopAgentRunner, "MAX_STEPS_REACHED_PROMPT")
+        interruption_prompt = getattr(ToolLoopAgentRunner, "USER_INTERRUPTION_MESSAGE")
+    except Exception:  # noqa: BLE001
+        return None, None
+
+    if not isinstance(max_steps_prompt, str) or not max_steps_prompt:
+        return None, None
+    if not isinstance(interruption_prompt, str) or not interruption_prompt:
+        return None, None
+    return max_steps_prompt, interruption_prompt
+
+
+def is_valid_consumer_assistant(
+    message: Any,
+    interruption_prompt: str | None,
+) -> bool:
+    """判断 assistant 是否真正消费了上一组工具结果。"""
+
+    if message_no_save(message):
+        return False
+    tool_call_ids = extract_tool_call_ids(message)
+    if tool_call_ids:
+        return True
+    return has_persistable_assistant_text(message, interruption_prompt)
+
+
+def has_persistable_assistant_text(
+    message: Any,
+    interruption_prompt: str | None,
+) -> bool:
+    content = message_value(message, "content")
+    text_values = list(iter_text_values(content))
+    for text, part in text_values:
+        if part is not None and part_no_save(part):
+            continue
+        stripped = text.strip()
+        if not stripped:
+            continue
+        if text == IMAGE_HISTORY_PLACEHOLDER:
+            continue
+        if interruption_prompt is not None and text == interruption_prompt:
+            continue
+        return True
+    return False
+
+
+def iter_text_values(content: Any) -> list[tuple[str, Any | None]]:
+    """提取会进入历史的文本块，忽略思考、图片、音频和未知块。"""
+
+    if isinstance(content, str):
+        return [(content, None)]
+
+    if isinstance(content, (list, tuple)):
+        values: list[tuple[str, Any | None]] = []
+        for part in content:
+            values.extend(iter_text_part(part))
+        return values
+
+    return iter_text_part(content)
+
+
+def iter_text_part(part: Any) -> list[tuple[str, Any | None]]:
+    if isinstance(part, str):
+        return [(part, None)]
+    part_type = message_value(part, "type")
+    if part is None or part_type != "text":
+        return []
+    text = message_value(part, "text")
+    if not isinstance(text, str):
+        return []
+    return [(text, part)]
+
+
+def part_no_save(part: Any) -> bool:
+    value = message_value(part, "_no_save")
+    try:
+        return bool(value)
+    except Exception as exc:  # noqa: BLE001
+        raise _ToolHistoryScanError("读取文本块临时标记失败") from exc
+
+
+def is_max_steps_prompt_message(message: Any, max_steps_prompt: str | None) -> bool:
+    role = message_value(message, "role")
+    if max_steps_prompt is None or role != "user":
+        return False
+    content = message_value(message, "content")
+    if isinstance(content, str):
+        return content == max_steps_prompt
+    text_values = iter_text_values(content)
+    if len(text_values) != 1:
+        return False
+    text, part = text_values[0]
+    return part is not None and not part_no_save(part) and text == max_steps_prompt
 
 
 def is_tool_image_user_message(message: Any) -> bool:
