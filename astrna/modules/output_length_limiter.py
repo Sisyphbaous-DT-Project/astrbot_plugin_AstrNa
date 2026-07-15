@@ -45,7 +45,7 @@ class OutputLengthLimiterModule:
         *,
         context: Any,
         logger: Any,
-        whitelist_umos: str = "",
+        whitelist_umos: Any = None,
         max_chars: int = DEFAULT_OUTPUT_LENGTH_LIMIT,
         provider_id: str = "",
         persona_id: str = "",
@@ -64,7 +64,7 @@ class OutputLengthLimiterModule:
     def configure(
         self,
         *,
-        whitelist_umos: str = "",
+        whitelist_umos: Any = None,
         max_chars: int = DEFAULT_OUTPUT_LENGTH_LIMIT,
         provider_id: str = "",
         persona_id: str = "",
@@ -623,12 +623,29 @@ class SimpleLLMResponse:
         self.usage = usage
 
 
-def parse_whitelist_umos(value: Any) -> set[str]:
-    if isinstance(value, (list, tuple, set)):
-        items = [str(item).strip() for item in value]
+def normalize_whitelist_umo_items(value: Any) -> list[str]:
+    if isinstance(value, str):
+        raw_items = (value,)
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = value
     else:
-        items = UMO_SPLIT_PATTERN.split(str(value or ""))
-    return {item for item in items if item}
+        return []
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_item in raw_items:
+        if not isinstance(raw_item, str):
+            continue
+        for item in UMO_SPLIT_PATTERN.split(raw_item.strip()):
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            normalized.append(item)
+    return normalized
+
+
+def parse_whitelist_umos(value: Any) -> set[str]:
+    return set(normalize_whitelist_umo_items(value))
 
 
 def parse_positive_int(value: Any, default: int) -> int:

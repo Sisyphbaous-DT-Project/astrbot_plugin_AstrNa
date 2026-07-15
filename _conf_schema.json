@@ -144,10 +144,13 @@
     "default": false
   },
   "output_length_limit_whitelist_umos": {
-    "type": "string",
+    "type": "list",
     "description": "输出限制白名单 UMO",
-    "hint": "一行一个或用逗号、分号分隔；命中的会话不会关闭流式，也不会限制输出。适合放行写作群、管理群或需要长回复的私聊。可用 AstrBot 的 /sid 指令获取 UMO。默认留空。",
-    "default": "",
+    "items": {
+      "type": "string"
+    },
+    "hint": "每项填写一个 UMO，可逐项添加多个，也可批量导入；命中的会话不会关闭流式，也不会限制输出。适合放行写作群、管理群或需要长回复的私聊。可用 AstrBot 的 /sid 指令获取 UMO。默认留空。",
+    "default": [],
     "collapsed": true,
     "condition": {
       "output_length_limit_enabled": true
@@ -196,6 +199,64 @@
     "description": "优化回复历史标记",
     "hint": "开启后，AstrNa 会在本轮请求里临时注入中文回复指向说明，明确当前发言人、被引用消息发送者，以及被引用 Bot 回复原本回复给谁，帮助模型区分群聊里的回复对象。QQ 官方 Bot 平台的引用消息缺少可靠的被引用消息发送者信息，AstrNa 无法安全判断引用关系，因此该功能不兼容 QQ 官方 Bot 的引用回复指向优化。AstrNa 也会在发给模型前临时清理旧历史里的内部标记，并移除模型误输出的内部标记，避免污染真实发送内容和后续历史。真实发送到聊天平台的消息不会改变；旧历史不会被批量迁移，只做本轮请求内清理。默认关闭。",
     "default": false
+  },
+  "disable_group_at_bot_wake": {
+    "type": "bool",
+    "description": "关闭群聊 @Bot 唤醒",
+    "hint": "开启后，指定群聊中的 @Bot 不再单独触发 AstrBot 默认回复，消息会像普通群消息一样继续进入群聊上下文、插件和主动回复流程。唤醒词与已识别的有效指令仍然优先；不影响私聊、@全体或 @ 其他成员。默认关闭。",
+    "default": false
+  },
+  "disable_group_at_bot_wake_all_groups": {
+    "type": "bool",
+    "description": "应用于所有群聊",
+    "hint": "开启后，关闭所有群聊的 @Bot 唤醒，并忽略下方群聊 ID 列表。关闭且列表为空时不会影响任何群。默认关闭。",
+    "default": false,
+    "collapsed": true,
+    "condition": {
+      "disable_group_at_bot_wake": true
+    }
+  },
+  "disable_group_at_bot_wake_group_ids": {
+    "type": "list",
+    "description": "关闭 @Bot 唤醒的群聊 ID",
+    "items": {
+      "type": "string"
+    },
+    "hint": "每项填写一个群聊 ID，不需要 UMO；可用 AstrBot 的 /sid 查看群号。开启“应用于所有群聊”时此列表会被忽略；两者都未设置时不会影响任何群。不同平台恰好使用相同群 ID 时会同时命中。",
+    "default": [],
+    "collapsed": true,
+    "condition": {
+      "disable_group_at_bot_wake": true
+    }
+  },
+  "disable_group_reply_to_bot_wake": {
+    "type": "bool",
+    "description": "关闭群聊引用 Bot 唤醒",
+    "hint": "开启后，指定群聊中引用 Bot 消息不再单独触发 AstrBot 默认回复，消息会像普通群消息一样继续进入群聊上下文、插件和主动回复流程。唤醒词与已识别的有效指令仍然优先；不影响引用其他成员。默认关闭。",
+    "default": false
+  },
+  "disable_group_reply_to_bot_wake_all_groups": {
+    "type": "bool",
+    "description": "应用于所有群聊",
+    "hint": "开启后，关闭所有群聊的引用 Bot 唤醒，并忽略下方群聊 ID 列表。关闭且列表为空时不会影响任何群。默认关闭。",
+    "default": false,
+    "collapsed": true,
+    "condition": {
+      "disable_group_reply_to_bot_wake": true
+    }
+  },
+  "disable_group_reply_to_bot_wake_group_ids": {
+    "type": "list",
+    "description": "关闭引用 Bot 唤醒的群聊 ID",
+    "items": {
+      "type": "string"
+    },
+    "hint": "每项填写一个群聊 ID，不需要 UMO；可用 AstrBot 的 /sid 查看群号。开启“应用于所有群聊”时此列表会被忽略；两者都未设置时不会影响任何群。不同平台恰好使用相同群 ID 时会同时命中。QQ 官方 Bot 无法可靠识别被引用消息的发送者，因此不会猜测。",
+    "default": [],
+    "collapsed": true,
+    "condition": {
+      "disable_group_reply_to_bot_wake": true
+    }
   },
   "unlock_group_sender_concurrency": {
     "type": "bool",

@@ -18,12 +18,14 @@ from .modules.image_history_context import ImageHistoryContextModule
 from .modules.group_identity_tools import GroupIdentityToolsModule
 from .modules.group_chat_context_optimizer import GroupChatContextOptimizerModule
 from .modules.group_sender_concurrency import GroupSenderConcurrencyModule
+from .modules.group_wake_suppression import GroupWakeSuppressionModule
 from .modules.identity_metadata import IdentityMetadataModule
 from .modules.issue_assistant import IssueAssistantModule
 from .modules.long_reply_context import LongReplyContextModule
 from .modules.output_length_limiter import (
     DEFAULT_OUTPUT_LENGTH_LIMIT,
     OutputLengthLimiterModule,
+    normalize_whitelist_umo_items,
 )
 from .modules.quoted_image_input import QuotedImageInputModule
 from .modules.reply_target_history import ReplyTargetHistoryModule
@@ -50,12 +52,18 @@ DEFAULT_CONFIG = {
     "optimize_image_caption": False,
     "optimize_send_message_to_user": False,
     "output_length_limit_enabled": False,
-    "output_length_limit_whitelist_umos": "",
+    "output_length_limit_whitelist_umos": [],
     "output_length_limit_max_chars": DEFAULT_OUTPUT_LENGTH_LIMIT,
     "output_length_limit_provider_id": "",
     "output_length_limit_persona_id": "",
     "provide_group_identity_tools": False,
     "optimize_reply_target_history": False,
+    "disable_group_at_bot_wake": False,
+    "disable_group_at_bot_wake_all_groups": False,
+    "disable_group_at_bot_wake_group_ids": [],
+    "disable_group_reply_to_bot_wake": False,
+    "disable_group_reply_to_bot_wake_all_groups": False,
+    "disable_group_reply_to_bot_wake_group_ids": [],
     "optimize_long_reply_context": False,
     "unlock_group_sender_concurrency": False,
     "issue_assistant_enabled": False,
@@ -79,8 +87,11 @@ class AstrNaRuntime:
         kv_store: Any | None = None,
     ):
         self.context = context
+        _migrate_output_length_whitelist_config(config)
         self.config = merge_config(config)
         self.logger = logger
+        self._closed = False
+        self._lifecycle_token = object()
         # 每个 Runtime 使用独立令牌，避免旧实例或并发事件误释放当前实例的计数。
         self._request_activity_owner_token = object()
         self._request_activity_events: dict[int, tuple[object, Any]] = {}
@@ -103,7 +114,7 @@ class AstrNaRuntime:
         self.output_length_limiter = OutputLengthLimiterModule(
             context=context,
             logger=logger,
-            whitelist_umos=self.config.get("output_length_limit_whitelist_umos", ""),
+            whitelist_umos=self.config.get("output_length_limit_whitelist_umos", []),
             max_chars=self.config.get(
                 "output_length_limit_max_chars",
                 DEFAULT_OUTPUT_LENGTH_LIMIT,
@@ -130,6 +141,30 @@ class AstrNaRuntime:
             logger=logger,
             enabled=self.config.get("custom_builtin_commands_enabled", False),
             allowlist=self.config.get("custom_builtin_commands_allowlist", []),
+        )
+        self.group_wake_suppression = GroupWakeSuppressionModule(
+            logger=logger,
+            disable_at_bot_wake=self.config.get("disable_group_at_bot_wake", False),
+            disable_at_bot_wake_all_groups=self.config.get(
+                "disable_group_at_bot_wake_all_groups",
+                False,
+            ),
+            disable_at_bot_wake_group_ids=self.config.get(
+                "disable_group_at_bot_wake_group_ids",
+                [],
+            ),
+            disable_reply_to_bot_wake=self.config.get(
+                "disable_group_reply_to_bot_wake",
+                False,
+            ),
+            disable_reply_to_bot_wake_all_groups=self.config.get(
+                "disable_group_reply_to_bot_wake_all_groups",
+                False,
+            ),
+            disable_reply_to_bot_wake_group_ids=self.config.get(
+                "disable_group_reply_to_bot_wake_group_ids",
+                [],
+            ),
         )
         self._configure_group_context_persist_callback()
         self.issue_assistant = IssueAssistantModule(
@@ -171,11 +206,13 @@ class AstrNaRuntime:
             self.group_sender_concurrency.install()
         if self.config.get("optimize_group_chat_context", False):
             self.group_chat_context_optimizer.install()
-        if self.config.get("custom_builtin_commands_enabled", False):
-            self.builtin_command_allowlist.install()
+        self._configure_waking_check_chain()
         self._configure_auto_cache_cleanup()
 
     async def sanitize_request(self, event: Any, req: Any) -> None:
+        lifecycle_token = self._lifecycle_token
+        if not self._is_lifecycle_current(lifecycle_token):
+            return
         self.begin_request_activity(event)
         self.reply_target_history.set_semantic_enabled(
             self.config.get("optimize_reply_target_history", False),
@@ -225,6 +262,8 @@ class AstrNaRuntime:
 
         if self.config.get("optimize_quoted_image_input", False):
             await self.quoted_image_input.optimize(event, req)
+            if not self._is_lifecycle_current(lifecycle_token):
+                return
 
         if self.config.get("optimize_dynamic_system_prompt", False):
             self.dynamic_system_prompt.install()
@@ -241,7 +280,7 @@ class AstrNaRuntime:
         )
         if output_length_limit_enabled:
             self.output_length_limiter.configure(
-                whitelist_umos=self.config.get("output_length_limit_whitelist_umos", ""),
+                whitelist_umos=self.config.get("output_length_limit_whitelist_umos", []),
                 max_chars=self.config.get(
                     "output_length_limit_max_chars",
                     DEFAULT_OUTPUT_LENGTH_LIMIT,
@@ -289,6 +328,8 @@ class AstrNaRuntime:
 
         self._configure_issue_assistant()
         await self.issue_assistant.prepare_request(event, req)
+        if not self._is_lifecycle_current(lifecycle_token):
+            return
 
         self.reply_target_history.sanitize_request(req)
 
@@ -342,7 +383,7 @@ class AstrNaRuntime:
         else:
             self.group_chat_context_optimizer.terminate()
 
-        self._configure_builtin_command_allowlist()
+        self._configure_waking_check_chain(lifecycle_token=lifecycle_token)
         self._configure_auto_cache_cleanup()
 
         if self.config.get("optimize_identity_metadata", False):
@@ -367,6 +408,8 @@ class AstrNaRuntime:
                     False,
                 ),
             )
+            if not self._is_lifecycle_current(lifecycle_token):
+                return
 
     async def handle_plugin_error(
         self,
@@ -486,18 +529,67 @@ class AstrNaRuntime:
         else:
             self.auto_cache_cleanup.terminate()
 
-    def _configure_builtin_command_allowlist(self) -> None:
-        enabled = self.config.get("custom_builtin_commands_enabled", False)
+    def _configure_waking_check_chain(
+        self,
+        *,
+        lifecycle_token: object | None = None,
+    ) -> None:
+        """稳定维护内置指令与群聊唤醒控制共用的 WakingCheck 补丁链。"""
+        if getattr(self, "_closed", False) or (
+            lifecycle_token is not None
+            and not self._is_lifecycle_current(lifecycle_token)
+        ):
+            return
+        builtin_enabled = self.config.get("custom_builtin_commands_enabled", False)
         self.builtin_command_allowlist.configure(
-            enabled=enabled,
+            enabled=builtin_enabled,
             allowlist=self.config.get("custom_builtin_commands_allowlist", []),
         )
-        if enabled:
-            self.builtin_command_allowlist.install()
-        else:
+        self.group_wake_suppression.configure(
+            disable_at_bot_wake=self.config.get("disable_group_at_bot_wake", False),
+            disable_at_bot_wake_all_groups=self.config.get(
+                "disable_group_at_bot_wake_all_groups",
+                False,
+            ),
+            disable_at_bot_wake_group_ids=self.config.get(
+                "disable_group_at_bot_wake_group_ids",
+                [],
+            ),
+            disable_reply_to_bot_wake=self.config.get(
+                "disable_group_reply_to_bot_wake",
+                False,
+            ),
+            disable_reply_to_bot_wake_all_groups=self.config.get(
+                "disable_group_reply_to_bot_wake_all_groups",
+                False,
+            ),
+            disable_reply_to_bot_wake_group_ids=self.config.get(
+                "disable_group_reply_to_bot_wake_group_ids",
+                [],
+            ),
+        )
+        group_wake_enabled = self.group_wake_suppression.has_active_rules
+        builtin_will_change = (
+            bool(getattr(self.builtin_command_allowlist, "_installed", False))
+            != bool(builtin_enabled)
+        )
+        group_wake_will_change = (
+            bool(getattr(self.group_wake_suppression, "_installed", False))
+            != group_wake_enabled
+        )
+
+        if builtin_will_change or group_wake_will_change:
+            # 补丁链固定为原生 -> 白名单 -> 群聊唤醒控制，重排时反向拆除。
+            self.group_wake_suppression.terminate()
             self.builtin_command_allowlist.terminate()
+        if builtin_enabled:
+            self.builtin_command_allowlist.install()
+        if group_wake_enabled:
+            self.group_wake_suppression.install()
 
     async def on_astrbot_loaded(self) -> None:
+        if getattr(self, "_closed", False):
+            return
         self._configure_auto_cache_cleanup()
 
     def record_activity(self) -> None:
@@ -556,7 +648,18 @@ class AstrNaRuntime:
     def end_send_activity(self) -> None:
         self.auto_cache_cleanup.end_send_activity()
 
+    def _is_lifecycle_current(self, lifecycle_token: object) -> bool:
+        return (
+            not getattr(self, "_closed", False)
+            and lifecycle_token is getattr(self, "_lifecycle_token", None)
+        )
+
     async def terminate(self) -> None:
+        self._closed = True
+        self._lifecycle_token = object()
+        # 共享唤醒链必须在第一个 await 前拆除，避免旧 Runtime 继续占用全局入口。
+        self.group_wake_suppression.terminate()
+        self.builtin_command_allowlist.terminate()
         await self.issue_assistant.terminate()
         self.group_sender_concurrency.terminate()
         self.group_chat_context_optimizer.terminate()
@@ -573,7 +676,6 @@ class AstrNaRuntime:
         self.deepseek_v4_400.terminate()
         self.auto_cache_cleanup.terminate()
         self._request_activity_events.clear()
-        self.builtin_command_allowlist.terminate()
         await asyncio.gather(
             self.group_chat_context_optimizer.drain_pending_operations(timeout=0.05),
             self.output_length_limiter.drain_pending_operations(timeout=0.05),
@@ -598,6 +700,17 @@ def merge_config(config: dict | None) -> dict[str, Any]:
             merged[key] = config[key]
 
     return merged
+
+
+def _migrate_output_length_whitelist_config(config: dict | None) -> None:
+    if not isinstance(config, dict):
+        return
+    key = "output_length_limit_whitelist_umos"
+    if key not in config or isinstance(config[key], list):
+        return
+    # AstrBot 不会按新 Schema 自动转换旧值；同步修改共享配置对象，避免 WebUI
+    # 把旧字符串当成字符列表展示。用户下次保存配置时会自然写回新格式。
+    config[key] = normalize_whitelist_umo_items(config[key])
 
 
 def _event_reference(reference: Any) -> Any:

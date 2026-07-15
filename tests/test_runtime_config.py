@@ -24,12 +24,18 @@ def test_merge_config_keeps_defaults_for_missing_values():
         "optimize_image_caption": False,
         "optimize_send_message_to_user": False,
         "output_length_limit_enabled": False,
-        "output_length_limit_whitelist_umos": "",
+        "output_length_limit_whitelist_umos": [],
         "output_length_limit_max_chars": 50,
         "output_length_limit_provider_id": "",
         "output_length_limit_persona_id": "",
         "provide_group_identity_tools": False,
         "optimize_reply_target_history": False,
+        "disable_group_at_bot_wake": False,
+        "disable_group_at_bot_wake_all_groups": False,
+        "disable_group_at_bot_wake_group_ids": [],
+        "disable_group_reply_to_bot_wake": False,
+        "disable_group_reply_to_bot_wake_all_groups": False,
+        "disable_group_reply_to_bot_wake_group_ids": [],
         "unlock_group_sender_concurrency": False,
         "optimize_group_chat_context": False,
         "group_chat_context_compress_provider_id": "",
@@ -63,14 +69,21 @@ def test_merge_config_can_enable_modules():
             "optimize_image_caption": True,
             "optimize_send_message_to_user": True,
             "output_length_limit_enabled": True,
-            "output_length_limit_whitelist_umos": (
-                "aiocqhttp:GroupMessage:123\naiocqhttp:PrivateMessage:456"
-            ),
+            "output_length_limit_whitelist_umos": [
+                "aiocqhttp:GroupMessage:123",
+                "aiocqhttp:PrivateMessage:456",
+            ],
             "output_length_limit_max_chars": 80,
             "output_length_limit_provider_id": "clean-provider",
             "output_length_limit_persona_id": "persona-1",
             "provide_group_identity_tools": True,
             "optimize_reply_target_history": True,
+            "disable_group_at_bot_wake": True,
+            "disable_group_at_bot_wake_all_groups": False,
+            "disable_group_at_bot_wake_group_ids": ["123", "456"],
+            "disable_group_reply_to_bot_wake": True,
+            "disable_group_reply_to_bot_wake_all_groups": True,
+            "disable_group_reply_to_bot_wake_group_ids": ["ignored"],
             "unlock_group_sender_concurrency": True,
             "optimize_group_chat_context": True,
             "group_chat_context_compress_provider_id": "compress-provider",
@@ -102,14 +115,21 @@ def test_merge_config_can_enable_modules():
         "optimize_image_caption": True,
         "optimize_send_message_to_user": True,
         "output_length_limit_enabled": True,
-        "output_length_limit_whitelist_umos": (
-            "aiocqhttp:GroupMessage:123\naiocqhttp:PrivateMessage:456"
-        ),
+        "output_length_limit_whitelist_umos": [
+            "aiocqhttp:GroupMessage:123",
+            "aiocqhttp:PrivateMessage:456",
+        ],
         "output_length_limit_max_chars": 80,
         "output_length_limit_provider_id": "clean-provider",
         "output_length_limit_persona_id": "persona-1",
         "provide_group_identity_tools": True,
         "optimize_reply_target_history": True,
+        "disable_group_at_bot_wake": True,
+        "disable_group_at_bot_wake_all_groups": False,
+        "disable_group_at_bot_wake_group_ids": ["123", "456"],
+        "disable_group_reply_to_bot_wake": True,
+        "disable_group_reply_to_bot_wake_all_groups": True,
+        "disable_group_reply_to_bot_wake_group_ids": ["ignored"],
         "unlock_group_sender_concurrency": True,
         "optimize_group_chat_context": True,
         "group_chat_context_compress_provider_id": "compress-provider",
@@ -127,6 +147,20 @@ def test_merge_config_supports_old_identity_metadata_key():
     config = merge_config({"identity_metadata": True})
 
     assert config["optimize_identity_metadata"] is True
+
+
+def test_runtime_migrates_legacy_output_whitelist_for_list_editor(fakes):
+    first = "aiocqhttp:GroupMessage:123"
+    second = "aiocqhttp:PrivateMessage:456"
+    config = {
+        "output_length_limit_whitelist_umos": f" {first}，\n{second};{first} ",
+    }
+
+    runtime = fakes.build_runtime(config)
+
+    assert config["output_length_limit_whitelist_umos"] == [first, second]
+    assert runtime.config["output_length_limit_whitelist_umos"] == [first, second]
+    assert runtime.output_length_limiter.whitelist_umos == {first, second}
 
 
 def test_long_reply_group_context_persist_callback_follows_optimizer_switch(fakes):

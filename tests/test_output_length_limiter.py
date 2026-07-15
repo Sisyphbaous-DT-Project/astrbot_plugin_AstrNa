@@ -6,7 +6,10 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from astrna.modules.output_length_limiter import OutputLengthLimiterModule
+from astrna.modules.output_length_limiter import (
+    OutputLengthLimiterModule,
+    parse_whitelist_umos,
+)
 from astrna.modules.send_message_to_user import (
     NORMAL_CHAT_REQUEST_ATTR,
     NORMAL_CHAT_REQUEST_MARKER,
@@ -314,24 +317,46 @@ def test_live_event_is_not_disabled_or_limited(astrbot_runner_modules):
     asyncio.run(runtime.terminate())
 
 
-def test_whitelist_keeps_streaming_and_response_unchanged(astrbot_runner_modules):
+def test_multiple_whitelist_umos_keep_streaming_and_response_unchanged(
+    astrbot_runner_modules,
+):
+    whitelist_umos = [
+        "aiocqhttp:GroupMessage:123456",
+        "aiocqhttp:PrivateMessage:654321",
+    ]
     runtime = build_runtime(
         {
             "output_length_limit_enabled": True,
-            "output_length_limit_whitelist_umos": "aiocqhttp:GroupMessage:123456",
+            "output_length_limit_whitelist_umos": whitelist_umos,
             "output_length_limit_max_chars": 5,
         },
     )
-    event = DummyEvent()
-    response = long_response()
-    runner = build_runner(response, event=event)
 
-    asyncio.run(collect_internal_process(astrbot_runner_modules, event))
-    [actual] = asyncio.run(collect_runner_responses(runner))
+    for umo in whitelist_umos:
+        event = DummyEvent(umo=umo)
+        response = long_response()
+        runner = build_runner(response, event=event)
 
-    assert event.get_extra("enable_streaming") is None
-    assert actual is response
+        asyncio.run(collect_internal_process(astrbot_runner_modules, event))
+        [actual] = asyncio.run(collect_runner_responses(runner))
+
+        assert event.get_extra("enable_streaming") is None
+        assert actual is response
     asyncio.run(runtime.terminate())
+
+
+def test_whitelist_parser_supports_new_list_and_legacy_delimited_string():
+    first = "aiocqhttp:GroupMessage:123456"
+    second = "aiocqhttp:PrivateMessage:654321"
+
+    assert parse_whitelist_umos([first, "", second, first, None, True]) == {
+        first,
+        second,
+    }
+    assert parse_whitelist_umos(f" {first}，\n{second};{first} ") == {
+        first,
+        second,
+    }
 
 
 def test_short_response_is_not_cleaned(astrbot_runner_modules):

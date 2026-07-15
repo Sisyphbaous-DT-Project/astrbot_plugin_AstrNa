@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.4.5"
+    assert metadata["version"] == "1.4.6"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -53,6 +53,12 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "output_length_limit_persona_id",
         "provide_group_identity_tools",
         "optimize_reply_target_history",
+        "disable_group_at_bot_wake",
+        "disable_group_at_bot_wake_all_groups",
+        "disable_group_at_bot_wake_group_ids",
+        "disable_group_reply_to_bot_wake",
+        "disable_group_reply_to_bot_wake_all_groups",
+        "disable_group_reply_to_bot_wake_group_ids",
         "unlock_group_sender_concurrency",
         "auto_cleanup_astrbot_cache",
         "custom_builtin_commands_enabled",
@@ -199,17 +205,21 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
     assert "正常发送链" in schema["output_length_limit_enabled"]["hint"]
     assert "关闭本轮流式输出" in schema["output_length_limit_enabled"]["hint"]
     assert "Live Mode" in schema["output_length_limit_enabled"]["hint"]
-    assert schema["output_length_limit_whitelist_umos"]["type"] == "string"
+    assert schema["output_length_limit_whitelist_umos"]["type"] == "list"
     assert (
         schema["output_length_limit_whitelist_umos"]["description"]
         == "输出限制白名单 UMO"
     )
-    assert schema["output_length_limit_whitelist_umos"]["default"] == ""
+    assert schema["output_length_limit_whitelist_umos"]["items"] == {
+        "type": "string",
+    }
+    assert schema["output_length_limit_whitelist_umos"]["default"] == []
     assert schema["output_length_limit_whitelist_umos"]["collapsed"] is True
     assert schema["output_length_limit_whitelist_umos"]["condition"] == {
         "output_length_limit_enabled": True,
     }
     assert "/sid" in schema["output_length_limit_whitelist_umos"]["hint"]
+    assert "添加多个" in schema["output_length_limit_whitelist_umos"]["hint"]
     assert schema["output_length_limit_max_chars"]["type"] == "int"
     assert schema["output_length_limit_max_chars"]["description"] == "最多输出字数"
     assert schema["output_length_limit_max_chars"]["default"] == 50
@@ -250,6 +260,44 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         == "优化回复历史标记"
     )
     assert schema["optimize_reply_target_history"]["default"] is False
+    assert schema["disable_group_at_bot_wake"]["type"] == "bool"
+    assert schema["disable_group_at_bot_wake"]["default"] is False
+    assert "@Bot" in schema["disable_group_at_bot_wake"]["hint"]
+    assert schema["disable_group_at_bot_wake_all_groups"]["type"] == "bool"
+    assert schema["disable_group_at_bot_wake_all_groups"]["default"] is False
+    assert schema["disable_group_at_bot_wake_all_groups"]["collapsed"] is True
+    assert schema["disable_group_at_bot_wake_all_groups"]["condition"] == {
+        "disable_group_at_bot_wake": True,
+    }
+    assert schema["disable_group_at_bot_wake_group_ids"]["type"] == "list"
+    assert schema["disable_group_at_bot_wake_group_ids"]["items"] == {
+        "type": "string",
+    }
+    assert schema["disable_group_at_bot_wake_group_ids"]["default"] == []
+    assert schema["disable_group_at_bot_wake_group_ids"]["collapsed"] is True
+    assert schema["disable_group_at_bot_wake_group_ids"]["condition"] == {
+        "disable_group_at_bot_wake": True,
+    }
+    assert "/sid" in schema["disable_group_at_bot_wake_group_ids"]["hint"]
+    assert schema["disable_group_reply_to_bot_wake"]["type"] == "bool"
+    assert schema["disable_group_reply_to_bot_wake"]["default"] is False
+    assert "引用 Bot" in schema["disable_group_reply_to_bot_wake"]["description"]
+    assert schema["disable_group_reply_to_bot_wake_all_groups"]["type"] == "bool"
+    assert schema["disable_group_reply_to_bot_wake_all_groups"]["default"] is False
+    assert schema["disable_group_reply_to_bot_wake_all_groups"]["collapsed"] is True
+    assert schema["disable_group_reply_to_bot_wake_all_groups"]["condition"] == {
+        "disable_group_reply_to_bot_wake": True,
+    }
+    assert schema["disable_group_reply_to_bot_wake_group_ids"]["type"] == "list"
+    assert schema["disable_group_reply_to_bot_wake_group_ids"]["items"] == {
+        "type": "string",
+    }
+    assert schema["disable_group_reply_to_bot_wake_group_ids"]["default"] == []
+    assert schema["disable_group_reply_to_bot_wake_group_ids"]["collapsed"] is True
+    assert schema["disable_group_reply_to_bot_wake_group_ids"]["condition"] == {
+        "disable_group_reply_to_bot_wake": True,
+    }
+    assert "QQ 官方 Bot" in schema["disable_group_reply_to_bot_wake_group_ids"]["hint"]
     assert schema["unlock_group_sender_concurrency"]["type"] == "bool"
     assert (
         schema["unlock_group_sender_concurrency"]["description"]
@@ -391,5 +439,6 @@ def test_changelog_contains_release_notes():
     assert "## 1.4.3" in changelog
     assert "## 1.4.4" in changelog
     assert "## 1.4.5" in changelog
+    assert "## 1.4.6" in changelog
     assert "## 1.2.5" in changelog
     assert "## 1.2.4" in changelog

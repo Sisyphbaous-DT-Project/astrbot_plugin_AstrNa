@@ -533,6 +533,7 @@ def test_reinstall_after_restore_does_not_stack_wrappers(fake_astrbot_modules):
 def test_help_patch_can_be_added_after_delayed_import(fake_astrbot_modules, monkeypatch):
     help_module_name = "astrbot.builtin_stars.builtin_commands.commands.help"
     help_module = sys.modules.pop(help_module_name)
+    monkeypatch.setitem(sys.modules, help_module_name, None)
     module = BuiltinCommandAllowlistModule(
         logger=FakeLogger(),
         enabled=True,
