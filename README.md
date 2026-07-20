@@ -5,9 +5,9 @@ AstrNa 是一款面向 AstrBot 的优化插件，目标是在不修改 AstrBot C
 > 💌 售后：`777879783`
 > 有问题请加，清漪也会蹦出来一起捣鼓。
 
-🎉 AstrNa 正式版已经发布。当前正式版：`1.4.6`
+🎉 AstrNa 正式版已经发布。当前正式版：`1.4.7`
 
-当前已测试兼容 AstrBot 版本：`4.26.6`
+当前已测试兼容 AstrBot 版本：`4.26.7`
 
 - 仓库地址：[Sisyphbaous-DT-Project/astrbot_plugin_AstrNa](https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_AstrNa)
 - 作者主页：[Sisyphbaous-DT-Project](https://github.com/Sisyphbaous-DT-Project)
@@ -438,7 +438,7 @@ AstrNa 主要面向 AstrBot 当前 4.x 版本。当前版本已在本地 AstrBot
 
 ## 验证状态
 
-最近版本发布前通过以下验证，当前已测试兼容 AstrBot `4.26.6`：
+最近版本发布前通过以下验证，当前已测试兼容 AstrBot `4.26.7`：
 
 ```bash
 TMPDIR=/tmp PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q -s
