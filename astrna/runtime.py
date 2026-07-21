@@ -230,6 +230,9 @@ class AstrNaRuntime:
         group_concurrency_enabled = bool(
             self.config.get("unlock_group_sender_concurrency", False)
         )
+        if group_concurrency_enabled:
+            # 必须在图片/工具历史清理和回复目标等模块改写请求前捕获数据库原稿。
+            self.group_sender_concurrency.capture_base_snapshot(event, req)
         image_history_will_change = (
             bool(getattr(self.image_history_context, "_installed", False))
             != image_history_enabled

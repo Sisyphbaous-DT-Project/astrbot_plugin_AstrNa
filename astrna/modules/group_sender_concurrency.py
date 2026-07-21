@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import copy
+import hashlib
 import inspect
 import json
 import weakref
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -36,6 +39,10 @@ _GROUP_SEND_LOCKS: weakref.WeakKeyDictionary[
     weakref.WeakValueDictionary[str, asyncio.Lock],
 ] = weakref.WeakKeyDictionary()
 
+_BASE_SNAPSHOT_EXTRA = "astrna_gsc_history_base"
+_TURN_ANCHOR_EXTRA = "astrna_gsc_turn_anchor"
+_COMMIT_RECEIPT_LIMIT = 512
+
 
 @dataclass
 class GroupSenderKey:
@@ -54,6 +61,8 @@ class SaveContext:
     umo: str
     conversation_id: str
     base_history: list[Any]
+    unit_start: int | None = None
+    expected_total: int | None = None
 
 
 @dataclass
@@ -131,6 +140,7 @@ class GroupSenderConcurrencyModule:
         self._group_gates: dict[tuple[int, str], GroupConcurrencyGate] = {}
         self._write_locks: dict[tuple[int, str], asyncio.Lock] = {}
         self._active_runners: dict[tuple[str, str], Any] = {}
+        self._commit_receipts: OrderedDict[tuple[int, str, str], str] = OrderedDict()
 
     def install(self) -> bool:
         if self._installed and type(self)._active_module is self:
@@ -168,6 +178,7 @@ class GroupSenderConcurrencyModule:
             self._group_gates.clear()
             self._write_locks.clear()
             self._active_runners.clear()
+            self._commit_receipts.clear()
 
     @classmethod
     def restore_patch(cls) -> None:
@@ -790,6 +801,61 @@ class GroupSenderConcurrencyModule:
             return None
         return lock_scope
 
+    def capture_base_snapshot(self, event: Any, req: Any) -> None:
+        """在 AstrNa 各模块改写请求前，捕获数据库历史原稿快照。
+
+        原稿只能来自 req.conversation.history；req.contexts 已混入人格预设
+        对话和其他提示词变换，不是数据库原稿。任何失败都只记日志，后续保存
+        会自然退化为直接使用 AstrBot 的结果。
+        """
+        try:
+            sender_key = build_group_sender_key(event)
+            if sender_key is None:
+                return
+            conversation = getattr(req, "conversation", None)
+            conversation_id = sanitize_text(getattr(conversation, "cid", None))
+            if not conversation_id:
+                return
+            base_history = parse_history_value(getattr(conversation, "history", None))
+            if base_history is None:
+                return
+            setter = getattr(event, "set_extra", None)
+            if not callable(setter):
+                return
+            setter(
+                _BASE_SNAPSHOT_EXTRA,
+                {
+                    "umo": sender_key.umo,
+                    "conversation_id": conversation_id,
+                    "base_history": copy.deepcopy(base_history),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log("warning", "AstrNa 捕获群聊并发历史原稿失败: %s", exc)
+
+    def capture_turn_anchor(self, event: Any, runner: Any) -> None:
+        """在 runner reset 完成后捕获本轮真实 user 消息对象作为合并锚点。"""
+        try:
+            snapshot = safe_call(getattr(event, "get_extra", None), _BASE_SNAPSHOT_EXTRA)
+            if not isinstance(snapshot, dict):
+                return
+            req = getattr(runner, "req", None)
+            conversation = getattr(req, "conversation", None)
+            conversation_id = sanitize_text(getattr(conversation, "cid", None))
+            if not conversation_id or conversation_id != snapshot.get("conversation_id"):
+                return
+            messages = getattr(getattr(runner, "run_context", None), "messages", None)
+            if not isinstance(messages, list) or not messages:
+                return
+            anchor = messages[-1]
+            if message_role(anchor) != "user" or message_no_save(anchor):
+                return
+            setter = getattr(event, "set_extra", None)
+            if callable(setter):
+                setter(_TURN_ANCHOR_EXTRA, anchor)
+        except Exception as exc:  # noqa: BLE001
+            self._log("warning", "AstrNa 捕获群聊并发轮次锚点失败: %s", exc)
+
     def build_save_context(
         self,
         args: tuple[Any, ...],
@@ -797,22 +863,40 @@ class GroupSenderConcurrencyModule:
     ) -> SaveContext | None:
         event = args[1] if len(args) > 1 else kwargs.get("event")
         req = args[2] if len(args) > 2 else kwargs.get("req")
+        all_messages = args[4] if len(args) > 4 else kwargs.get("all_messages")
         sender_key = build_group_sender_key(event)
         if sender_key is None:
             return None
+        snapshot = safe_call(getattr(event, "get_extra", None), _BASE_SNAPSHOT_EXTRA)
+        if not isinstance(snapshot, dict):
+            return None
+        if snapshot.get("umo") != sender_key.umo:
+            return None
         conversation = getattr(req, "conversation", None)
         conversation_id = sanitize_text(getattr(conversation, "cid", None))
-        if not conversation_id:
+        if not conversation_id or conversation_id != snapshot.get("conversation_id"):
             return None
-        base_history = parse_history_value(getattr(req, "contexts", None))
-        if base_history is None:
-            base_history = parse_history_value(getattr(conversation, "history", None))
-        if base_history is None:
-            base_history = []
+        base_history = snapshot.get("base_history")
+        if not isinstance(base_history, list):
+            return None
+        unit_start = None
+        expected_total = None
+        anchor = safe_call(getattr(event, "get_extra", None), _TURN_ANCHOR_EXTRA)
+        if anchor is not None and isinstance(all_messages, list):
+            checkpoint_id = safe_call(getattr(event, "get_extra", None), "llm_checkpoint_id")
+            located = locate_current_unit(
+                all_messages,
+                anchor,
+                isinstance(checkpoint_id, str) and bool(checkpoint_id),
+            )
+            if located is not None:
+                unit_start, expected_total = located
         return SaveContext(
             umo=sender_key.umo,
             conversation_id=conversation_id,
             base_history=base_history,
+            unit_start=unit_start,
+            expected_total=expected_total,
         )
 
     async def update_conversation_with_merge(
@@ -834,25 +918,116 @@ class GroupSenderConcurrencyModule:
             return await original_update(manager_self, *args, **kwargs)
 
         async with self.get_write_lock(save_context.umo):
+            chosen = history
+            branch = "fallback-no-latest"
             latest_history = await fetch_latest_history(
                 manager_self,
                 save_context.umo,
                 save_context.conversation_id,
             )
-            if latest_history is None:
-                return await original_update(manager_self, *args, **kwargs)
-            merged_history = merge_histories(
-                save_context.base_history,
-                latest_history,
-                history,
-            )
+            if latest_history is not None:
+                try:
+                    chosen, branch = self.choose_merged_history(
+                        save_context,
+                        latest_history,
+                        history,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    chosen = history
+                    branch = "fallback-error"
+                    self._log(
+                        "warning",
+                        "AstrNa 群聊并发历史合并比较失败，保存 AstrBot 结果: %s",
+                        exc,
+                    )
             merged_args = list(args)
             merged_kwargs = dict(kwargs)
             if len(merged_args) > 2:
-                merged_args[2] = merged_history
+                merged_args[2] = chosen
             else:
-                merged_kwargs["history"] = merged_history
-            return await original_update(manager_self, *merged_args, **merged_kwargs)
+                merged_kwargs["history"] = chosen
+            if chosen is not history and not digests_equal(chosen, history):
+                # 合并带回了 AstrBot 不知道的额外并发轮次，本次 token 计数会
+                # 低估真实历史长度；置 0 让 AstrBot 下一轮改用内容估算。
+                if len(merged_args) > 5:
+                    merged_args[5] = 0
+                else:
+                    merged_kwargs["token_usage"] = 0
+            result = await original_update(manager_self, *merged_args, **merged_kwargs)
+            self._remember_receipt(save_context, chosen)
+            self._log(
+                "info",
+                "AstrNa 群聊并发历史保存: branch=%s base=%d latest=%s new=%d chosen=%d",
+                branch,
+                len(save_context.base_history),
+                len(latest_history) if isinstance(latest_history, list) else "-",
+                len(history),
+                len(chosen),
+            )
+            return result
+
+    def choose_merged_history(
+        self,
+        save_context: SaveContext,
+        latest_history: list[Any],
+        new_history: list[Any],
+    ) -> tuple[list[Any], str]:
+        """按可信收据决定最终历史；无法证明合并安全时返回 AstrBot 的结果。"""
+        unit_start = save_context.unit_start
+        if (
+            unit_start is None
+            or save_context.expected_total != len(new_history)
+            or not 0 <= unit_start < len(new_history)
+            or message_role(new_history[unit_start]) != "user"
+        ):
+            return new_history, "fallback-no-anchor"
+        base_history = save_context.base_history
+        latest_digest = structural_digest(latest_history)
+        if latest_digest == structural_digest(base_history):
+            return new_history, "no-concurrent-write"
+        receipt = self._get_receipt(save_context)
+        if receipt is None or latest_digest != receipt:
+            return new_history, "fallback-untrusted-latest"
+        current_unit = new_history[unit_start:]
+        if len(latest_history) > len(base_history) and structural_digest(
+            latest_history[: len(base_history)],
+        ) == structural_digest(base_history):
+            # latest 是 base 后追加了其他并发请求：保留 AstrBot 为本请求生成
+            # 的短底稿/摘要，只补回并发分支和当前请求的完整写入单元。
+            merged = (
+                new_history[:unit_start]
+                + latest_history[len(base_history) :]
+                + current_unit
+            )
+            return merged, "merge-append"
+        # 另一请求已完成截断、历史清理或 LLM 摘要：信任其短历史，追加当前单元。
+        return list(latest_history) + current_unit, "merge-after-rewrite"
+
+    def _receipt_key(self, save_context: SaveContext) -> tuple[int, str, str]:
+        return (
+            id(asyncio.get_running_loop()),
+            save_context.umo,
+            save_context.conversation_id,
+        )
+
+    def _get_receipt(self, save_context: SaveContext) -> str | None:
+        key = self._receipt_key(save_context)
+        digest = self._commit_receipts.get(key)
+        if digest is not None:
+            self._commit_receipts.move_to_end(key)
+        return digest
+
+    def _remember_receipt(self, save_context: SaveContext, chosen: list[Any]) -> None:
+        """数据库保存成功后记录内容摘要；摘要失败时跳过，不保存聊天正文。"""
+        try:
+            digest = structural_digest(chosen)
+        except Exception:  # noqa: BLE001
+            return
+        key = self._receipt_key(save_context)
+        self._commit_receipts[key] = digest
+        self._commit_receipts.move_to_end(key)
+        while len(self._commit_receipts) > _COMMIT_RECEIPT_LIMIT:
+            self._commit_receipts.popitem(last=False)
 
     def get_write_lock(self, key: str) -> asyncio.Lock:
         loop_key = (id(asyncio.get_running_loop()), key)
@@ -969,6 +1144,7 @@ class GroupSenderConcurrencyModule:
         if sender_key is None or sender_key.umo != str(umo):
             return False
         self._active_runners[(sender_key.umo, sender_key.sender_id)] = runner
+        self.capture_turn_anchor(event, runner)
         return True
 
     def unregister_sender_runner(self, umo: str, runner: Any) -> bool:
@@ -1086,90 +1262,89 @@ def is_group_unified_msg_origin(umo: str) -> bool:
     return len(parts) >= 2 and parts[1] == "GroupMessage"
 
 
-def merge_histories(
-    base_history: list[Any],
-    latest_history: list[Any],
-    new_history: list[Any],
-) -> list[Any]:
-    if not isinstance(latest_history, list) or not isinstance(new_history, list):
-        return new_history
-    base = base_history if isinstance(base_history, list) else []
-    prefix_len = common_prefix_length(base, new_history)
-    if prefix_len != len(base):
-        tail = infer_new_tail(base, new_history)
-        return append_tail_without_duplicates(latest_history, tail)
-
-    tail = new_history[prefix_len:]
-    if not tail:
-        return latest_history
-    return append_tail_without_duplicates(latest_history, tail)
-
-
-def infer_new_tail(base_history: list[Any], new_history: list[Any]) -> list[Any]:
-    base = base_history if isinstance(base_history, list) else []
-    if not base:
-        return list(new_history)
-    if not new_history:
-        return []
-
-    current_turn_tail = infer_current_turn_tail(new_history)
-    if current_turn_tail:
-        return current_turn_tail
-
-    base_fingerprints = {message_fingerprint(item) for item in base}
-    last_base_fingerprint = message_fingerprint(base[-1])
-    for index in range(len(new_history) - 1, -1, -1):
-        if message_fingerprint(new_history[index]) == last_base_fingerprint:
-            return list(new_history[index + 1 :])
-
-    tail: list[Any] = []
-    for item in new_history:
-        if message_fingerprint(item) not in base_fingerprints:
-            tail.append(item)
-    return tail or list(new_history[-2:])
+def normalize_for_digest(value: Any) -> Any:
+    """递归规范化历史消息用于结构摘要；未知类型直接抛错进保守回退。"""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        normalized: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"unsupported history key type: {type(key)!r}")
+            normalized[key] = normalize_for_digest(item)
+        return normalized
+    if isinstance(value, (list, tuple)):
+        return [normalize_for_digest(item) for item in value]
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return normalize_for_digest(model_dump())
+    raise TypeError(f"unsupported history value type: {type(value)!r}")
 
 
-def infer_current_turn_tail(history: list[Any]) -> list[Any]:
-    assistant_index = None
-    for index in range(len(history) - 1, -1, -1):
-        if message_role(history[index]) == "assistant":
-            assistant_index = index
-            break
-    if assistant_index is None:
-        return []
-
-    for index in range(assistant_index, -1, -1):
-        if message_role(history[index]) == "user":
-            return list(history[index:])
-    return list(history[assistant_index:])
+def structural_digest(value: Any) -> str:
+    payload = json.dumps(
+        normalize_for_digest(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def append_tail_without_duplicates(latest_history: list[Any], tail: list[Any]) -> list[Any]:
-    if not tail:
-        return latest_history
-    merged = list(latest_history)
-    for item in tail:
-        fingerprint = message_fingerprint(item)
-        if merged and message_fingerprint(merged[-1]) == fingerprint:
-            continue
-        merged.append(item)
-    return merged
-
-
-def common_prefix_length(left: list[Any], right: list[Any]) -> int:
-    count = 0
-    for left_item, right_item in zip(left, right):
-        if message_fingerprint(left_item) != message_fingerprint(right_item):
-            break
-        count += 1
-    return count
-
-
-def message_fingerprint(value: Any) -> str:
+def digests_equal(left: Any, right: Any) -> bool:
     try:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-    except TypeError:
-        return str(value)
+        return structural_digest(left) == structural_digest(right)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def message_no_save(value: Any) -> bool:
+    if isinstance(value, dict):
+        return bool(value.get("_no_save"))
+    return bool(getattr(value, "_no_save", False))
+
+
+def message_checkpoint_after(value: Any) -> Any:
+    if isinstance(value, dict):
+        return None
+    return getattr(value, "_checkpoint_after", None)
+
+
+def locate_current_unit(
+    all_messages: list[Any],
+    anchor: Any,
+    checkpoint_present: bool,
+) -> tuple[int, int] | None:
+    """按 AstrBot 持久化规则定位锚点在最终保存历史中的起始下标。
+
+    模拟规则：跳过首个 system、跳过 _no_save 的 user/assistant、每条消息
+    计 1 个 dict、_checkpoint_after 额外计 1 个 checkpoint dict。返回
+    (锚点下标, 预期总条数)；定位失败、出现多义或读取异常时返回 None。
+    """
+    try:
+        matches = 0
+        anchor_index = None
+        dump_index = 0
+        skipped_initial_system = False
+        for message in all_messages:
+            role = message_role(message)
+            if role == "system" and not skipped_initial_system:
+                skipped_initial_system = True
+                continue
+            if role in ("assistant", "user") and message_no_save(message):
+                continue
+            if message is anchor:
+                matches += 1
+                anchor_index = dump_index
+            dump_index += 1
+            if message_checkpoint_after(message) is not None:
+                dump_index += 1
+        if matches != 1 or anchor_index is None:
+            return None
+        return anchor_index, dump_index + (1 if checkpoint_present else 0)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def message_role(value: Any) -> str:

@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import functools
+import importlib
 import json
+import os
 import sys
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
 from astrna.modules.group_sender_concurrency import (
+    _BASE_SNAPSHOT_EXTRA,
     GroupSenderConcurrencyModule,
     SendRound,
-    merge_histories,
+    locate_current_unit,
 )
 
 
@@ -150,15 +155,73 @@ class DummyReq:
         self.contexts = contexts
 
 
+class FakeMessage:
+    """模拟 AstrBot Message：携带角色、正文与持久化标记。"""
+
+    def __init__(self, role, content, *, no_save=False, checkpoint_after=None):
+        self.role = role
+        self.content = content
+        self._no_save = no_save
+        self._checkpoint_after = checkpoint_after
+
+    def model_dump(self):
+        return {"role": self.role, "content": self.content}
+
+
+class Undigestable:
+    """无法结构化的历史对象，用于触发保守回退。"""
+
+
+def history_pairs(count, *, prefix="turn"):
+    return [
+        {"role": "user" if index % 2 == 0 else "assistant", "content": f"{prefix}-{index}"}
+        for index in range(count)
+    ]
+
+
+def turn(tag):
+    return [
+        {"role": "user", "content": f"{tag} question"},
+        {"role": "assistant", "content": f"{tag} reply"},
+    ]
+
+
+def load_real_astrbot_context_modules():
+    """按测试环境加载 AstrBot 的真实消息和截断实现。"""
+    try:
+        message_module = importlib.import_module("astrbot.core.agent.message")
+        truncator_module = importlib.import_module(
+            "astrbot.core.agent.context.truncator",
+        )
+    except ModuleNotFoundError:
+        astrbot_source = os.environ.get("ASTRBOT_SOURCE_PATH")
+        if astrbot_source:
+            source_path = Path(astrbot_source)
+            if source_path.is_dir() and str(source_path) not in sys.path:
+                sys.path.insert(0, str(source_path))
+        try:
+            message_module = importlib.import_module("astrbot.core.agent.message")
+            truncator_module = importlib.import_module(
+                "astrbot.core.agent.context.truncator",
+            )
+        except ModuleNotFoundError:
+            pytest.skip(
+                "需要安装 astrbot 包，或设置 ASTRBOT_SOURCE_PATH 指向 AstrBot 源码目录",
+            )
+    return message_module, truncator_module.ContextTruncator
+
+
 class DummyRunnerContext:
     def __init__(self, event):
         self.context = SimpleNamespace(event=event)
+        self.messages = []
 
 
 class DummyRunner:
     def __init__(self, event):
         self.run_context = DummyRunnerContext(event)
         self.follow_ups = []
+        self.req = None
 
     def follow_up(self, message_text):
         ticket = SimpleNamespace(
@@ -170,6 +233,85 @@ class DummyRunner:
         ticket.resolved.set()
         self.follow_ups.append(ticket)
         return ticket
+
+
+def start_request(module, manager, *, sender_id):
+    """模拟 AstrBot 构建请求：从数据库读取历史原稿并捕获 AstrNa 快照。"""
+    current = copy.deepcopy(manager.conversation.content)
+    conversation = DummyConversation(cid=manager.conversation.cid, history=current)
+    base = json.loads(conversation.history)
+    event = DummyEvent(sender_id=sender_id)
+    req = DummyReq(conversation, contexts=list(base))
+    module.capture_base_snapshot(event, req)
+    return SimpleNamespace(event=event, req=req, base=base)
+
+
+async def drive_turn(
+    fakes,
+    stage,
+    handle,
+    *,
+    kept_prefix,
+    unit,
+    no_save_prefix=None,
+    kept_checkpoints=None,
+    checkpoint_id=None,
+    token_usage=42,
+    register=True,
+    break_identity=False,
+):
+    """模拟 AstrBot 截断/工具循环后的完整保存链路。
+
+    kept_prefix 是 AstrBot 截断或摘要后保留的历史；unit 是本轮写入单元，
+    必须以 user 开头。register 时运行历史以本轮 user 收尾（对应 AstrBot
+    runner reset 完成、工具循环之前的状态）。
+    """
+    persona = [
+        FakeMessage(item["role"], item["content"], no_save=True)
+        for item in (no_save_prefix or [])
+    ]
+    kept = [
+        FakeMessage(
+            item["role"],
+            item["content"],
+            checkpoint_after=(kept_checkpoints or {}).get(index),
+        )
+        for index, item in enumerate(kept_prefix)
+    ]
+    unit_messages = [FakeMessage(item["role"], item["content"]) for item in unit]
+    if register:
+        runner = DummyRunner(handle.event)
+        runner.req = handle.req
+        runner.run_context.messages = [*persona, *kept, unit_messages[0]]
+        fakes.internal_module.register_active_runner(
+            handle.event.unified_msg_origin,
+            runner,
+        )
+    if break_identity:
+        # 模拟运行历史被整体重建：锚点对象在最终列表中找不到身份匹配。
+        persona = [
+            FakeMessage(item["role"], item["content"], no_save=True)
+            for item in (no_save_prefix or [])
+        ]
+        kept = [
+            FakeMessage(
+                item["role"],
+                item["content"],
+                checkpoint_after=(kept_checkpoints or {}).get(index),
+            )
+            for index, item in enumerate(kept_prefix)
+        ]
+        unit_messages = [FakeMessage(item["role"], item["content"]) for item in unit]
+    final_messages = [*persona, *kept, *unit_messages]
+    if checkpoint_id is not None:
+        handle.event.set_extra("llm_checkpoint_id", checkpoint_id)
+    await stage._save_to_history(
+        handle.event,
+        handle.req,
+        None,
+        final_messages,
+        token_usage=token_usage,
+    )
 
 
 @pytest.fixture
@@ -209,11 +351,34 @@ def fake_astrbot_modules(monkeypatch):
             all_messages,
             runner_stats=None,
             user_aborted=False,
+            token_usage=42,
         ):
+            # 与 AstrBot 持久化规则一致：跳首个 system、跳 _no_save 的
+            # user/assistant，绑定 checkpoint，最后按事件追加 checkpoint 段。
+            dumped = []
+            skipped_initial_system = False
+            for message in all_messages:
+                if message.role == "system" and not skipped_initial_system:
+                    skipped_initial_system = True
+                    continue
+                if message.role in ("assistant", "user") and message._no_save:
+                    continue
+                dumped.append(message.model_dump())
+                if message._checkpoint_after is not None:
+                    dumped.append(
+                        {
+                            "role": "_checkpoint",
+                            "content": dict(message._checkpoint_after),
+                        }
+                    )
+            checkpoint_id = event.get_extra("llm_checkpoint_id")
+            if isinstance(checkpoint_id, str) and checkpoint_id:
+                dumped.append({"role": "_checkpoint", "content": {"id": checkpoint_id}})
             await self.conv_manager.update_conversation(
                 event.unified_msg_origin,
                 req.conversation.cid,
-                history=all_messages,
+                history=dumped,
+                token_usage=token_usage,
             )
 
     internal_module.InternalAgentSubStage = InternalAgentSubStage
@@ -298,24 +463,35 @@ def fake_astrbot_modules(monkeypatch):
         def __init__(self, conversation=None):
             self.conversation = conversation
             self.updated = []
+            self.fail_updates = False
 
         async def get_conversation(self, umo, cid):
             assert self.conversation is not None
             assert cid == self.conversation.cid
-            return self.conversation
+            # 模拟真实数据库读取：每次返回当前内容的独立快照对象。
+            content = copy.deepcopy(self.conversation.content)
+            try:
+                history = json.dumps(content, ensure_ascii=False)
+            except (TypeError, ValueError):
+                history = "not-json"
+            return SimpleNamespace(cid=cid, history=history, content=content)
 
         async def update_conversation(
             self,
             unified_msg_origin,
             conversation_id=None,
             history=None,
+            token_usage=None,
             **kwargs,
         ):
+            if self.fail_updates:
+                raise RuntimeError("db down")
             self.updated.append(
                 {
                     "umo": unified_msg_origin,
                     "cid": conversation_id,
                     "history": history,
+                    "token_usage": token_usage,
                 }
             )
             if self.conversation is not None:
@@ -535,20 +711,24 @@ def test_state_preserving_terminate_keeps_group_runtime_state():
     runner = object()
     gate = object()
     write_lock = object()
+    receipt_key = (1, "group", "conv")
     module._active_runners[("group", "sender")] = runner
     module._group_gates[(1, "group")] = gate
     module._write_locks[(1, "group")] = write_lock
+    module._commit_receipts[receipt_key] = "digest"
 
     module.terminate(preserve_state=True)
 
     assert module._active_runners[("group", "sender")] is runner
     assert module._group_gates[(1, "group")] is gate
     assert module._write_locks[(1, "group")] is write_lock
+    assert module._commit_receipts[receipt_key] == "digest"
 
     module.terminate()
     assert module._active_runners == {}
     assert module._group_gates == {}
     assert module._write_locks == {}
+    assert module._commit_receipts == {}
 
 
 def test_install_and_terminate_restore_patch(fake_astrbot_modules):
@@ -1469,119 +1649,792 @@ def test_group_cron_without_group_id_still_uses_exclusive_group_gate(
     }
 
 
-def test_concurrent_history_save_merges_without_overwriting(fake_astrbot_modules):
+def install_history_stage(fake_astrbot_modules, history):
     module = GroupSenderConcurrencyModule(logger=DummyLogger())
     assert module.install() is True
     stage = fake_astrbot_modules.internal_cls()
-    conversation = DummyConversation(
-        history=[
-            {"role": "user", "content": "old"},
-            {"role": "assistant", "content": "old reply"},
-        ]
-    )
+    conversation = DummyConversation(history=history)
     manager = fake_astrbot_modules.conversation_cls(conversation)
     stage.conv_manager = manager
-    base = json.loads(conversation.history)
+    return module, stage, manager, conversation
 
-    async def save(sender_id, user_text, assistant_text):
-        event = DummyEvent(sender_id=sender_id)
-        req = DummyReq(conversation, contexts=list(base))
-        messages = [
-            *base,
-            {"role": "user", "content": user_text},
-            {"role": "assistant", "content": assistant_text},
-        ]
-        await stage._save_to_history(event, req, None, messages)
+
+def test_concurrent_history_save_merges_without_overwriting(fake_astrbot_modules):
+    base = history_pairs(2, prefix="old")
+    module, stage, manager, conversation = install_history_stage(
+        fake_astrbot_modules,
+        base,
+    )
 
     async def save_both():
+        # 每个请求持有独立的数据库快照，管理器单独维护最新版。
+        handle_a = start_request(module, manager, sender_id="user-a")
+        handle_b = start_request(module, manager, sender_id="user-b")
+        assert handle_a.base == handle_b.base == base
         await asyncio.gather(
-            save("user-a", "a question", "a reply"),
-            save("user-b", "b question", "b reply"),
+            drive_turn(
+                fake_astrbot_modules,
+                stage,
+                handle_a,
+                kept_prefix=handle_a.base,
+                unit=turn("a"),
+            ),
+            drive_turn(
+                fake_astrbot_modules,
+                stage,
+                handle_b,
+                kept_prefix=handle_b.base,
+                unit=turn("b"),
+            ),
         )
 
     run(save_both())
 
-    saved_history = json.loads(conversation.history)
-    assert saved_history[:2] == [
-        {"role": "user", "content": "old"},
-        {"role": "assistant", "content": "old reply"},
-    ]
-    assert [
-        {"role": "user", "content": "a question"},
-        {"role": "assistant", "content": "a reply"},
-    ] in [saved_history[2:4], saved_history[4:6]]
-    assert [
-        {"role": "user", "content": "b question"},
-        {"role": "assistant", "content": "b reply"},
-    ] in [saved_history[2:4], saved_history[4:6]]
+    saved = json.loads(conversation.history)
+    assert saved[:2] == base
+    assert saved[2:] in (
+        [*turn("a"), *turn("b")],
+        [*turn("b"), *turn("a")],
+    )
+    # 先落库的请求无并发合并，保留原 token；后落库的真实合并置 0。
+    assert sorted(entry["token_usage"] for entry in manager.updated) == [0, 42]
 
 
-def test_merge_histories_keeps_concurrent_branch_after_context_compression():
+def test_truncated_history_stays_truncated_without_concurrency(fake_astrbot_modules):
+    base = history_pairs(394, prefix="old")
+    module, stage, manager, conversation = install_history_stage(
+        fake_astrbot_modules,
+        base,
+    )
+
+    async def save_two_rounds():
+        handle = start_request(module, manager, sender_id="user-a")
+        # AstrBot 4.26.7 的 30/15 截断会保留 30 条旧消息和本轮 user；
+        # 最终 assistant 落库后正好为 32 条。
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle,
+            kept_prefix=base[-30:],
+            unit=turn("current"),
+        )
+        handle_next = start_request(module, manager, sender_id="user-a")
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_next,
+            kept_prefix=handle_next.base,
+            unit=turn("next"),
+        )
+
+    run(save_two_rounds())
+
+    truncated_new = [*base[-30:], *turn("current")]
+    first_saved = manager.updated[0]["history"]
+    assert first_saved == truncated_new
+    assert len(first_saved) == 32
+    assert base[0] not in first_saved
+    assert manager.updated[0]["token_usage"] == 42
+
+    final_saved = json.loads(conversation.history)
+    assert final_saved == [*truncated_new, *turn("next")]
+    assert len(final_saved) == 34
+    assert manager.updated[1]["token_usage"] == 42
+
+
+def test_real_astrbot_30_15_truncation_reaches_32_then_34():
+    message_module, truncator_cls = load_real_astrbot_context_modules()
+    message_cls = message_module.Message
+    truncator = truncator_cls()
     base = [
-        {"role": "user", "content": "old"},
-        {"role": "assistant", "content": "old reply"},
+        message_cls(
+            role="user" if index % 2 == 0 else "assistant",
+            content=f"old-{index}",
+        )
+        for index in range(394)
     ]
-    latest = [
-        *base,
-        {"role": "user", "content": "a question"},
-        {"role": "assistant", "content": "a reply"},
+
+    current_user = message_cls(role="user", content="current question")
+    first_context = truncator.truncate_by_turns(
+        [*base, current_user],
+        keep_most_recent_turns=30,
+        drop_turns=15,
+    )
+    assert len(first_context) == 31
+    assert first_context[-1] is current_user
+    first_saved = message_module.dump_messages_with_checkpoints(
+        [*first_context, message_cls(role="assistant", content="current reply")],
+    )
+    assert len(first_saved) == 32
+
+    next_context = message_module.bind_checkpoint_messages(first_saved)
+    next_context.append(message_cls(role="user", content="next question"))
+    second_context = truncator.truncate_by_turns(
+        next_context,
+        keep_most_recent_turns=30,
+        drop_turns=15,
+    )
+    second_saved = message_module.dump_messages_with_checkpoints(
+        [*second_context, message_cls(role="assistant", content="next reply")],
+    )
+    assert len(second_saved) == 34
+
+
+def test_persona_no_save_dialogs_stay_out_of_base_and_database(fake_astrbot_modules):
+    base = history_pairs(2, prefix="db")
+    module, stage, manager, conversation = install_history_stage(
+        fake_astrbot_modules,
+        base,
+    )
+    persona_dialogs = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"persona-{i}"}
+        for i in range(8)
     ]
-    compressed_new = [
-        {"role": "system", "content": "summary of older context"},
+
+    async def save():
+        handle = start_request(module, manager, sender_id="user-a")
+        # req.contexts 被人格预设污染，但原稿必须仍等于数据库历史。
+        handle.req.contexts = [*persona_dialogs, *handle.base]
+        assert handle.base == base
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle,
+            kept_prefix=handle.base,
+            unit=turn("current"),
+            no_save_prefix=persona_dialogs,
+        )
+
+    run(save())
+
+    saved = json.loads(conversation.history)
+    assert saved == [*base, *turn("current")]
+    assert not any("persona" in str(item.get("content")) for item in saved)
+
+
+def test_concurrent_requests_across_truncation_point(fake_astrbot_modules):
+    base = history_pairs(394, prefix="old")
+    module, stage, manager, conversation = install_history_stage(
+        fake_astrbot_modules,
+        base,
+    )
+
+    async def save_both():
+        handle_a = start_request(module, manager, sender_id="user-a")
+        handle_b = start_request(module, manager, sender_id="user-b")
+        # A 未截断，先落库。
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_a,
+            kept_prefix=handle_a.base,
+            unit=turn("a"),
+        )
+        # B 看到同一 base，但 AstrBot 已把它截到最近 32 条。
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_b,
+            kept_prefix=base[-32:],
+            unit=turn("b"),
+        )
+
+    run(save_both())
+
+    saved = json.loads(conversation.history)
+    assert saved == [*base[-32:], *turn("a"), *turn("b")]
+    assert len(saved) == 36
+    assert base[0] not in saved
+    assert manager.updated[0]["token_usage"] == 42
+    assert manager.updated[1]["token_usage"] == 0
+
+
+def test_first_saved_short_history_wins_when_both_truncate(fake_astrbot_modules):
+    base = history_pairs(394, prefix="old")
+    module, stage, manager, conversation = install_history_stage(
+        fake_astrbot_modules,
+        base,
+    )
+
+    async def save_both():
+        handle_a = start_request(module, manager, sender_id="user-a")
+        handle_b = start_request(module, manager, sender_id="user-b")
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_a,
+            kept_prefix=base[-32:],
+            unit=turn("a"),
+        )
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_b,
+            kept_prefix=base[-32:],
+            unit=turn("b"),
+        )
+
+    run(save_both())
+
+    saved = json.loads(conversation.history)
+    assert saved == [*base[-32:], *turn("a"), *turn("b")]
+    assert len(saved) == 36
+
+
+def test_both_summarized_keeps_first_summary_only(fake_astrbot_modules):
+    base = history_pairs(394, prefix="old")
+    module, stage, manager, conversation = install_history_stage(
+        fake_astrbot_modules,
+        base,
+    )
+    summary_a = [{"role": "user", "content": "summary A"}]
+    summary_b = [{"role": "user", "content": "summary B"}]
+
+    async def save_both():
+        handle_a = start_request(module, manager, sender_id="user-a")
+        handle_b = start_request(module, manager, sender_id="user-b")
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_a,
+            kept_prefix=[*summary_a, *base[-4:]],
+            unit=turn("a"),
+        )
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_b,
+            kept_prefix=[*summary_b, *base[-4:]],
+            unit=turn("b"),
+        )
+
+    run(save_both())
+
+    saved = json.loads(conversation.history)
+    assert saved == [*summary_a, *base[-4:], *turn("a"), *turn("b")]
+    assert summary_b[0] not in saved
+    assert saved.count(summary_a[0]) == 1
+
+
+def test_three_requests_same_base_out_of_order(fake_astrbot_modules):
+    base = history_pairs(4, prefix="old")
+    module, stage, manager, conversation = install_history_stage(
+        fake_astrbot_modules,
+        base,
+    )
+
+    async def save_all():
+        handle_a = start_request(module, manager, sender_id="user-a")
+        handle_b = start_request(module, manager, sender_id="user-b")
+        handle_c = start_request(module, manager, sender_id="user-c")
+        # 同一 base，按 c → a → b 顺序落库。
+        for handle, tag in ((handle_c, "c"), (handle_a, "a"), (handle_b, "b")):
+            await drive_turn(
+                fake_astrbot_modules,
+                stage,
+                handle,
+                kept_prefix=handle.base,
+                unit=turn(tag),
+            )
+
+    run(save_all())
+
+    saved = json.loads(conversation.history)
+    assert saved == [*base, *turn("c"), *turn("a"), *turn("b")]
+    for tag in ("a", "b", "c"):
+        assert saved.count({"role": "user", "content": f"{tag} question"}) == 1
+
+
+def test_interleaved_start_and_finish_times(fake_astrbot_modules):
+    base = history_pairs(2, prefix="old")
+    module, stage, manager, conversation = install_history_stage(
+        fake_astrbot_modules,
+        base,
+    )
+
+    async def save_both():
+        handle_a = start_request(module, manager, sender_id="user-a")
+        handle_b = start_request(module, manager, sender_id="user-b")
+        # A 先开始，B 先完成。
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_b,
+            kept_prefix=handle_b.base,
+            unit=turn("b"),
+        )
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_a,
+            kept_prefix=handle_a.base,
+            unit=turn("a"),
+        )
+
+    run(save_both())
+
+    saved = json.loads(conversation.history)
+    assert saved == [*base, *turn("b"), *turn("a")]
+
+
+def test_tool_chain_and_checkpoint_stay_intact(fake_astrbot_modules):
+    base = history_pairs(2, prefix="old")
+    module, stage, manager, conversation = install_history_stage(
+        fake_astrbot_modules,
+        base,
+    )
+    tool_unit = [
         {"role": "user", "content": "b question"},
+        {"role": "assistant", "content": None},
+        {"role": "tool", "content": "tool result"},
         {"role": "assistant", "content": "b reply"},
     ]
+    checkpoint_segment = {"role": "_checkpoint", "content": {"id": "cp-1"}}
 
-    merged = merge_histories(base, latest, compressed_new)
+    async def save_both():
+        handle_a = start_request(module, manager, sender_id="user-a")
+        handle_b = start_request(module, manager, sender_id="user-b")
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_a,
+            kept_prefix=handle_a.base,
+            unit=turn("a"),
+        )
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_b,
+            kept_prefix=handle_b.base,
+            unit=tool_unit,
+            checkpoint_id="cp-1",
+        )
 
-    assert merged == [
-        *latest,
-        {"role": "user", "content": "b question"},
-        {"role": "assistant", "content": "b reply"},
+    run(save_both())
+
+    saved = json.loads(conversation.history)
+    assert saved == [*base, *turn("a"), *tool_unit, checkpoint_segment]
+
+
+def test_real_astrbot_tool_unit_keeps_calls_media_and_checkpoints():
+    message_module, _ = load_real_astrbot_context_modules()
+    checkpoint_data = message_module.CheckpointData
+    message_cls = message_module.Message
+    tool_call = message_module.ToolCall(
+        id="call-weather",
+        function=message_module.ToolCall.FunctionBody(
+            name="weather",
+            arguments='{"city":"Shanghai"}',
+        ),
+    )
+    old_user = message_cls(role="user", content="old question")
+    old_user._checkpoint_after = checkpoint_data(id="old-checkpoint")
+    anchor = message_cls(role="user", content="current question")
+    tool_request = message_cls(
+        role="assistant",
+        content=None,
+        tool_calls=[tool_call],
+    )
+    tool_result = message_cls(
+        role="tool",
+        tool_call_id=tool_call.id,
+        content="sunny",
+    )
+    temporary_part = message_module.TextPart(text="runtime only").mark_as_temp()
+    tool_image_user = message_cls(
+        role="user",
+        content=[
+            message_module.TextPart(text="tool image"),
+            message_module.ImageURLPart(
+                image_url={"url": "https://example.invalid/tool.png"},
+            ),
+            temporary_part,
+        ],
+    )
+    max_step_user = message_cls(role="user", content="max-step follow-up")
+    final_reply = message_cls(role="assistant", content="final reply")
+    final_reply._checkpoint_after = checkpoint_data(id="current-checkpoint")
+    all_messages = [
+        message_cls(role="system", content="system"),
+        old_user,
+        anchor,
+        tool_request,
+        tool_result,
+        tool_image_user,
+        max_step_user,
+        final_reply,
     ]
 
+    unit_start, expected_total = locate_current_unit(
+        all_messages,
+        anchor,
+        checkpoint_present=True,
+    )
+    saved = message_module.dump_messages_with_checkpoints(all_messages[1:])
+    saved.append(
+        message_module.CheckpointMessageSegment(
+            content=checkpoint_data(id="event-checkpoint"),
+        ).model_dump(),
+    )
 
-def test_merge_histories_preserves_repeated_same_text_turn():
-    base = [{"role": "user", "content": "old"}]
-    latest = [*base, {"role": "assistant", "content": "ok"}]
-    new_history = [
-        *base,
-        {"role": "user", "content": "old"},
-        {"role": "assistant", "content": "ok"},
+    assert (unit_start, expected_total) == (2, len(saved))
+    current_unit = saved[unit_start:]
+    assert [item["role"] for item in current_unit] == [
+        "user",
+        "assistant",
+        "tool",
+        "user",
+        "user",
+        "assistant",
+        "_checkpoint",
+        "_checkpoint",
     ]
-
-    merged = merge_histories(base, latest, new_history)
-
-    assert merged == [
-        *latest,
-        {"role": "user", "content": "old"},
-        {"role": "assistant", "content": "ok"},
+    assert current_unit[1]["tool_calls"][0]["id"] == "call-weather"
+    assert current_unit[2]["tool_call_id"] == "call-weather"
+    assert current_unit[3]["content"] == [
+        {"type": "text", "text": "tool image"},
+        {
+            "type": "image_url",
+            "image_url": {"url": "https://example.invalid/tool.png", "id": None},
+        },
     ]
+    assert current_unit[-2]["content"] == {"id": "current-checkpoint"}
+    assert current_unit[-1]["content"] == {"id": "event-checkpoint"}
+
+    rebuilt_messages = message_module.bind_checkpoint_messages(saved[:-1])
+    assert locate_current_unit(rebuilt_messages, anchor, checkpoint_present=True) is None
 
 
-def test_merge_histories_preserves_repeated_text_after_context_compression():
+def test_bound_checkpoint_counts_toward_unit_location(fake_astrbot_modules):
+    base = history_pairs(2, prefix="old")
+    module, stage, manager, conversation = install_history_stage(
+        fake_astrbot_modules,
+        base,
+    )
+    bound_checkpoint = {"role": "_checkpoint", "content": {"id": "cp-old"}}
+
+    async def save_both():
+        handle_a = start_request(module, manager, sender_id="user-a")
+        handle_b = start_request(module, manager, sender_id="user-b")
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_a,
+            kept_prefix=handle_a.base,
+            unit=turn("a"),
+        )
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_b,
+            kept_prefix=handle_b.base,
+            kept_checkpoints={0: {"id": "cp-old"}},
+            unit=turn("b"),
+        )
+
+    run(save_both())
+
+    saved = json.loads(conversation.history)
+    assert saved == [base[0], bound_checkpoint, base[1], *turn("a"), *turn("b")]
+    assert manager.updated[1]["token_usage"] == 0
+
+
+def test_aborted_request_saves_user_only_unit(fake_astrbot_modules):
+    base = history_pairs(2, prefix="old")
+    module, stage, manager, conversation = install_history_stage(
+        fake_astrbot_modules,
+        base,
+    )
+    aborted_unit = [{"role": "user", "content": "aborted question"}]
+
+    async def save_both():
+        handle_a = start_request(module, manager, sender_id="user-a")
+        handle_b = start_request(module, manager, sender_id="user-b")
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_a,
+            kept_prefix=handle_a.base,
+            unit=turn("a"),
+        )
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_b,
+            kept_prefix=handle_b.base,
+            unit=aborted_unit,
+        )
+
+    run(save_both())
+
+    saved = json.loads(conversation.history)
+    assert saved == [*base, *turn("a"), *aborted_unit]
+
+
+def test_identical_text_two_requests_keeps_both(fake_astrbot_modules):
+    base = history_pairs(2, prefix="old")
+    module, stage, manager, conversation = install_history_stage(
+        fake_astrbot_modules,
+        base,
+    )
+    same_unit = turn("same")
+
+    async def save_both():
+        handle_a = start_request(module, manager, sender_id="user-a")
+        handle_b = start_request(module, manager, sender_id="user-b")
+        for handle in (handle_a, handle_b):
+            await drive_turn(
+                fake_astrbot_modules,
+                stage,
+                handle,
+                kept_prefix=handle.base,
+                unit=same_unit,
+            )
+
+    run(save_both())
+
+    saved = json.loads(conversation.history)
+    assert saved == [*base, *same_unit, *same_unit]
+    assert saved.count(same_unit[0]) == 2
+
+
+def test_unknown_external_rewrite_falls_back_to_new(fake_astrbot_modules):
+    base = history_pairs(2, prefix="old")
+    module, stage, manager, conversation = install_history_stage(
+        fake_astrbot_modules,
+        base,
+    )
+
+    async def save_both():
+        handle_a = start_request(module, manager, sender_id="user-a")
+        handle_b = start_request(module, manager, sender_id="user-b")
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_a,
+            kept_prefix=handle_a.base,
+            unit=turn("a"),
+        )
+        # 外部在 A 落库后改写了数据库，收据不再匹配。
+        external = [{"role": "user", "content": "external edit"}]
+        conversation.history = json.dumps(external, ensure_ascii=False)
+        conversation.content = external
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_b,
+            kept_prefix=handle_b.base,
+            unit=turn("b"),
+        )
+
+    run(save_both())
+
+    new_b = [*base, *turn("b")]
+    saved = json.loads(conversation.history)
+    assert saved == new_b
+    assert manager.updated[1]["history"] == new_b
+    assert manager.updated[1]["token_usage"] == 42
+
+
+def test_malformed_history_object_falls_back_to_new(fake_astrbot_modules):
+    base = history_pairs(2, prefix="old")
+    module, stage, manager, conversation = install_history_stage(
+        fake_astrbot_modules,
+        base,
+    )
+
+    async def save_both():
+        handle_a = start_request(module, manager, sender_id="user-a")
+        handle_b = start_request(module, manager, sender_id="user-b")
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_a,
+            kept_prefix=handle_a.base,
+            unit=turn("a"),
+        )
+        # 数据库里混入无法结构化的对象。
+        conversation.content = [*json.loads(conversation.history), Undigestable()]
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_b,
+            kept_prefix=handle_b.base,
+            unit=turn("b"),
+        )
+
+    run(save_both())
+
+    new_b = [*base, *turn("b")]
+    saved = json.loads(conversation.history)
+    assert saved == new_b
+    assert manager.updated[1]["token_usage"] == 42
+
+
+def test_missing_anchor_falls_back_to_new(fake_astrbot_modules):
+    base = history_pairs(2, prefix="old")
+    module, stage, manager, conversation = install_history_stage(
+        fake_astrbot_modules,
+        base,
+    )
+
+    async def save_both():
+        handle_a = start_request(module, manager, sender_id="user-a")
+        handle_b = start_request(module, manager, sender_id="user-b")
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_a,
+            kept_prefix=handle_a.base,
+            unit=turn("a"),
+        )
+        # B 没有经过 register_active_runner，缺少锚点。
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_b,
+            kept_prefix=handle_b.base,
+            unit=turn("b"),
+            register=False,
+        )
+
+    run(save_both())
+
+    new_b = [*base, *turn("b")]
+    saved = json.loads(conversation.history)
+    assert saved == new_b
+    assert manager.updated[1]["token_usage"] == 42
+
+
+def test_rebuilt_history_breaks_anchor_falls_back_to_new(fake_astrbot_modules):
+    base = history_pairs(2, prefix="old")
+    module, stage, manager, conversation = install_history_stage(
+        fake_astrbot_modules,
+        base,
+    )
+
+    async def save_both():
+        handle_a = start_request(module, manager, sender_id="user-a")
+        handle_b = start_request(module, manager, sender_id="user-b")
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_a,
+            kept_prefix=handle_a.base,
+            unit=turn("a"),
+        )
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_b,
+            kept_prefix=handle_b.base,
+            unit=turn("b"),
+            break_identity=True,
+        )
+
+    run(save_both())
+
+    new_b = [*base, *turn("b")]
+    saved = json.loads(conversation.history)
+    assert saved == new_b
+    assert manager.updated[1]["token_usage"] == 42
+
+
+def test_failed_save_does_not_update_receipt(fake_astrbot_modules):
+    base = history_pairs(2, prefix="old")
+    module, stage, manager, conversation = install_history_stage(
+        fake_astrbot_modules,
+        base,
+    )
+
+    async def save_all():
+        handle_a = start_request(module, manager, sender_id="user-a")
+        handle_b = start_request(module, manager, sender_id="user-b")
+        handle_c = start_request(module, manager, sender_id="user-c")
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_a,
+            kept_prefix=handle_a.base,
+            unit=turn("a"),
+        )
+        manager.fail_updates = True
+        with pytest.raises(RuntimeError):
+            await drive_turn(
+                fake_astrbot_modules,
+                stage,
+                handle_b,
+                kept_prefix=handle_b.base,
+                unit=turn("b"),
+            )
+        manager.fail_updates = False
+        # 收据仍属于 A 的落库内容，C 信任 latest 并正常合并。
+        await drive_turn(
+            fake_astrbot_modules,
+            stage,
+            handle_c,
+            kept_prefix=handle_c.base,
+            unit=turn("c"),
+        )
+
+    run(save_all())
+
+    saved = json.loads(conversation.history)
+    assert saved == [*base, *turn("a"), *turn("c")]
+    assert manager.updated[-1]["token_usage"] == 0
+
+
+def test_capture_base_snapshot_skips_ineligible_requests():
+    module = GroupSenderConcurrencyModule(logger=DummyLogger())
+    conversation = DummyConversation(history=history_pairs(2))
+
+    private_event = DummyEvent(private=True)
+    module.capture_base_snapshot(private_event, DummyReq(conversation, []))
+    assert private_event.get_extra(_BASE_SNAPSHOT_EXTRA) is None
+
+    event_without_conversation = DummyEvent()
+    module.capture_base_snapshot(event_without_conversation, DummyReq(None, []))
+    assert event_without_conversation.get_extra(_BASE_SNAPSHOT_EXTRA) is None
+
+    # 快照必须深拷贝，不能持有原可变列表引用。
+    raw = [{"role": "user", "content": "x"}]
+    mutable_conversation = SimpleNamespace(cid="conv-1", history=raw)
+    event = DummyEvent()
+    module.capture_base_snapshot(event, DummyReq(mutable_conversation, []))
+    raw[0]["content"] = "mutated"
+    snapshot = event.get_extra(_BASE_SNAPSHOT_EXTRA)
+    assert snapshot["base_history"] == [{"role": "user", "content": "x"}]
+    assert snapshot["conversation_id"] == "conv-1"
+
+
+def test_runtime_capture_uses_conversation_history_not_contexts(
+    fakes,
+    fake_astrbot_modules,
+):
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
     base = [
-        {"role": "user", "content": "old"},
-        {"role": "assistant", "content": "repeat"},
+        {"role": "user", "content": "db-1"},
+        {"role": "assistant", "content": "db-2"},
     ]
-    latest = [
-        *base,
-        {"role": "user", "content": "other"},
-        {"role": "assistant", "content": "other reply"},
-    ]
-    compressed_new = [
-        {"role": "system", "content": "summary of older context"},
-        {"role": "user", "content": "repeat"},
-        {"role": "assistant", "content": "current"},
-    ]
+    persona_dialogs = [{"role": "user", "content": "persona", "_no_save": True}]
+    event = DummyEvent()
+    req = SimpleNamespace(
+        contexts=[*persona_dialogs, *base],
+        conversation=SimpleNamespace(cid="conv-1", history=json.dumps(base)),
+        prompt="",
+        system_prompt="",
+        extra_user_content_parts=[],
+    )
 
-    merged = merge_histories(base, latest, compressed_new)
+    run(runtime.sanitize_request(event, req))
 
-    assert merged == [
-        *latest,
-        {"role": "user", "content": "repeat"},
-        {"role": "assistant", "content": "current"},
-    ]
+    snapshot = event.get_extra(_BASE_SNAPSHOT_EXTRA)
+    assert snapshot is not None
+    assert snapshot["umo"] == event.unified_msg_origin
+    assert snapshot["conversation_id"] == "conv-1"
+    assert snapshot["base_history"] == base
+
+    run(runtime.terminate())
 
 
 def test_follow_up_is_isolated_by_group_sender(fake_astrbot_modules):
