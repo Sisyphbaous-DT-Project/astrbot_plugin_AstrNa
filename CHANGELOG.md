@@ -1,5 +1,12 @@
 # 更新日志
 
+## 1.4.9
+
+- 修复 Issue 助手聊天指令注册错误：此前 7 个指令各自叠加了空格版与下划线版两个命令装饰器，而 AstrBot 对同一 handler 的全部过滤器按 AND 关系检查，导致 `/astrna issue ...` 与 `/astrna_issue_...` 两种写法实际上都无法触发。
+- 改用 AstrBot 正规嵌套指令组注册：`/astrna issue <操作>` 覆盖 `latest`、`draft`、`ignore`、`analyze`、`edit`、`submit`、`cancel`，裸 `/astrna` 与 `/astrna issue` 可展示指令组帮助树；`edit` 后的多词补充内容完整保留。
+- 下划线形式 `/astrna_issue_<操作>` 继续作为兼容入口保留，仍沿用原 handler 名；Issue 状态、权限、发送方式、GitHub 提交与 LLM 工具行为均不改变。
+- 新增 Issue 指令专项测试，覆盖注册结构、双入口唯一匹配与参数解析。
+
 ## 1.4.8
 
 - 修复“解锁群聊并发回复”在 AstrBot 已截断、压缩或总结会话历史后，旧合并逻辑可能把已删除的完整历史重新接回数据库，导致历史持续膨胀、群聊提示词缓存长期难以命中的问题。

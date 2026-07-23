@@ -79,43 +79,83 @@ class AstrNa(Star):
             traceback_text,
         )
 
-    @filter.command("astrna issue latest")
+    @filter.command_group("astrna")
+    def astrna_command_group(self):
+        pass
+
+    @astrna_command_group.group("issue")
+    def astrna_issue_command_group(self):
+        pass
+
+    @astrna_issue_command_group.command("latest")
+    async def issue_latest_group_command(self, event: AstrMessageEvent) -> None:
+        """查看 AstrNa 最近一次报错分析。"""
+        await self._send_text(event, await self.runtime.issue_latest(event))
+
+    @astrna_issue_command_group.command("draft")
+    async def issue_draft_group_command(self, event: AstrMessageEvent) -> None:
+        """生成或查看 AstrNa Issue 草稿。"""
+        await self._send_text(event, await self.runtime.issue_draft(event))
+
+    @astrna_issue_command_group.command("ignore")
+    async def issue_ignore_group_command(self, event: AstrMessageEvent) -> None:
+        """忽略 AstrNa 最近一次报错。"""
+        await self._send_text(event, await self.runtime.issue_ignore(event))
+
+    @astrna_issue_command_group.command("analyze")
+    async def issue_analyze_group_command(self, event: AstrMessageEvent) -> None:
+        """调用源码辅助分析流程。"""
+        await self._send_text(event, await self.runtime.issue_analyze(event))
+
+    @astrna_issue_command_group.command("edit")
+    async def issue_edit_group_command(
+        self,
+        event: AstrMessageEvent,
+        note: GreedyStr,
+    ) -> None:
+        """为 AstrNa Issue 草稿追加补充说明。"""
+        await self._send_text(event, await self.runtime.issue_edit(event, str(note)))
+
+    @astrna_issue_command_group.command("submit")
+    async def issue_submit_group_command(self, event: AstrMessageEvent) -> None:
+        """确认提交 AstrNa Issue 草稿。"""
+        await self._send_text(event, await self.runtime.issue_submit(event))
+
+    @astrna_issue_command_group.command("cancel")
+    async def issue_cancel_group_command(self, event: AstrMessageEvent) -> None:
+        """丢弃 AstrNa Issue 草稿。"""
+        await self._send_text(event, await self.runtime.issue_cancel(event))
+
     @filter.command("astrna_issue_latest")
     async def issue_latest(self, event: AstrMessageEvent) -> None:
         """查看 AstrNa 最近一次报错分析。"""
         await self._send_text(event, await self.runtime.issue_latest(event))
 
-    @filter.command("astrna issue draft")
     @filter.command("astrna_issue_draft")
     async def issue_draft(self, event: AstrMessageEvent) -> None:
         """生成或查看 AstrNa Issue 草稿。"""
         await self._send_text(event, await self.runtime.issue_draft(event))
 
-    @filter.command("astrna issue ignore")
     @filter.command("astrna_issue_ignore")
     async def issue_ignore(self, event: AstrMessageEvent) -> None:
         """忽略 AstrNa 最近一次报错。"""
         await self._send_text(event, await self.runtime.issue_ignore(event))
 
-    @filter.command("astrna issue analyze")
     @filter.command("astrna_issue_analyze")
     async def issue_analyze(self, event: AstrMessageEvent) -> None:
         """调用源码辅助分析流程。"""
         await self._send_text(event, await self.runtime.issue_analyze(event))
 
-    @filter.command("astrna issue edit")
     @filter.command("astrna_issue_edit")
     async def issue_edit(self, event: AstrMessageEvent, note: GreedyStr) -> None:
         """为 AstrNa Issue 草稿追加补充说明。"""
         await self._send_text(event, await self.runtime.issue_edit(event, str(note)))
 
-    @filter.command("astrna issue submit")
     @filter.command("astrna_issue_submit")
     async def issue_submit(self, event: AstrMessageEvent) -> None:
         """确认提交 AstrNa Issue 草稿。"""
         await self._send_text(event, await self.runtime.issue_submit(event))
 
-    @filter.command("astrna issue cancel")
     @filter.command("astrna_issue_cancel")
     async def issue_cancel(self, event: AstrMessageEvent) -> None:
         """丢弃 AstrNa Issue 草稿。"""

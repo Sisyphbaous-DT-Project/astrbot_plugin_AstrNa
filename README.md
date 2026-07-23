@@ -5,7 +5,7 @@ AstrNa 是一款面向 AstrBot 的优化插件，目标是在不修改 AstrBot C
 > 💌 售后：`777879783`
 > 有问题请加，清漪也会蹦出来一起捣鼓。
 
-🎉 AstrNa 正式版已经发布。当前正式版：`1.4.8`
+🎉 AstrNa 正式版已经发布。当前正式版：`1.4.9`
 
 当前已测试兼容 AstrBot 版本：`4.26.7`
 
@@ -398,7 +398,7 @@ AstrBot 自带“禁用自带指令”是总开关，打开后核心内置指令
 - `/astrna issue submit`：确认提交 Issue。
 - `/astrna issue cancel`：丢弃草稿。
 
-下划线形式 `/astrna_issue_latest`、`/astrna_issue_draft` 等也会保留作为兼容入口。
+推荐使用上面的 `/astrna issue ...` 分组写法；下划线形式 `/astrna_issue_latest`、`/astrna_issue_draft` 等继续作为兼容入口保留。
 
 也可以让模型通过自然语言调用同一组工具，例如“忽略这个报错”“用源码工具分析一下”“生成 issue 草稿”“确认提交”。真正提交 Issue 前仍需要明确确认；工具提交入口也必须带 `confirm=true`。
 
