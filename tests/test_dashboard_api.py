@@ -39,7 +39,8 @@ class _FilterStub:
 
 
 class _StarStub:
-    name = "astrbot_plugin_AstrNa"
+    # AstrBot StarManager 会将注入到插件类的 name 规范为小写。
+    name = "astrbot_plugin_astrna"
 
     def __init__(self, context):
         self.context = context
@@ -168,8 +169,9 @@ def webapi(monkeypatch, fakes):
     return build
 
 
-def test_registers_two_dashboard_apis(webapi):
+def test_registers_dashboard_apis_with_metadata_name_casing(webapi):
     star, context, _ = webapi(FakeConfig(), {})
+    assert star.name == "astrbot_plugin_astrna"
     routes = {route: methods for route, _, methods, _ in context.registered}
     assert routes == {
         "/astrbot_plugin_AstrNa/dashboard/state": ["GET"],

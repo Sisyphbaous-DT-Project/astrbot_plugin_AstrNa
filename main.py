@@ -11,6 +11,8 @@ from .astrna.modules.dashboard_catalog import (
 )
 from .astrna.runtime import AstrNaRuntime
 
+DASHBOARD_PLUGIN_NAME = "astrbot_plugin_AstrNa"
+
 try:
     from astrbot.api import web as astrbot_web
 except Exception:  # pragma: no cover - 旧版 AstrBot 无插件页面 API
@@ -43,12 +45,9 @@ class AstrNa(Star):
         register = getattr(self.context, "register_web_api", None)
         if not callable(register) or astrbot_web is None:
             return
-        plugin_name = (
-            getattr(self, "name", None)
-            or getattr(type(self), "name", None)
-            or "astrbot_plugin_AstrNa"
-        )
-        base = f"/{plugin_name}/dashboard"
+        # AstrBot 会把插件类上的 name 规范成小写，但 Plugin Page Bridge 按
+        # metadata.yaml 中保留大小写的插件名请求接口；路由必须使用后者。
+        base = f"/{DASHBOARD_PLUGIN_NAME}/dashboard"
         try:
             register(
                 f"{base}/state",
