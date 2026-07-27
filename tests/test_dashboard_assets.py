@@ -103,3 +103,26 @@ def test_fallback_catalog_keeps_all_twenty_features_read_only():
     assert len(set(keys)) == 20
     assert "readOnly: !interactive" in text
     assert "enabled: interactive ? false : null" in text
+
+
+def test_crt_container_ids_avoid_adblock_false_positive():
+    html = (PAGES_DIR / "index.html").read_text(encoding="utf-8")
+    app_js = (PAGES_DIR / "js" / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="astrna-monitor-stage"' in html
+    assert 'id="astrna-monitor-fallback"' in html
+    assert not re.search(r'id=["\']crt-', html)
+    assert '#astrna-monitor-stage' in app_js
+    assert '#astrna-monitor-fallback' in app_js
+
+
+def test_crt_scene_verifies_webgl2_and_runtime_rendering():
+    text = (PAGES_DIR / "js" / "crt-scene.js").read_text(encoding="utf-8")
+
+    assert 'canvas.getContext("webgl2")' in text
+    assert 'canvas.addEventListener("webglcontextlost"' in text
+    assert "verifyRenderedFrame();" in text
+    assert "renderer.info.render.triangles" in text
+    assert "gl.readPixels(" in text
+    assert "renderer.getContext().isContextLost()" in text
+    assert "reportFailure();" in text

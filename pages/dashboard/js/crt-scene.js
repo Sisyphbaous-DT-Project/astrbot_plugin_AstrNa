@@ -36,9 +36,13 @@ function loadTexture(url, { flipY = true } = {}) {
   });
 }
 
-export function createCrtScene(container) {
-  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+export function createCrtScene(container, { onFailure } = {}) {
+  const renderer = new THREE.WebGLRenderer({
+    antialias: true,
+    alpha: false,
+    powerPreference: "high-performance",
+  });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -70,7 +74,7 @@ export function createCrtScene(container) {
     .addScaledVector(WORLD_UP, 40);
   key.target.position.copy(SCREEN_CENTER).addScaledVector(WORLD_UP, -6);
   key.castShadow = true;
-  key.shadow.mapSize.set(2048, 2048);
+  key.shadow.mapSize.set(1024, 1024);
   key.shadow.bias = -0.0004;
   key.shadow.normalBias = 0.06;
   scene.add(key, key.target);
@@ -100,114 +104,135 @@ export function createCrtScene(container) {
   ground.receiveShadow = true;
   scene.add(ground);
 
+  let rafId = 0;
+  let paused = false;
+  let disposed = false;
+  let failureNotified = false;
+  let healthTimer = 0;
+  const canvas = renderer.domElement;
+
+  const reportFailure = () => {
+    if (disposed || failureNotified) return;
+    failureNotified = true;
+    if (typeof onFailure === "function") onFailure();
+  };
+  const onContextLost = (event) => {
+    event.preventDefault();
+    reportFailure();
+  };
+  canvas.addEventListener("webglcontextlost", onContextLost, false);
+
   const screenHolder = { material: null };
   const modelReady = (async () => {
     const draco = new DRACOLoader();
     draco.setDecoderPath("./assets/draco/");
     const gltfLoader = new GLTFLoader();
     gltfLoader.setDRACOLoader(draco);
-    const narrow = container.clientWidth < 720;
-    const [gltf, bootTex, badgeTex] = await Promise.all([
-      gltfLoader.loadAsync("./assets/models/computer.glb"),
-      loadTexture(narrow
-        ? "./assets/textures/astrna_boot_screen_mobile.png"
-        : "./assets/textures/astrna_boot_screen.png"),
-      loadTexture("./assets/textures/astrna_badge.png", { flipY: false }),
-    ]);
-    const model = gltf.scene;
+    try {
+      const narrow = container.clientWidth < 720;
+      const [gltf, bootTex, badgeTex] = await Promise.all([
+        gltfLoader.loadAsync("./assets/models/computer.glb"),
+        loadTexture(narrow
+          ? "./assets/textures/astrna_boot_screen_mobile.png"
+          : "./assets/textures/astrna_boot_screen.png"),
+        loadTexture("./assets/textures/astrna_badge.png", { flipY: false }),
+      ]);
+      if (disposed) throw new Error("CRT scene disposed");
+      const model = gltf.scene;
 
-    const toRemove = [];
-    model.traverse((node) => {
-      if (node.name === "background") toRemove.push(node);
-    });
-    toRemove.forEach((node) => node.removeFromParent());
+      const toRemove = [];
+      model.traverse((node) => {
+        if (node.name === "background") toRemove.push(node);
+      });
+      toRemove.forEach((node) => node.removeFromParent());
 
-    model.traverse((node) => {
-      if (!node.isMesh) return;
-      node.castShadow = true;
-      node.receiveShadow = true;
-      if ((node.name || "").toLowerCase().includes("logo")) {
-        // 机身徽标替换为 AstrNa 铭牌
-        node.material = new THREE.MeshStandardMaterial({
-          map: badgeTex,
-          roughness: 0.55,
-          metalness: 0.08,
-        });
-      }
-    });
-    scene.add(model);
+      model.traverse((node) => {
+        if (!node.isMesh) return;
+        node.castShadow = true;
+        node.receiveShadow = true;
+        if ((node.name || "").toLowerCase().includes("logo")) {
+          // 机身徽标替换为 AstrNa 铭牌
+          node.material = new THREE.MeshStandardMaterial({
+            map: badgeTex,
+            roughness: 0.55,
+            metalness: 0.08,
+          });
+        }
+      });
+      scene.add(model);
 
-    // 屏幕：收集 computer 网格中属于弧形显像管的三角形，
-    // 复制为贴合玻璃曲面的新网格，平面投影 AstrNa 开机画面。
-    let comp = null;
-    model.traverse((node) => {
-      if (node.isMesh && node.name === "computer") comp = node;
-    });
-    if (comp) {
-      const geo = comp.geometry;
-      const posAttr = geo.attributes.position;
-      const idx = geo.index;
-      const triCount = (idx ? idx.count : posAttr.count) / 3;
-      const A = new THREE.Vector3(); const B = new THREE.Vector3(); const Cv = new THREE.Vector3();
-      const e1 = new THREE.Vector3(); const e2 = new THREE.Vector3();
-      const nrm = new THREE.Vector3(); const ctr = new THREE.Vector3();
-      const positions = [];
-      const uvs = [];
-      const pushVertex = (vi) => {
-        const px = posAttr.getX(vi); const py = posAttr.getY(vi); const pz = posAttr.getZ(vi);
-        positions.push(px, py, pz);
-        const rel = new THREE.Vector3(px, py, pz).sub(SCREEN_CENTER);
-        uvs.push(
-          rel.dot(SCREEN_RIGHT) / SCREEN_GLASS_W + 0.5,
-          rel.dot(SCREEN_UP) / SCREEN_GLASS_H + 0.5,
-        );
-      };
-      for (let t = 0; t < triCount; t += 1) {
-        const a = idx ? idx.getX(t * 3) : t * 3;
-        const b = idx ? idx.getX(t * 3 + 1) : t * 3 + 1;
-        const c = idx ? idx.getX(t * 3 + 2) : t * 3 + 2;
-        A.set(posAttr.getX(a), posAttr.getY(a), posAttr.getZ(a));
-        B.set(posAttr.getX(b), posAttr.getY(b), posAttr.getZ(b));
-        Cv.set(posAttr.getX(c), posAttr.getY(c), posAttr.getZ(c));
-        e1.subVectors(B, A); e2.subVectors(Cv, A);
-        nrm.crossVectors(e1, e2);
-        if (nrm.lengthSq() < 1e-9) continue;
-        nrm.normalize();
-        // 玻璃三角形反向绕序（原材质双面渲染），用法线绝对值匹配；
-        // 放宽到 0.45 以覆盖弧形鼓面的斜面部分。
-        if (Math.abs(nrm.dot(SCREEN_NORMAL)) < 0.45) continue;
-        ctr.addVectors(A, B).add(Cv).divideScalar(3).sub(SCREEN_CENTER);
-        if (Math.abs(ctr.dot(SCREEN_RIGHT)) > SCREEN_GLASS_W / 2 + 0.4) continue;
-        if (Math.abs(ctr.dot(SCREEN_UP)) > SCREEN_GLASS_H / 2 + 0.4) continue;
-        if (ctr.dot(SCREEN_NORMAL) > 1.2) continue; // 排除更靠前的边框
-        pushVertex(a); pushVertex(b); pushVertex(c);
+      // 屏幕：收集 computer 网格中属于弧形显像管的三角形，
+      // 复制为贴合玻璃曲面的新网格，平面投影 AstrNa 开机画面。
+      let comp = null;
+      model.traverse((node) => {
+        if (node.isMesh && node.name === "computer") comp = node;
+      });
+      if (comp) {
+        const geo = comp.geometry;
+        const posAttr = geo.attributes.position;
+        const idx = geo.index;
+        const triCount = (idx ? idx.count : posAttr.count) / 3;
+        const A = new THREE.Vector3(); const B = new THREE.Vector3(); const Cv = new THREE.Vector3();
+        const e1 = new THREE.Vector3(); const e2 = new THREE.Vector3();
+        const nrm = new THREE.Vector3(); const ctr = new THREE.Vector3();
+        const positions = [];
+        const uvs = [];
+        const pushVertex = (vi) => {
+          const px = posAttr.getX(vi); const py = posAttr.getY(vi); const pz = posAttr.getZ(vi);
+          positions.push(px, py, pz);
+          const rel = new THREE.Vector3(px, py, pz).sub(SCREEN_CENTER);
+          uvs.push(
+            rel.dot(SCREEN_RIGHT) / SCREEN_GLASS_W + 0.5,
+            rel.dot(SCREEN_UP) / SCREEN_GLASS_H + 0.5,
+          );
+        };
+        for (let t = 0; t < triCount; t += 1) {
+          const a = idx ? idx.getX(t * 3) : t * 3;
+          const b = idx ? idx.getX(t * 3 + 1) : t * 3 + 1;
+          const c = idx ? idx.getX(t * 3 + 2) : t * 3 + 2;
+          A.set(posAttr.getX(a), posAttr.getY(a), posAttr.getZ(a));
+          B.set(posAttr.getX(b), posAttr.getY(b), posAttr.getZ(b));
+          Cv.set(posAttr.getX(c), posAttr.getY(c), posAttr.getZ(c));
+          e1.subVectors(B, A); e2.subVectors(Cv, A);
+          nrm.crossVectors(e1, e2);
+          if (nrm.lengthSq() < 1e-9) continue;
+          nrm.normalize();
+          // 玻璃三角形反向绕序（原材质双面渲染），用法线绝对值匹配；
+          // 放宽到 0.45 以覆盖弧形鼓面的斜面部分。
+          if (Math.abs(nrm.dot(SCREEN_NORMAL)) < 0.45) continue;
+          ctr.addVectors(A, B).add(Cv).divideScalar(3).sub(SCREEN_CENTER);
+          if (Math.abs(ctr.dot(SCREEN_RIGHT)) > SCREEN_GLASS_W / 2 + 0.4) continue;
+          if (Math.abs(ctr.dot(SCREEN_UP)) > SCREEN_GLASS_H / 2 + 0.4) continue;
+          if (ctr.dot(SCREEN_NORMAL) > 1.2) continue; // 排除更靠前的边框
+          pushVertex(a); pushVertex(b); pushVertex(c);
+        }
+        if (positions.length) {
+          const glassGeo = new THREE.BufferGeometry();
+          glassGeo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+          glassGeo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+          const screenMat = new THREE.MeshBasicMaterial({
+            map: bootTex,
+            toneMapped: false,
+            side: THREE.DoubleSide, // 玻璃三角形反向绕序，必须双面渲染
+            polygonOffset: true,
+            polygonOffsetFactor: -2,
+            polygonOffsetUnits: -2,
+          });
+          const screenMesh = new THREE.Mesh(glassGeo, screenMat);
+          scene.add(screenMesh);
+          screenHolder.material = screenMat;
+        }
       }
-      if (positions.length) {
-        const glassGeo = new THREE.BufferGeometry();
-        glassGeo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-        glassGeo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
-        const screenMat = new THREE.MeshBasicMaterial({
-          map: bootTex,
-          toneMapped: false,
-          side: THREE.DoubleSide, // 玻璃三角形反向绕序，必须双面渲染
-          polygonOffset: true,
-          polygonOffsetFactor: -2,
-          polygonOffsetUnits: -2,
-        });
-        const screenMesh = new THREE.Mesh(glassGeo, screenMat);
-        scene.add(screenMesh);
-        screenHolder.material = screenMat;
-      }
+      resize();
+      render();
+      verifyRenderedFrame();
+    } finally {
+      draco.dispose();
     }
-
-    draco.dispose();
   })();
 
-  container.appendChild(renderer.domElement);
+  container.appendChild(canvas);
 
-  let rafId = 0;
-  let paused = false;
-  let disposed = false;
   const clock = new THREE.Clock();
   const parallax = { x: 0, y: 0 };
   const reducedMotion = window.matchMedia
@@ -225,7 +250,7 @@ export function createCrtScene(container) {
   const basePos = new THREE.Vector3();
   const baseLook = new THREE.Vector3();
 
-  const render = () => {
+  function render() {
     const t = clock.getElapsedTime();
     if (screenHolder.material) {
       const f = 0.94 + Math.sin(t * 17.3) * 0.025 + Math.sin(t * 3.1) * 0.02;
@@ -243,28 +268,84 @@ export function createCrtScene(container) {
     camera.lookAt(baseLook);
     screenGlow.intensity = 26 + approachP * 160;
     renderer.render(scene, camera);
-  };
+  }
+
+  function verifyRenderedFrame() {
+    if (renderer.info.render.triangles < 10) {
+      throw new Error("CRT model did not reach the first frame");
+    }
+    const gl = renderer.getContext();
+    const width = gl.drawingBufferWidth;
+    const height = gl.drawingBufferHeight;
+    if (width < 2 || height < 2) throw new Error("CRT canvas has no drawable area");
+    const pixel = new Uint8Array(4);
+    let minLight = Number.POSITIVE_INFINITY;
+    let maxLight = Number.NEGATIVE_INFINITY;
+    for (const xRatio of [0.3, 0.4, 0.5, 0.6, 0.7]) {
+      for (const yRatio of [0.25, 0.4, 0.55, 0.7, 0.85]) {
+        gl.readPixels(
+          Math.min(width - 1, Math.floor(width * xRatio)),
+          Math.min(height - 1, Math.floor(height * yRatio)),
+          1,
+          1,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          pixel,
+        );
+        const light = pixel[0] + pixel[1] + pixel[2];
+        minLight = Math.min(minLight, light);
+        maxLight = Math.max(maxLight, light);
+      }
+    }
+    if (maxLight - minLight < 24) throw new Error("CRT first frame is blank");
+  }
+
   const loop = () => {
     if (disposed) return;
-    if (!paused) render();
+    if (!paused) {
+      if (renderer.getContext().isContextLost()) {
+        reportFailure();
+        return;
+      }
+      try {
+        render();
+      } catch {
+        reportFailure();
+        return;
+      }
+    }
     rafId = window.requestAnimationFrame(loop);
   };
 
-  const resize = () => {
+  function resize() {
     const w = container.clientWidth || 1;
     const h = container.clientHeight || 1;
     renderer.setSize(w, h, false);
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
-  };
+  }
   resize();
   const resizeObserver = new ResizeObserver(resize);
   resizeObserver.observe(container);
 
-  const onVisibility = () => { paused = document.hidden; };
+  const onVisibility = () => {
+    paused = document.hidden;
+    if (!paused && renderer.getContext().isContextLost()) reportFailure();
+  };
   document.addEventListener("visibilitychange", onVisibility);
 
-  loop();
+  modelReady.then(() => {
+    if (!disposed && !failureNotified) {
+      loop();
+      healthTimer = window.setInterval(() => {
+        if (!disposed && !document.hidden && renderer.getContext().isContextLost()) {
+          reportFailure();
+        }
+      }, 500);
+    }
+  }).catch(() => {
+    reportFailure();
+  });
 
   return {
     camera,
@@ -274,25 +355,33 @@ export function createCrtScene(container) {
       approachP = Math.min(1, Math.max(0, progress));
     },
     dispose() {
+      if (disposed) return;
       disposed = true;
       window.cancelAnimationFrame(rafId);
+      window.clearInterval(healthTimer);
       resizeObserver.disconnect();
       document.removeEventListener("visibilitychange", onVisibility);
       container.removeEventListener("pointermove", onPointerMove);
-      renderer.dispose();
-      renderer.domElement.remove();
+      canvas.removeEventListener("webglcontextlost", onContextLost, false);
+      try {
+        renderer.dispose();
+      } catch {
+        // 上下文已丢失时，释放失败不应阻止二维降级。
+      }
+      canvas.remove();
     },
   };
 }
 
-/** WebGL 可用性检测。 */
+/** Three.js r166 需要 WebGL2；检测后立即释放临时上下文。 */
 export function isWebglAvailable() {
   try {
     const canvas = document.createElement("canvas");
-    return Boolean(
-      window.WebGLRenderingContext
-        && (canvas.getContext("webgl") || canvas.getContext("experimental-webgl")),
-    );
+    const gl = canvas.getContext("webgl2");
+    if (!gl) return false;
+    const loseContext = gl.getExtension("WEBGL_lose_context");
+    if (loseContext) loseContext.loseContext();
+    return true;
   } catch {
     return false;
   }

@@ -35,20 +35,25 @@ async function bootstrap() {
   const bootOverlay = $("#boot-overlay");
   const intro = $("#intro");
   const app = $("#app");
-  const stageEl = $("#crt-stage");
-  const crtFallback = $("#crt-fallback");
+  const stageEl = $("#astrna-monitor-stage");
+  const crtFallback = $("#astrna-monitor-fallback");
 
   let scene = null;
   let use2d = false;
+  let sceneGeneration = 0;
   const smallScreen = window.innerWidth < 760;
   const coarsePointer = window.matchMedia("(pointer: coarse)").matches;
   const lowPower = Boolean(navigator.hardwareConcurrency && navigator.hardwareConcurrency <= 2);
 
-  function activate2d() {
-    if (scene) {
-      scene.dispose();
-      scene = null;
+  function activate2d(expectedScene = null) {
+    if (expectedScene && scene !== expectedScene) {
+      expectedScene.dispose();
+      return;
     }
+    sceneGeneration += 1;
+    const previousScene = scene;
+    scene = null;
+    if (previousScene) previousScene.dispose();
     use2d = true;
     stageEl.hidden = true;
     crtFallback.hidden = false;
@@ -56,21 +61,36 @@ async function bootstrap() {
 
   async function prepareScene() {
     const want3d = !reducedMotion && !smallScreen && !lowPower && isWebglAvailable();
-    if (want3d) {
-      try {
-        scene = createCrtScene(stageEl);
-        await scene.ready;
-        scene.setApproach(0);
-      } catch {
-        activate2d();
-      }
-    } else {
+    if (!want3d) {
       activate2d();
+      return;
     }
-    stageEl.addEventListener("webglcontextlost", (event) => {
-      event.preventDefault();
-      activate2d();
-    });
+
+    const generation = ++sceneGeneration;
+    let candidate = null;
+    use2d = false;
+    stageEl.hidden = false;
+    crtFallback.hidden = true;
+    try {
+      candidate = createCrtScene(stageEl, {
+        onFailure: () => {
+          if (generation === sceneGeneration) activate2d(candidate);
+        },
+      });
+      scene = candidate;
+      await candidate.ready;
+      if (generation !== sceneGeneration || scene !== candidate || use2d) {
+        candidate.dispose();
+        return;
+      }
+      candidate.setApproach(0);
+    } catch {
+      if (generation === sceneGeneration && scene === candidate) {
+        activate2d(candidate);
+      } else if (candidate) {
+        candidate.dispose();
+      }
+    }
   }
 
   const essentials = { context: null, state: null };
@@ -426,16 +446,17 @@ async function bootstrap() {
         anticipatePin: 1,
       },
     });
-    if (scene) {
+    const activeScene = scene;
+    if (activeScene) {
       tl.to(approach, {
         p: 1, duration: 1, ease: "none",
-        onUpdate: () => scene.setApproach(approach.p),
+        onUpdate: () => activeScene.setApproach(approach.p),
       }, 0);
       tl.to(stageEl, { opacity: 0, duration: 0.25 }, 0.75);
-    } else {
-      tl.to(crtFallback.firstElementChild, { scale: 2.4, duration: 1, ease: "power1.in" }, 0);
-      tl.to(crtFallback, { opacity: 0, duration: 0.3 }, 0.7);
     }
+    // 即使当前为 3D，也预置备用层时间轴；运行中降级时可接续当前进度。
+    tl.to(crtFallback.firstElementChild, { scale: 2.4, duration: 1, ease: "power1.in" }, 0);
+    tl.to(crtFallback, { opacity: 0, duration: 0.3 }, 0.7);
     tl.to(".intro-hint", { opacity: 0, duration: 0.15 }, 0.6);
     window.ScrollTrigger.refresh();
 
