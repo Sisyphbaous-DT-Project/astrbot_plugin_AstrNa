@@ -1,0 +1,595 @@
+/* AstrNa 功能控制台 — Win98 复古桌面视觉
+   青绿色桌面 + 灰色立体窗口 + 蓝色标题栏 + 机械式开关。
+   CRT 三维场景与启动画面保持暗色监视器氛围。 */
+
+@font-face {
+  font-family: "STIX Two Text";
+  src: url("../assets/fonts/stix-1.woff2") format("woff2");
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "STIX Two Text";
+  src: url("../assets/fonts/stix-2.woff2") format("woff2");
+  font-weight: 400 700;
+  font-style: italic;
+  font-display: swap;
+}
+
+:root {
+  /* Win98 调色板 */
+  --desktop: #008080;
+  --panel: #c0c0c0;
+  --panel-light: #dfdfdf;
+  --panel-dark: #808080;
+  --bevel-hi: #ffffff;
+  --bevel-lo: #0a0a0a;
+  --title-a: #000080;
+  --title-b: #1084d0;
+  --text: #000000;
+  --muted: #404040;
+  --graytext: #808080;
+  --ok: #008000;
+  --bad: #c00000;
+  --warn: #7a5c00;
+  /* 暗色监视器区域（CRT/启动/原理演示舞台） */
+  --screen: #041414;
+  --screen-text: #e8f6f6;
+  --screen-line: #2a4a4a;
+  --serif: "STIX Two Text", "Songti SC", "SimSun", Georgia, serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace;
+  --ui: Tahoma, "Segoe UI", "Microsoft YaHei", "PingFang SC", SimSun, sans-serif;
+  /* 立体边框 */
+  --raised: inset -1px -1px var(--bevel-lo), inset 1px 1px var(--bevel-hi),
+    inset -2px -2px var(--panel-dark), inset 2px 2px var(--panel-light);
+  --raised-btn: inset -1px -1px var(--bevel-lo), inset 1px 1px var(--bevel-hi),
+    inset -2px -2px var(--panel-dark), inset 2px 2px var(--panel-light);
+  --sunken: inset -1px -1px var(--bevel-hi), inset 1px 1px var(--bevel-lo),
+    inset -2px -2px var(--panel-light), inset 2px 2px var(--panel-dark);
+}
+
+/* 明暗主题只调整外层桌面氛围，Win98 核心视觉保持一致 */
+html[data-theme="light"] { --desktop: #2a9090; }
+
+* { box-sizing: border-box; }
+
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--desktop);
+  color: var(--text);
+  font-family: var(--ui);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* 旧显示器噪点覆盖层 */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  pointer-events: none;
+  background: url("../assets/textures/rgba_noise.png");
+  opacity: 0.045;
+}
+
+button { font-family: var(--ui); }
+
+em { font-family: var(--serif); font-style: italic; }
+
+/* ---------- 通用元件（Win98 立体控件） ---------- */
+
+.btn {
+  appearance: none;
+  background: var(--panel);
+  border: none;
+  box-shadow: var(--raised-btn);
+  color: var(--text);
+  padding: 6px 20px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.btn:hover:not(:disabled) { background: var(--panel-light); }
+.btn:active:not(:disabled) {
+  box-shadow: var(--sunken);
+  padding: 7px 19px 5px 21px; /* 按下沉陷偏移 */
+}
+.btn:disabled { color: var(--graytext); cursor: default; text-shadow: 1px 1px 0 var(--bevel-hi); }
+.btn.ghost { background: var(--panel); }
+.btn.small { padding: 3px 12px; font-size: 12px; }
+.btn.small:active:not(:disabled) { padding: 4px 11px 2px 13px; }
+
+.btn:focus-visible,
+.t-switch:focus-visible,
+.film-card:focus-visible,
+.icon-btn:focus-visible {
+  outline: 1px dotted var(--text);
+  outline-offset: 2px;
+}
+
+.icon-btn {
+  appearance: none;
+  background: var(--panel);
+  border: none;
+  box-shadow: var(--raised-btn);
+  color: var(--text);
+  width: 22px; height: 20px;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+.icon-btn:active { box-shadow: var(--sunken); }
+
+.badge {
+  display: inline-block;
+  padding: 0 6px;
+  font-size: 11px;
+  background: var(--panel);
+  box-shadow: var(--sunken);
+  color: var(--muted);
+}
+.badge.on { color: var(--ok); font-weight: bold; }
+.badge.off { color: var(--muted); }
+.badge.exp { color: var(--bad); font-weight: bold; background: #f0e0a0; box-shadow: var(--raised); }
+.badge.note { color: var(--warn); }
+.badge.live {
+  background: var(--title-a);
+  color: #fff;
+  font-weight: bold;
+  letter-spacing: 1px;
+  box-shadow: var(--raised);
+}
+.badge.live.stale { background: #7a5c00; }
+
+/* 机械式开关：凹槽滑轨 + 立体拨杆 + 状态灯 */
+.t-switch {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-family: var(--ui);
+}
+.t-switch .track {
+  position: relative;
+  width: 46px; height: 20px;
+  background: var(--panel-light);
+  box-shadow: var(--sunken);
+}
+.t-switch .track::before { /* 状态灯 */
+  content: "";
+  position: absolute;
+  right: 4px; top: 5px;
+  width: 8px; height: 8px;
+  background: #7a7a7a;
+  border: 1px solid var(--panel-dark);
+}
+.t-switch[aria-checked="true"] .track::before { background: #00c000; box-shadow: 0 0 4px #00c000; }
+.t-switch .knob {
+  position: absolute;
+  left: 2px; top: 2px;
+  width: 20px; height: 16px;
+  background: var(--panel);
+  box-shadow: var(--raised-btn);
+  transition: left 100ms linear;
+}
+.t-switch[aria-checked="true"] .knob { left: 24px; background: var(--panel-light); }
+.t-switch .state-label { min-width: 20px; text-align: left; font-size: 12px; color: var(--muted); }
+.t-switch[aria-checked="true"] .state-label { color: var(--ok); font-weight: bold; }
+.t-switch:disabled { cursor: default; opacity: 0.65; }
+
+/* ---------- 启动画面（保留暗色 BIOS 风格） ---------- */
+
+.boot-overlay {
+  position: fixed; inset: 0; z-index: 100;
+  background: #000;
+  color: var(--screen-text);
+  font-family: var(--mono);
+  display: flex; align-items: center; justify-content: center;
+}
+.boot-inner { width: min(680px, 92vw); }
+.boot-screen {
+  display: block;
+  width: min(520px, 80vw);
+  margin: 0 auto 22px;
+  image-rendering: pixelated;
+}
+.boot-log {
+  min-height: 108px;
+  max-height: 160px;
+  overflow: hidden;
+  font-size: 12px;
+  color: #b9c9c9;
+  border-left: 2px solid #1e3a3a;
+  padding-left: 12px;
+}
+.boot-log .ok { color: #7dff7d; }
+.boot-log .fail { color: #ff6d6d; }
+.boot-progress {
+  height: 14px;
+  margin: 14px 0 10px;
+  background: #0a0a0a;
+  border: 1px solid #2a4a4a;
+}
+.boot-progress > div {
+  height: 100%;
+  width: 0;
+  background: repeating-linear-gradient(90deg, #00e0e0 0 8px, transparent 8px 12px);
+  transition: width 180ms ease;
+}
+.boot-actions { display: flex; justify-content: flex-end; }
+.boot-actions .btn { font-family: var(--mono); }
+
+/* ---------- CRT 场景（保持暗色监视器氛围） ---------- */
+
+.intro { position: relative; height: 100vh; overflow: hidden; background: #060606; color: var(--screen-text); }
+.crt-stage { position: absolute; inset: 0; }
+.crt-stage canvas { display: block; width: 100%; height: 100%; }
+
+.crt-overlay {
+  position: absolute; inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.028) 0 1px, transparent 1px 3px);
+  mix-blend-mode: overlay;
+}
+.crt-vignette {
+  position: absolute; inset: 0;
+  pointer-events: none;
+  background: radial-gradient(ellipse at center, transparent 55%, rgba(0, 0, 0, 0.55) 100%);
+}
+
+.hero {
+  position: absolute;
+  top: clamp(18px, 3vh, 32px); left: 0; right: 0;
+  text-align: center;
+  pointer-events: none;
+}
+.hero-title {
+  font-family: var(--serif);
+  font-size: clamp(48px, 6vw, 88px);
+  line-height: 1;
+  font-style: italic;
+  font-weight: 400;
+  letter-spacing: 2px;
+  margin: 0;
+  color: #f2f2f2;
+  text-shadow: 0 2px 18px rgba(0, 0, 0, 0.6);
+}
+.hero-sub {
+  font-family: var(--mono);
+  color: #9fb4b4;
+  letter-spacing: 4px;
+  font-size: 12px;
+  margin: 8px 0 0;
+}
+
+.intro-hint {
+  position: absolute;
+  left: 50%; bottom: 5vh;
+  transform: translateX(-50%);
+  text-align: center;
+  color: #9fb4b4;
+  font-family: var(--mono);
+}
+.intro-hint p { margin: 0 0 12px; letter-spacing: 3px; font-size: 12px; animation: hint-blink 1.8s steps(2, start) infinite; }
+@keyframes hint-blink { 50% { opacity: 0.35; } }
+
+/* 2D 降级：静态开机画面 */
+.crt2d {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: radial-gradient(ellipse at 50% 40%, #14302e 0%, #060606 75%);
+}
+.crt2d-frame {
+  width: min(58vw, 540px);
+  transform: translateY(30px);
+  padding: 18px;
+  background: var(--panel);
+  box-shadow: var(--raised);
+}
+.crt2d-screen {
+  aspect-ratio: 4 / 3;
+  background: var(--screen) url("../assets/textures/astrna_boot_screen.png") center / cover no-repeat;
+  box-shadow: var(--sunken);
+}
+
+/* ---------- 主应用（Win98 桌面 + 窗口） ---------- */
+
+.app {
+  min-height: 100vh;
+  padding: 5vh clamp(10px, 3vw, 44px) 48px;
+  background:
+    repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.02) 0 1px, transparent 1px 3px),
+    var(--desktop);
+}
+
+.console-window {
+  max-width: 1180px;
+  margin: 0 auto;
+  background: var(--panel);
+  box-shadow: var(--raised);
+  padding: 0 4px 4px;
+}
+
+.console-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  background: linear-gradient(90deg, var(--title-a), var(--title-b));
+  color: #fff;
+  padding: 4px 6px 4px 10px;
+  margin: 0 -4px;
+}
+.console-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: bold;
+  letter-spacing: 1px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.console-title em { font-family: var(--ui); font-style: normal; }
+.frame-total { font-family: var(--mono); font-size: 11px; color: #cfe0ff; letter-spacing: 1px; }
+
+.console-warnings {
+  margin: 10px 12px 0;
+  padding: 8px 12px;
+  background: #fff8dc;
+  box-shadow: var(--sunken);
+  color: var(--warn);
+  font-size: 12px;
+}
+.console-warnings div + div { margin-top: 4px; }
+
+/* ---------- 胶卷 ---------- */
+
+.film-wrap { padding: 14px 10px 4px; }
+
+.filmstrip {
+  display: flex;
+  gap: 14px;
+  overflow-x: auto;
+  scroll-behavior: smooth;
+  padding: 26px calc(50% - 190px);
+  cursor: grab;
+  scrollbar-width: none;
+}
+.filmstrip::-webkit-scrollbar { display: none; }
+.filmstrip.dragging { cursor: grabbing; scroll-behavior: auto; }
+
+.film-card {
+  flex: 0 0 380px;
+  background: var(--panel);
+  box-shadow: var(--raised);
+  outline: 2px solid transparent;
+  outline-offset: 3px;
+  transition: transform 180ms ease, outline-color 180ms ease;
+}
+.film-card.centered {
+  outline-color: var(--title-a);
+  transform: translateY(-6px);
+}
+.film-holes {
+  height: 12px;
+  margin: 4px 8px 0;
+  background:
+    repeating-linear-gradient(90deg, var(--panel-dark) 0 10px, transparent 10px 22px) center / 100% 6px no-repeat;
+  opacity: 0.55;
+  border-bottom: 1px solid var(--panel-light);
+}
+.film-holes:last-child { border-bottom: none; border-top: 1px solid var(--panel-light); margin: 0 8px 4px; }
+
+.film-card .card-body { padding: 12px 16px 14px; }
+
+.film-card h3 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 8px;
+  font-size: 14px;
+  background: linear-gradient(90deg, var(--title-a), var(--title-b));
+  color: #fff;
+  padding: 3px 8px;
+  margin-left: -6px;
+  margin-right: -6px;
+}
+.frame-no { font-family: var(--mono); font-size: 13px; color: #cfe0ff; }
+.frame-name { letter-spacing: 0.5px; }
+.film-card h3 .badge { margin-left: auto; }
+
+.film-card .tagline {
+  min-height: 66px;
+  margin: 8px 0;
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+.film-card .notices-line { min-height: 22px; margin-bottom: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+
+.film-card .card-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-top: 1px solid var(--panel-dark);
+  box-shadow: 0 1px 0 var(--panel-light);
+  padding-top: 10px;
+}
+
+.film-nav { display: flex; justify-content: center; align-items: center; gap: 16px; margin-top: 10px; }
+.film-counter {
+  min-width: 84px;
+  text-align: center;
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--panel-light);
+  box-shadow: var(--sunken);
+  padding: 2px 8px;
+}
+.film-tip { text-align: center; color: var(--muted); margin: 12px 0 0; font-size: 12px; }
+
+.console-foot {
+  display: flex;
+  gap: 4px;
+  margin-top: 14px;
+  padding: 2px;
+}
+.console-foot span {
+  flex: 1;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  color: var(--muted);
+  background: var(--panel);
+  box-shadow: var(--sunken);
+  text-align: center;
+}
+
+/* ---------- 详情（Win98 应用窗口） ---------- */
+
+.detail-overlay {
+  position: fixed; inset: 0; z-index: 70;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px;
+}
+
+.window {
+  background: var(--panel);
+  box-shadow: var(--raised);
+  padding: 0 4px 4px;
+}
+
+.detail-window {
+  width: min(1020px, 96vw);
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.window-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  background: linear-gradient(90deg, var(--title-a), var(--title-b));
+  color: #fff;
+  padding: 4px 4px 4px 10px;
+  margin: 0 -4px;
+}
+.window-title { font-size: 13px; font-weight: bold; letter-spacing: 1px; }
+
+.detail-content {
+  display: grid;
+  grid-template-columns: 1.05fr 0.95fr;
+  gap: 10px;
+  padding: 10px;
+  overflow: auto;
+}
+.detail-content .col { display: flex; flex-direction: column; gap: 10px; }
+
+.panel {
+  background: var(--panel);
+  box-shadow: var(--raised);
+  padding: 8px 12px 10px;
+}
+.panel.grow { flex: 1; display: flex; flex-direction: column; }
+.panel h3 {
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--title-a);
+  letter-spacing: 1px;
+  border-bottom: 1px solid var(--panel-dark);
+  box-shadow: 0 1px 0 var(--panel-light);
+  padding-bottom: 4px;
+}
+.panel p, .panel ul { margin: 4px 0; font-size: 13px; }
+.panel ul { padding-left: 18px; }
+.panel li { margin: 2px 0; }
+
+.detail-status { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+
+.subconfig-tip { color: var(--muted); font-size: 12px; }
+
+.detail-stage {
+  position: relative;
+  flex: 1;
+  min-height: 320px;
+  background: var(--screen);
+  box-shadow: var(--sunken);
+  overflow: hidden;
+}
+.detail-stage svg { width: 100%; height: 100%; display: block; }
+.detail-stage .stage-caption {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  background: rgba(0, 0, 0, 0.65);
+  color: var(--screen-text);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 1px;
+  padding: 4px 10px;
+}
+
+.detail-footer { display: flex; justify-content: flex-start; padding: 4px 10px 10px; }
+
+/* ---------- 模态窗口 ---------- */
+
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 80;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex; align-items: center; justify-content: center;
+}
+.modal-window { width: min(460px, 92vw); }
+.modal-body { display: flex; gap: 12px; padding: 14px 14px; align-items: flex-start; }
+.modal-icon {
+  font-size: 16px;
+  font-weight: bold;
+  line-height: 1;
+  flex: 0 0 auto;
+  width: 30px; height: 30px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--panel);
+  box-shadow: var(--raised);
+  border-radius: 50%;
+}
+.modal-icon.warn { color: #8a6d00; background: #f0e0a0; }
+.modal-icon.error { color: var(--bad); }
+.modal-text { flex: 1; white-space: pre-wrap; font-size: 13px; }
+.modal-buttons { display: flex; justify-content: flex-end; gap: 10px; padding: 0 14px 12px; }
+
+/* ---------- 兜底 ---------- */
+
+.fallback-banner {
+  margin: 12px;
+  padding: 10px 14px;
+  background: #fff8dc;
+  box-shadow: var(--sunken);
+  color: var(--bad);
+  font-size: 12.5px;
+}
+
+/* ---------- 响应式与减少动态 ---------- */
+
+@media (max-width: 760px) {
+  .detail-content { grid-template-columns: 1fr; }
+  .film-card { flex-basis: 320px; }
+  .filmstrip { padding: 22px calc(50% - 160px); }
+  .hero-title { font-size: clamp(44px, 14vw, 72px); }
+  .hero-sub { font-size: 10px; letter-spacing: 2px; }
+  .crt2d-frame { width: min(84vw, 540px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .intro-hint p { animation: none; }
+  .filmstrip { scroll-behavior: auto; }
+  .film-card { transition: none; }
+  .t-switch .knob { transition: none; }
+  .boot-progress > div { transition: none; }
+}

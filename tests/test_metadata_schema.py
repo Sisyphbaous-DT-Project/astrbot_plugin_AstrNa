@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.4.9"
+    assert metadata["version"] == "1.5.0.beta1"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -443,6 +443,7 @@ def test_changelog_contains_release_notes():
     assert "## 1.4.7" in changelog
     assert "## 1.4.8" in changelog
     assert "## 1.4.9" in changelog
+    assert "## 1.5.0.beta1" in changelog
     assert "## 1.2.5" in changelog
     assert "## 1.2.4" in changelog
 
@@ -451,4 +452,6 @@ def test_readme_current_version_matches_metadata():
     metadata = yaml.safe_load(Path("metadata.yaml").read_text(encoding="utf-8"))
     readme = Path("README.md").read_text(encoding="utf-8")
 
-    assert f"当前正式版：`{metadata['version']}`" in readme
+    version = str(metadata["version"])
+    label = "当前测试版" if "beta" in version else "当前正式版"
+    assert f"{label}：`{version}`" in readme

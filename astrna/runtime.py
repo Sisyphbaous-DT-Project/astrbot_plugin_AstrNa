@@ -209,6 +209,18 @@ class AstrNaRuntime:
         self._configure_waking_check_chain()
         self._configure_auto_cache_cleanup()
 
+    def update_dashboard_switch(self, key: str, value: bool) -> None:
+        """同步功能控制台修改的单个布尔主开关到合并配置副本。
+
+        只接受 DEFAULT_CONFIG 中的布尔键；其余键一律拒绝。运行时各模块在
+        下一次相关事件中按现有规则读取 self.config 并重建包装链。
+        """
+        if key not in DEFAULT_CONFIG:
+            raise ValueError(f"未知的配置开关: {key}")
+        if not isinstance(DEFAULT_CONFIG[key], bool) or type(value) is not bool:
+            raise ValueError("仅允许修改布尔主开关")
+        self.config[key] = value
+
     async def sanitize_request(self, event: Any, req: Any) -> None:
         lifecycle_token = self._lifecycle_token
         if not self._is_lifecycle_current(lifecycle_token):

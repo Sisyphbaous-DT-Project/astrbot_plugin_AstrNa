@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AstrNa — 功能控制台</title>
+  <link rel="stylesheet" href="./css/console.css">
+</head>
+<body>
+  <!-- 复古启动画面（同时承担真实加载反馈） -->
+  <div id="boot-overlay" class="boot-overlay" role="dialog" aria-label="AstrNa 启动画面">
+    <div class="boot-inner">
+      <img class="boot-screen" src="./assets/textures/astrna_boot_screen.png" alt="AstrNa 启动画面">
+      <pre class="boot-log" aria-live="polite"></pre>
+      <div class="boot-progress" aria-hidden="true"><div></div></div>
+      <div class="boot-actions">
+        <button class="btn ghost" type="button" data-boot-skip>跳过 &gt;&gt;</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- CRT 电脑登场 -->
+  <section id="intro" class="intro" aria-label="CRT 电脑">
+    <div id="crt-stage" class="crt-stage"></div>
+    <div id="crt-fallback" class="crt2d" hidden>
+      <div class="crt2d-frame">
+        <div class="crt2d-screen"></div>
+      </div>
+    </div>
+    <div class="crt-overlay" aria-hidden="true"></div>
+    <div class="crt-vignette" aria-hidden="true"></div>
+    <header class="hero">
+      <h1 class="hero-title"><em>AstrNa</em></h1>
+      <p class="hero-sub">AstrBot 优化插件 · 功能控制台</p>
+    </header>
+    <div class="intro-hint">
+      <p>滚动滚轮，进入屏幕</p>
+      <button id="enter-button" class="btn" type="button">进入屏幕</button>
+    </div>
+  </section>
+
+  <!-- 功能控制台主界面 -->
+  <main id="app" class="app" hidden>
+    <div class="console-window">
+      <header class="console-head">
+        <h2 class="console-title"><em>功能胶卷</em> <span class="frame-total">— 20 帧</span></h2>
+        <span id="live-status" class="badge live" title="状态来自 AstrNa 真实配置">LIVE</span>
+      </header>
+      <div id="console-warnings" class="console-warnings" hidden></div>
+      <div class="film-wrap">
+        <div id="filmstrip" class="filmstrip" role="listbox" aria-label="功能胶卷" tabindex="0"></div>
+      </div>
+      <div class="film-nav">
+        <button id="film-prev" class="btn" type="button" aria-label="上一帧">« 上一帧</button>
+        <span id="film-counter" class="film-counter">- / 20</span>
+        <button id="film-next" class="btn" type="button" aria-label="下一帧">下一帧 »</button>
+      </div>
+      <p class="film-tip">滚轮 / 拖动 / 方向键浏览；在居中帧上继续滚动或点击「放大查看」进入详情；开关即时保存到 AstrNa 配置。</p>
+      <footer class="console-foot">
+        <span>20 个功能模块</span>
+        <span>开关与 AstrBot 插件配置页实时同步</span>
+        <span>复杂子配置请前往原配置页</span>
+      </footer>
+    </div>
+  </main>
+
+  <!-- 功能详情遮罩 -->
+  <div id="detail-overlay" class="detail-overlay" hidden></div>
+
+  <script src="./vendor/gsap.min.js"></script>
+  <script src="./vendor/ScrollTrigger.min.js"></script>
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>

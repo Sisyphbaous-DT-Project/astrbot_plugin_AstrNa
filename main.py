@@ -4,7 +4,17 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.star.filter.command import GreedyStr
 
+from .astrna.modules.dashboard_catalog import (
+    DashboardSwitchRollbackError,
+    apply_switch,
+    build_state,
+)
 from .astrna.runtime import AstrNaRuntime
+
+try:
+    from astrbot.api import web as astrbot_web
+except Exception:  # pragma: no cover - 旧版 AstrBot 无插件页面 API
+    astrbot_web = None  # type: ignore[assignment]
 
 try:
     from astrbot.core.message.message_event_result import MessageChain
@@ -23,6 +33,69 @@ class AstrNa(Star):
             logger=logger,
             kv_store=self,
         )
+        # 共享配置对象（生产环境为 AstrBotConfig），供功能控制台读写同一个
+        # 配置实例，与 AstrBot 原插件配置页双向同步。
+        self._shared_config = config if config is not None else {}
+        self._register_dashboard_apis()
+
+    def _register_dashboard_apis(self) -> None:
+        """注册功能控制台 Web API；旧版 AstrBot 无此机制时静默跳过。"""
+        register = getattr(self.context, "register_web_api", None)
+        if not callable(register) or astrbot_web is None:
+            return
+        plugin_name = (
+            getattr(self, "name", None)
+            or getattr(type(self), "name", None)
+            or "astrbot_plugin_AstrNa"
+        )
+        base = f"/{plugin_name}/dashboard"
+        try:
+            register(
+                f"{base}/state",
+                self._webapi_dashboard_state,
+                ["GET"],
+                "AstrNa 功能控制台状态",
+            )
+            register(
+                f"{base}/switch",
+                self._webapi_dashboard_switch,
+                ["POST"],
+                "AstrNa 功能控制台主开关",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[AstrNa] 注册功能控制台 Web API 失败: {exc}")
+
+    async def _webapi_dashboard_state(self):
+        return astrbot_web.json_response(build_state(self._shared_config))
+
+    async def _webapi_dashboard_switch(self):
+        try:
+            payload = await astrbot_web.request.json(default={})
+        except Exception:  # noqa: BLE001
+            return astrbot_web.error_response("请求体不是合法 JSON", status_code=400)
+        if not isinstance(payload, dict):
+            return astrbot_web.error_response("请求体必须是 JSON 对象", status_code=400)
+        try:
+            result = await apply_switch(
+                self._shared_config,
+                self.runtime,
+                payload.get("key"),
+                payload.get("value"),
+            )
+        except ValueError as exc:
+            return astrbot_web.error_response(str(exc), status_code=400)
+        except DashboardSwitchRollbackError:
+            logger.exception("[AstrNa] 功能控制台保存失败且自动回滚未能落盘")
+            return astrbot_web.error_response(
+                "配置保存失败，自动回滚也未能落盘；请刷新页面并在原配置页确认状态",
+                status_code=500,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[AstrNa] 功能控制台保存开关失败")
+            return astrbot_web.error_response(
+                "配置保存失败，已恢复原状态", status_code=500
+            )
+        return astrbot_web.json_response(result)
 
     @filter.on_llm_request(priority=1000)
     async def sanitize_llm_context(
