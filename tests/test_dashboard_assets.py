@@ -40,6 +40,7 @@ def test_pages_tree_exists():
     assert (PAGES_DIR / "index.html").is_file()
     assert (PAGES_DIR / "css" / "console.css").is_file()
     assert (PAGES_DIR / "js" / "app.js").is_file()
+    assert (PAGES_DIR / "js" / "asset-url.js").is_file()
     assert (PAGES_DIR / "js" / "fallback-catalog.js").is_file()
     for lib in ("gsap.min.js", "ScrollTrigger.min.js", "three.module.min.js"):
         lib_path = PAGES_DIR / "vendor" / lib
@@ -118,11 +119,18 @@ def test_crt_container_ids_avoid_adblock_false_positive():
 
 def test_crt_scene_verifies_webgl2_and_runtime_rendering():
     text = (PAGES_DIR / "js" / "crt-scene.js").read_text(encoding="utf-8")
+    app_text = (PAGES_DIR / "js" / "app.js").read_text(encoding="utf-8")
 
     assert 'canvas.getContext("webgl2")' in text
+    assert "createPluginPageAssetUrlModifier" in text
+    assert "new THREE.LoadingManager()" in text
+    assert "new THREE.TextureLoader(assetManager)" in text
+    assert "new DRACOLoader(assetManager)" in text
+    assert "new GLTFLoader(assetManager)" in text
     assert 'canvas.addEventListener("webglcontextlost"' in text
     assert "verifyRenderedFrame();" in text
     assert "renderer.info.render.triangles" in text
     assert "gl.readPixels(" in text
     assert "renderer.getContext().isContextLost()" in text
     assert "reportFailure();" in text
+    assert "hardwareConcurrency" not in app_text

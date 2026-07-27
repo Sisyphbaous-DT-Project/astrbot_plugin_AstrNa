@@ -42,8 +42,6 @@ async function bootstrap() {
   let use2d = false;
   let sceneGeneration = 0;
   const smallScreen = window.innerWidth < 760;
-  const coarsePointer = window.matchMedia("(pointer: coarse)").matches;
-  const lowPower = Boolean(navigator.hardwareConcurrency && navigator.hardwareConcurrency <= 2);
 
   function activate2d(expectedScene = null) {
     if (expectedScene && scene !== expectedScene) {
@@ -60,7 +58,7 @@ async function bootstrap() {
   }
 
   async function prepareScene() {
-    const want3d = !reducedMotion && !smallScreen && !lowPower && isWebglAvailable();
+    const want3d = !reducedMotion && !smallScreen && isWebglAvailable();
     if (!want3d) {
       activate2d();
       return;

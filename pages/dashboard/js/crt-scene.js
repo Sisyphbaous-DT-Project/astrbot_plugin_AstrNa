@@ -12,6 +12,7 @@
 import * as THREE from "../vendor/three.module.min.js";
 import { GLTFLoader } from "../vendor/GLTFLoader.js";
 import { DRACOLoader } from "../vendor/DRACOLoader.js";
+import { createPluginPageAssetUrlModifier } from "./asset-url.js";
 
 const SCREEN_CENTER = new THREE.Vector3(-21.72, 10.22, 1.86);
 const SCREEN_NORMAL = new THREE.Vector3(0.627, 0, -0.779).normalize(); // 指向观众
@@ -21,9 +22,9 @@ const WORLD_UP = new THREE.Vector3(0, 1, 0);
 const SCREEN_GLASS_W = 14.04; // 可视开口尺寸（4:3）
 const SCREEN_GLASS_H = 10.59;
 
-function loadTexture(url, { flipY = true } = {}) {
+function loadTexture(manager, url, { flipY = true } = {}) {
   return new Promise((resolve, reject) => {
-    new THREE.TextureLoader().load(
+    new THREE.TextureLoader(manager).load(
       url,
       (tex) => {
         tex.colorSpace = THREE.SRGBColorSpace;
@@ -37,6 +38,8 @@ function loadTexture(url, { flipY = true } = {}) {
 }
 
 export function createCrtScene(container, { onFailure } = {}) {
+  const assetManager = new THREE.LoadingManager();
+  assetManager.setURLModifier(createPluginPageAssetUrlModifier());
   const renderer = new THREE.WebGLRenderer({
     antialias: true,
     alpha: false,
@@ -89,7 +92,7 @@ export function createCrtScene(container, { onFailure } = {}) {
   scene.add(screenGlow);
 
   // 地面：dirt 肌理（模型底部 y≈0.06，直接落地）
-  const texLoader = new THREE.TextureLoader();
+  const texLoader = new THREE.TextureLoader(assetManager);
   const dirt = texLoader.load("./assets/textures/dirt.jpg");
   dirt.wrapS = THREE.RepeatWrapping;
   dirt.wrapT = THREE.RepeatWrapping;
@@ -124,18 +127,18 @@ export function createCrtScene(container, { onFailure } = {}) {
 
   const screenHolder = { material: null };
   const modelReady = (async () => {
-    const draco = new DRACOLoader();
+    const draco = new DRACOLoader(assetManager);
     draco.setDecoderPath("./assets/draco/");
-    const gltfLoader = new GLTFLoader();
+    const gltfLoader = new GLTFLoader(assetManager);
     gltfLoader.setDRACOLoader(draco);
     try {
       const narrow = container.clientWidth < 720;
       const [gltf, bootTex, badgeTex] = await Promise.all([
         gltfLoader.loadAsync("./assets/models/computer.glb"),
-        loadTexture(narrow
+        loadTexture(assetManager, narrow
           ? "./assets/textures/astrna_boot_screen_mobile.png"
           : "./assets/textures/astrna_boot_screen.png"),
-        loadTexture("./assets/textures/astrna_badge.png", { flipY: false }),
+        loadTexture(assetManager, "./assets/textures/astrna_badge.png", { flipY: false }),
       ]);
       if (disposed) throw new Error("CRT scene disposed");
       const model = gltf.scene;
