@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
@@ -12,6 +14,36 @@ from .astrna.modules.dashboard_catalog import (
 from .astrna.runtime import AstrNaRuntime
 
 DASHBOARD_PLUGIN_NAME = "astrbot_plugin_AstrNa"
+
+try:
+    import yaml
+except Exception:  # pragma: no cover - 极简环境无 PyYAML
+    yaml = None  # type: ignore[assignment]
+
+
+def _read_plugin_version() -> str:
+    """从插件根目录 metadata.yaml 读取正式版本号；任何失败都返回 "unknown"。
+
+    metadata.yaml 是唯一的版本来源，绝不从 README、CHANGELOG 或前端常量推断。
+    """
+    try:
+        metadata_path = Path(__file__).resolve().parent / "metadata.yaml"
+        text = metadata_path.read_text(encoding="utf-8")
+        version: object = None
+        if yaml is not None:
+            payload = yaml.safe_load(text) or {}
+            if isinstance(payload, dict):
+                version = payload.get("version")
+        else:
+            for line in text.splitlines():
+                if line.startswith("version:"):
+                    version = line.split(":", 1)[1].strip().strip("'\"")
+                    break
+        if isinstance(version, str) and version.strip():
+            return version.strip()
+    except Exception:  # noqa: BLE001
+        logger.warning("[AstrNa] 读取 metadata.yaml 版本号失败")
+    return "unknown"
 
 try:
     from astrbot.api import web as astrbot_web
@@ -38,6 +70,7 @@ class AstrNa(Star):
         # 共享配置对象（生产环境为 AstrBotConfig），供功能控制台读写同一个
         # 配置实例，与 AstrBot 原插件配置页双向同步。
         self._shared_config = config if config is not None else {}
+        self._plugin_version = _read_plugin_version()
         self._register_dashboard_apis()
 
     def _register_dashboard_apis(self) -> None:
@@ -65,7 +98,9 @@ class AstrNa(Star):
             logger.warning(f"[AstrNa] 注册功能控制台 Web API 失败: {exc}")
 
     async def _webapi_dashboard_state(self):
-        return astrbot_web.json_response(build_state(self._shared_config))
+        return astrbot_web.json_response(
+            build_state(self._shared_config, version=self._plugin_version)
+        )
 
     async def _webapi_dashboard_switch(self):
         try:

@@ -13,6 +13,7 @@ import * as THREE from "../vendor/three.module.min.js";
 import { GLTFLoader } from "../vendor/GLTFLoader.js";
 import { DRACOLoader } from "../vendor/DRACOLoader.js";
 import { createPluginPageAssetUrlModifier } from "./asset-url.js";
+import { normalizeVersion } from "./dashboard-version.js";
 
 const SCREEN_CENTER = new THREE.Vector3(-21.72, 10.22, 1.86);
 const SCREEN_NORMAL = new THREE.Vector3(0.627, 0, -0.779).normalize(); // 指向观众
@@ -37,7 +38,8 @@ function loadTexture(manager, url, { flipY = true } = {}) {
   });
 }
 
-export function createCrtScene(container, { onFailure } = {}) {
+export function createCrtScene(container, { onFailure, version } = {}) {
+  let currentVersion = normalizeVersion(version);
   const assetManager = new THREE.LoadingManager();
   assetManager.setURLModifier(createPluginPageAssetUrlModifier());
   const renderer = new THREE.WebGLRenderer({
@@ -126,6 +128,11 @@ export function createCrtScene(container, { onFailure } = {}) {
   canvas.addEventListener("webglcontextlost", onContextLost, false);
 
   const screenHolder = { material: null };
+  // 屏幕纹理由中性底图 + 动态版本文字合成：底图不再烧录版本号，
+  // 版本来自状态接口，变化时只重绘离屏 Canvas，不重载模型。
+  let bootTexture = null;
+  let screenTexture = null;
+  let drawScreen = null;
   const modelReady = (async () => {
     const draco = new DRACOLoader(assetManager);
     draco.setDecoderPath("./assets/draco/");
@@ -142,6 +149,30 @@ export function createCrtScene(container, { onFailure } = {}) {
       ]);
       if (disposed) throw new Error("CRT scene disposed");
       const model = gltf.scene;
+
+      // 中性底图绘制到离屏 Canvas，再叠加当前版本文字（位置与原设计稿
+      // 版本行一致：y = 0.52h + 34s，s = w/640，桌面/移动图各自换算）。
+      bootTexture = bootTex;
+      const bootImage = bootTex.image;
+      const screenCanvas = document.createElement("canvas");
+      screenCanvas.width = bootImage.width;
+      screenCanvas.height = bootImage.height;
+      drawScreen = (text) => {
+        const ctx = screenCanvas.getContext("2d");
+        const w = screenCanvas.width;
+        const h = screenCanvas.height;
+        const s = w / 640;
+        ctx.drawImage(bootImage, 0, 0);
+        ctx.font = `${Math.max(8, Math.round(21 * s))}px monospace`;
+        ctx.fillStyle = "rgb(200, 200, 200)";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        ctx.fillText(`Version ${text}`, w / 2, h * 0.52 + 34 * s);
+      };
+      drawScreen(currentVersion);
+      screenTexture = new THREE.CanvasTexture(screenCanvas);
+      screenTexture.colorSpace = THREE.SRGBColorSpace;
+      screenTexture.flipY = true;
 
       const toRemove = [];
       model.traverse((node) => {
@@ -214,7 +245,7 @@ export function createCrtScene(container, { onFailure } = {}) {
           glassGeo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
           glassGeo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
           const screenMat = new THREE.MeshBasicMaterial({
-            map: bootTex,
+            map: screenTexture,
             toneMapped: false,
             side: THREE.DoubleSide, // 玻璃三角形反向绕序，必须双面渲染
             polygonOffset: true,
@@ -357,6 +388,16 @@ export function createCrtScene(container, { onFailure } = {}) {
     setApproach(progress) {
       approachP = Math.min(1, Math.max(0, progress));
     },
+    /** 版本变化时重绘屏幕 Canvas 并刷新纹理，不重载模型。 */
+    setVersion(value) {
+      const next = normalizeVersion(value);
+      if (next === currentVersion) return;
+      currentVersion = next;
+      if (drawScreen && screenTexture && !disposed) {
+        drawScreen(next);
+        screenTexture.needsUpdate = true;
+      }
+    },
     dispose() {
       if (disposed) return;
       disposed = true;
@@ -366,6 +407,8 @@ export function createCrtScene(container, { onFailure } = {}) {
       document.removeEventListener("visibilitychange", onVisibility);
       container.removeEventListener("pointermove", onPointerMove);
       canvas.removeEventListener("webglcontextlost", onContextLost, false);
+      if (screenTexture) screenTexture.dispose();
+      if (bootTexture) bootTexture.dispose();
       try {
         renderer.dispose();
       } catch {

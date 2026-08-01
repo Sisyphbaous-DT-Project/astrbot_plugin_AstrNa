@@ -195,11 +195,27 @@ em { font-family: var(--serif); font-style: italic; }
   display: flex; align-items: center; justify-content: center;
 }
 .boot-inner { width: min(680px, 92vw); }
-.boot-screen {
-  display: block;
+.boot-screen-wrap {
+  position: relative;
   width: min(520px, 80vw);
   margin: 0 auto 22px;
+}
+.boot-screen {
+  display: block;
+  width: 100%;
   image-rendering: pixelated;
+}
+/* 运行时版本叠加：与中性底图的原版本行同位（约 58% 高度），随图宽等比缩放 */
+.boot-version {
+  position: absolute;
+  left: 50%;
+  top: 59%;
+  transform: translate(-50%, -50%);
+  font-family: var(--mono);
+  font-size: min(17px, 2.6vw);
+  color: #c8c8c8;
+  white-space: nowrap;
+  user-select: text;
 }
 .boot-log {
   min-height: 108px;
@@ -295,9 +311,21 @@ em { font-family: var(--serif); font-style: italic; }
   box-shadow: var(--raised);
 }
 .crt2d-screen {
+  position: relative;
   aspect-ratio: 4 / 3;
   background: var(--screen) url("../assets/textures/astrna_boot_screen.png") center / cover no-repeat;
   box-shadow: var(--sunken);
+}
+.crt2d-version {
+  position: absolute;
+  left: 50%;
+  top: 59%;
+  transform: translate(-50%, -50%);
+  font-family: var(--mono);
+  font-size: min(15px, 2vw);
+  color: #c8c8c8;
+  white-space: nowrap;
+  user-select: text;
 }
 
 /* ---------- 主应用（Win98 桌面 + 窗口） ---------- */
@@ -358,13 +386,13 @@ em { font-family: var(--serif); font-style: italic; }
   display: flex;
   gap: 14px;
   overflow-x: auto;
-  scroll-behavior: smooth;
+  /* 吸附由 filmstrip.js 统一控制，禁用浏览器平滑滚动避免互相打断 */
   padding: 26px calc(50% - 190px);
   cursor: grab;
   scrollbar-width: none;
 }
 .filmstrip::-webkit-scrollbar { display: none; }
-.filmstrip.dragging { cursor: grabbing; scroll-behavior: auto; }
+.filmstrip.dragging { cursor: grabbing; }
 
 .film-card {
   flex: 0 0 380px;

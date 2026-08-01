@@ -1,9 +1,26 @@
 /** 横向胶卷：20 帧功能卡片，滚轮/拖动/键盘/按钮导航，居中高亮。 */
 
-export function createFilmstrip({ container, counterEl, features, onOpenDetail }) {
+import { createWheelGesture, normalizeWheelDelta } from "./wheel-gesture.js";
+
+const WHEEL_TIMING = {
+  browseThreshold: 70,
+  gestureGap: 200,
+  settleQuiet: 300,
+  maxFramesPerEvent: 3,
+};
+const CENTER_TOLERANCE = 6;
+
+export function createFilmstrip({ container, counterEl, features, onOpenDetail, isDetailOpen }) {
   const strip = container;
   const cards = new Map();
+  // 三种帧身份分离：currentKey=视觉最近帧（计数/高亮），
+  // targetKey=本次手势/导航的目标帧，settledKey=最后完成居中的帧。
   let currentKey = null;
+  let targetKey = null;
+  let settledKey = null;
+  const gesture = createWheelGesture(WHEEL_TIMING);
+  const detailOpen = () => (typeof isDetailOpen === "function" ? Boolean(isDetailOpen()) : false);
+  const reducedMotion = () => window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
   const buildCard = (feature, index) => {
     const card = document.createElement("article");
@@ -42,19 +59,25 @@ export function createFilmstrip({ container, counterEl, features, onOpenDetail }
     status.className = "badge status-badge";
     noticesLine.appendChild(status);
 
+    // 详情按钮/双击/Enter 直达详情，不受滚轮武装限制
     card.querySelector(".detail-btn").addEventListener("click", (event) => {
       event.stopPropagation();
+      gesture.disarm();
       onOpenDetail(feature.key);
     });
     card.addEventListener("click", (event) => {
       if (dragMoved) return;
       if (event.target.closest("button, a, input, [role='switch']")) return;
-      scrollToKey(feature.key);
+      navigateTo(feature.key);
     });
-    card.addEventListener("dblclick", () => onOpenDetail(feature.key));
+    card.addEventListener("dblclick", () => {
+      gesture.disarm();
+      onOpenDetail(feature.key);
+    });
     card.addEventListener("keydown", (event) => {
       if (event.key === "Enter") {
         event.preventDefault();
+        gesture.disarm();
         onOpenDetail(feature.key);
       }
     });
@@ -66,8 +89,6 @@ export function createFilmstrip({ container, counterEl, features, onOpenDetail }
     strip.appendChild(card);
     cards.set(feature.key, card);
   });
-
-  const cardList = () => features.map((f) => cards.get(f.key));
 
   // 以可视矩形计算中心，避免 offsetLeft 与 scrollLeft 坐标系不一致
   const stripMid = () => {
@@ -105,68 +126,121 @@ export function createFilmstrip({ container, counterEl, features, onOpenDetail }
     return card ? Math.abs(cardMid(card) - stripMid()) : Infinity;
   };
 
-  const scrollToKey = (key, smooth = true) => {
+  const indexOfKey = (key) => features.findIndex((f) => f.key === key);
+  const clampIndex = (index) => Math.min(features.length - 1, Math.max(0, index));
+
+  // 吸附统一由脚本控制（CSS 不再使用 scroll-behavior: smooth），
+  // 任何时刻只允许一个吸附动画；新导航先杀旧动画、清旧定时器。
+  let snapTween = null;
+  let gestureTimer = 0;
+  let quietTimer = 0;
+
+  const killSnapTween = () => {
+    if (!snapTween) return;
+    snapTween.kill();
+    snapTween = null;
+    gesture.setSnapActive(false);
+  };
+  const clearGestureTimer = () => {
+    window.clearTimeout(gestureTimer);
+    gestureTimer = 0;
+  };
+  const clearQuietTimer = () => {
+    window.clearTimeout(quietTimer);
+    quietTimer = 0;
+  };
+
+  const runSnap = (key) => {
     const card = cards.get(key);
     if (!card) return;
-    strip.scrollTo({
-      left: strip.scrollLeft + (cardMid(card) - stripMid()),
-      behavior: smooth && !window.matchMedia("(prefers-reduced-motion: reduce)").matches
-        ? "smooth" : "auto",
+    killSnapTween();
+    clearQuietTimer();
+    targetKey = key;
+    gesture.setSnapActive(true);
+    const target = strip.scrollLeft + (cardMid(card) - stripMid());
+    const finish = () => {
+      snapTween = null;
+      markCentered();
+      const centered = centeredDistance() <= CENTER_TOLERANCE;
+      const switched = key !== settledKey;
+      if (centered) {
+        settledKey = key;
+        targetKey = key;
+      }
+      const result = gesture.snapDone({ centered, switched });
+      if (result.armAfter !== null && result.armAfter !== undefined) {
+        const token = result.token;
+        quietTimer = window.setTimeout(() => {
+          quietTimer = 0;
+          gesture.quietElapsed(token);
+        }, result.armAfter);
+      }
+    };
+    if (reducedMotion() || !window.gsap) {
+      strip.scrollLeft = target;
+      finish();
+      return;
+    }
+    snapTween = window.gsap.to(strip, {
+      scrollLeft: target,
+      duration: 0.32,
+      ease: "power2.out",
+      onComplete: finish,
     });
   };
 
+  /** 按钮/方向键/卡片点击等导航：解除旧武装，从当前目标帧继续，避免过期目标。 */
+  const navigateTo = (key) => {
+    gesture.disarm();
+    clearGestureTimer();
+    runSnap(key);
+  };
+
   const stepBy = (delta) => {
-    const index = features.findIndex((f) => f.key === currentKey);
-    const next = Math.min(features.length - 1, Math.max(0, index + delta));
-    scrollToKey(features[next].key);
+    const base = indexOfKey(targetKey || settledKey || currentKey);
+    navigateTo(features[clampIndex(base + delta)].key);
   };
 
-  // 停止滚动后自动吸附到最近帧，保证当前帧真正居中
-  let snapTimer = 0;
-  let settleTimer = 0;
-  let settledAt = 0;
-  const scheduleSnap = () => {
-    window.clearTimeout(snapTimer);
-    window.clearTimeout(settleTimer);
-    settledAt = 0;
-    snapTimer = window.setTimeout(() => {
-      if (!dragging && currentKey) {
-        scrollToKey(currentKey);
-        settleTimer = window.setTimeout(() => {
-          markCentered();
-          if (centeredDistance() <= 6) settledAt = performance.now();
-        }, 360);
-      }
-    }, 180);
-  };
-
-  // 连续滚动用于浏览；在某帧停稳片刻后再次向前滚动，才进入该帧详情。
-  let wheelAccum = 0;
-  let wheelTimer = 0;
+  // 滚轮：先连续浏览；真实翻页、吸附居中并完全停稳后，
+  // 下一次独立向前手势才进入详情（由 wheel-gesture 状态机裁决）。
   strip.addEventListener("wheel", (event) => {
     event.preventDefault();
-    const delta = Math.abs(event.deltaY) >= Math.abs(event.deltaX)
-      ? event.deltaY : event.deltaX;
+    killSnapTween();
+    clearQuietTimer();
+    const delta = normalizeWheelDelta({
+      deltaX: event.deltaX,
+      deltaY: event.deltaY,
+      deltaMode: event.deltaMode,
+      pageSize: strip.clientWidth || 600,
+    });
     const hovered = document.elementFromPoint(event.clientX, event.clientY);
-    const overCentered = hovered && hovered.closest(".film-card.centered");
-    const armed = overCentered
-      && delta > 0
-      && centeredDistance() <= 6
-      && performance.now() - settledAt >= 420;
-    if (armed) {
-      wheelAccum += delta;
-      window.clearTimeout(wheelTimer);
-      wheelTimer = window.setTimeout(() => { wheelAccum = 0; }, 420);
-      if (wheelAccum >= 160 && currentKey) {
-        wheelAccum = 0;
-        settledAt = 0;
-        onOpenDetail(currentKey);
-      }
-    } else {
-      wheelAccum = 0;
-      strip.scrollLeft += delta;
-      scheduleSnap();
+    const overCentered = Boolean(hovered && hovered.closest(".film-card.centered"));
+    const effect = gesture.wheel({
+      delta,
+      now: performance.now(),
+      overCentered,
+      detailOpen: detailOpen(),
+    });
+    if (effect.openDetail) {
+      clearGestureTimer();
+      if (currentKey) onOpenDetail(currentKey);
+      return;
     }
+    if (effect.scrollBy) strip.scrollLeft += effect.scrollBy;
+    if (effect.commits) {
+      const next = clampIndex(indexOfKey(targetKey) + effect.commits);
+      targetKey = features[next].key;
+    }
+    clearGestureTimer();
+    gestureTimer = window.setTimeout(() => {
+      gestureTimer = 0;
+      const result = gesture.endGesture();
+      if (result.snap === "toTarget" && targetKey) {
+        runSnap(targetKey);
+      } else if (result.snap === "back" && settledKey) {
+        runSnap(settledKey);
+      }
+    }, WHEEL_TIMING.gestureGap);
   }, { passive: false });
 
   // 拖动/滑动
@@ -177,6 +251,10 @@ export function createFilmstrip({ container, counterEl, features, onOpenDetail }
   strip.addEventListener("pointerdown", (event) => {
     // 按钮/开关等交互元素不启动拖动，否则指针捕获会吞掉点击
     if (event.target.closest("button, a, input, [role='switch']")) return;
+    gesture.disarm();
+    killSnapTween();
+    clearGestureTimer();
+    clearQuietTimer();
     dragging = true;
     dragMoved = false;
     dragStartX = event.clientX;
@@ -194,7 +272,8 @@ export function createFilmstrip({ container, counterEl, features, onOpenDetail }
     if (!dragging) return;
     dragging = false;
     strip.classList.remove("dragging");
-    scheduleSnap();
+    markCentered();
+    if (currentKey) runSnap(currentKey);
   };
   strip.addEventListener("pointerup", endDrag);
   strip.addEventListener("pointercancel", endDrag);
@@ -215,11 +294,44 @@ export function createFilmstrip({ container, counterEl, features, onOpenDetail }
   });
 
   markCentered();
+  targetKey = currentKey;
+  settledKey = currentKey;
+
+  const scrollToKey = (key, smooth = true) => {
+    if (!cards.get(key)) return;
+    if (smooth) {
+      navigateTo(key);
+      return;
+    }
+    gesture.disarm();
+    killSnapTween();
+    clearGestureTimer();
+    clearQuietTimer();
+    const card = cards.get(key);
+    strip.scrollLeft = strip.scrollLeft + (cardMid(card) - stripMid());
+    markCentered();
+    targetKey = key;
+    settledKey = key;
+  };
 
   return {
     scrollToKey,
     stepBy,
     getCurrentKey: () => currentKey,
+    /** 详情关闭后恢复原位置：瞬时滚回并重置武装状态，避免立刻再次打开。 */
+    restoreAfterDetail(key) {
+      gesture.detailClosed();
+      killSnapTween();
+      clearGestureTimer();
+      clearQuietTimer();
+      const card = cards.get(key);
+      if (card) {
+        strip.scrollLeft = strip.scrollLeft + (cardMid(card) - stripMid());
+        markCentered();
+        targetKey = key;
+        settledKey = key;
+      }
+    },
     /** 刷新某一帧的开关与状态徽标。 */
     setEnabled(key, enabled) {
       const card = cards.get(key);

@@ -395,8 +395,12 @@ def _build_warnings(config: Mapping[str, Any]) -> list[str]:
     return warnings
 
 
-def build_state(config: Mapping[str, Any]) -> dict[str, Any]:
-    """生成页面完整状态。config 为 AstrBot 注入的共享配置对象或其映射。"""
+def build_state(config: Mapping[str, Any], version: Any = "unknown") -> dict[str, Any]:
+    """生成页面完整状态。config 为 AstrBot 注入的共享配置对象或其映射。
+
+    version 由调用方从正式插件元数据读取后传入；本模块不自行探测工作目录。
+    非空字符串以外的值一律降级为 "unknown"，绝不猜测版本。
+    """
     features: list[dict[str, Any]] = []
     for feature in FEATURES:
         key = feature["key"]
@@ -404,7 +408,9 @@ def build_state(config: Mapping[str, Any]) -> dict[str, Any]:
         entry["enabled"] = _truthy_flag(config, key)
         entry["details"] = _build_details(key, config)
         features.append(entry)
+    normalized = version.strip() if isinstance(version, str) else ""
     return {
+        "version": normalized or "unknown",
         "features": features,
         "warnings": _build_warnings(config),
     }

@@ -10,7 +10,10 @@
   <!-- 复古启动画面（同时承担真实加载反馈） -->
   <div id="boot-overlay" class="boot-overlay" role="dialog" aria-label="AstrNa 启动画面">
     <div class="boot-inner">
-      <img class="boot-screen" src="./assets/textures/astrna_boot_screen.png" alt="AstrNa 启动画面">
+      <div class="boot-screen-wrap">
+        <img class="boot-screen" src="./assets/textures/astrna_boot_screen.png" alt="AstrNa 启动画面">
+        <span class="boot-version" data-dashboard-version>Version …</span>
+      </div>
       <pre class="boot-log" aria-live="polite"></pre>
       <div class="boot-progress" aria-hidden="true"><div></div></div>
       <div class="boot-actions">
@@ -24,7 +27,7 @@
     <div id="astrna-monitor-stage" class="crt-stage"></div>
     <div id="astrna-monitor-fallback" class="crt2d" hidden>
       <div class="crt2d-frame">
-        <div class="crt2d-screen"></div>
+        <div class="crt2d-screen"><span class="crt2d-version" data-dashboard-version>Version …</span></div>
       </div>
     </div>
     <div class="crt-overlay" aria-hidden="true"></div>

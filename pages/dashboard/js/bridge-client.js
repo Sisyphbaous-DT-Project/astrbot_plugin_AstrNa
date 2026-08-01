@@ -23,6 +23,8 @@ function createMockBridge() {
           enabled: enabled.get(item.key),
         })),
         warnings: [],
+        // 本地独立预览的明确标识；正式版本只来自真实状态接口。
+        version: "preview",
       };
     },
     async apiPost(endpoint, body) {

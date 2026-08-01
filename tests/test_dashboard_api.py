@@ -192,6 +192,17 @@ def test_state_api_returns_full_state(webapi):
     asyncio.run(star.runtime.terminate())
 
 
+def test_state_api_version_matches_metadata(webapi):
+    import yaml
+
+    metadata = yaml.safe_load((REPO_ROOT / "metadata.yaml").read_text(encoding="utf-8"))
+    star, _, _ = webapi(FakeConfig(), {})
+    kind, data = asyncio.run(star._webapi_dashboard_state())
+    assert kind == "json"
+    assert data["version"] == str(metadata["version"])
+    asyncio.run(star.runtime.terminate())
+
+
 def test_switch_api_success(webapi):
     config = FakeConfig()
     star, _, _ = webapi(config, {"key": "auto_cleanup_astrbot_cache", "value": True})

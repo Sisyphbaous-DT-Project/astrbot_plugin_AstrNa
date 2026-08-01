@@ -5,6 +5,7 @@
 
 import { createBridge } from "./bridge-client.js";
 import { buildFallbackState } from "./fallback-catalog.js";
+import { normalizeVersion, versionLabel } from "./dashboard-version.js";
 import { runBoot, BootSkippedError } from "./boot.js";
 import { confirmDialog, errorDialog } from "./modal.js";
 import { createFilmstrip } from "./filmstrip.js";
@@ -71,6 +72,7 @@ async function bootstrap() {
     crtFallback.hidden = true;
     try {
       candidate = createCrtScene(stageEl, {
+        version: essentials.state && essentials.state.version,
         onFailure: () => {
           if (generation === sceneGeneration) activate2d(candidate);
         },
@@ -94,6 +96,17 @@ async function bootstrap() {
   const essentials = { context: null, state: null };
   let appEntered = false;
 
+  /** 统一接收状态版本：更新启动页/二维 CRT 的 DOM 标签与三维 CRT 屏幕纹理。 */
+  function applyDashboardVersion(state) {
+    const label = versionLabel(state && state.version);
+    for (const el of document.querySelectorAll("[data-dashboard-version]")) {
+      el.textContent = label;
+    }
+    if (scene && typeof scene.setVersion === "function") {
+      scene.setVersion(normalizeVersion(state && state.version));
+    }
+  }
+
   async function loadEssentials() {
     if (!essentials.context) {
       essentials.context = await withTimeout(bridge.ready(), 8000, "连接 AstrBot 控制台");
@@ -101,6 +114,7 @@ async function bootstrap() {
     if (!essentials.state) {
       essentials.state = await withTimeout(
         bridge.apiGet("dashboard/state"), 10000, "读取功能配置");
+      applyDashboardVersion(essentials.state);
     }
     return essentials;
   }
@@ -111,6 +125,7 @@ async function bootstrap() {
   function showFatal(error) {
     hideBoot();
     essentials.state = buildFallbackState();
+    applyDashboardVersion(essentials.state);
     enterApp({
       simple: true,
       banner: `无法读取真实配置，已进入只读目录：${error && error.message ? error.message : error}`,
@@ -157,6 +172,7 @@ async function bootstrap() {
           { label: "读取功能配置", run: async () => {
             essentials.state = await withTimeout(
               bridge.apiGet("dashboard/state"), 10000, "读取功能配置");
+            applyDashboardVersion(essentials.state);
           } },
           { label: "准备 CRT 场景", run: async () => { await prepareScene(); } },
         ],
@@ -200,6 +216,7 @@ async function bootstrap() {
     if (appEntered) return;
     appEntered = true;
     const { context, state } = essentials;
+    applyDashboardVersion(state);
     if (context && typeof context.isDark === "boolean" && !document.documentElement.dataset.theme) {
       document.documentElement.dataset.theme = context.isDark ? "dark" : "light";
     }
@@ -327,6 +344,7 @@ async function bootstrap() {
       container: $("#filmstrip"),
       counterEl: $("#film-counter"),
       features,
+      isDetailOpen: () => detailHandle !== null,
       onOpenDetail: (key) => {
         const feature = featureMap.get(key);
         if (!feature) return;
@@ -336,7 +354,7 @@ async function bootstrap() {
           reducedMotion,
           onClose: () => {
             detailHandle = null;
-            filmstrip.scrollToKey(key, false);
+            filmstrip.restoreAfterDetail(key);
             const card = document.querySelector(`.film-card[data-key="${key}"]`);
             if (card) card.focus({ preventScroll: true });
           },
@@ -378,6 +396,7 @@ async function bootstrap() {
         if (!nextState || !Array.isArray(nextState.features)) {
           throw new Error("功能配置格式不正确");
         }
+        applyDashboardVersion(nextState);
         stateReadOnly = false;
         for (const nextFeature of nextState.features) {
           const current = featureMap.get(nextFeature.key);

@@ -193,5 +193,7 @@ export function buildFallbackState({ interactive = false } = {}) {
     warnings: interactive
       ? []
       : ["真实配置暂时无法读取：当前为只读目录，所有开关均已锁定。"],
+    // 状态接口失败时版本必须保持未知，绝不伪装成正式版本。
+    version: "unknown",
   };
 }

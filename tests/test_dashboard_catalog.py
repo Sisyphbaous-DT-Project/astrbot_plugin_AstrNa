@@ -91,6 +91,17 @@ def test_build_state_defaults_all_disabled():
     assert state["warnings"] == []
 
 
+def test_build_state_version_defaults_to_unknown():
+    assert build_state({})["version"] == "unknown"
+
+
+def test_build_state_version_passthrough_and_fallback():
+    assert build_state({}, version="1.5.0.beta5")["version"] == "1.5.0.beta5"
+    assert build_state({}, version="  1.5.0.beta5  ")["version"] == "1.5.0.beta5"
+    for bad in ("", "   ", None, 0, 1.5, ["1.5.0.beta5"]):
+        assert build_state({}, version=bad)["version"] == "unknown"
+
+
 def test_build_state_never_leaks_sensitive_values():
     config = {
         "issue_assistant_enabled": True,
