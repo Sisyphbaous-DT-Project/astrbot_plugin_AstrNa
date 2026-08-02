@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.5.0.beta5"
+    assert metadata["version"] == "1.5.1"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -361,7 +361,7 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
     assert schema["issue_assistant_devkit_enabled"]["type"] == "bool"
     assert (
         schema["issue_assistant_devkit_enabled"]["description"]
-        == "提供阅读源码和修改源码的功能"
+        == "开发工具箱（提供阅读源码和修改源码的功能）"
     )
     assert schema["issue_assistant_devkit_enabled"]["default"] is False
     assert schema["issue_assistant_devkit_enabled"]["collapsed"] is True
@@ -448,6 +448,7 @@ def test_changelog_contains_release_notes():
     assert "## 1.5.0.beta3" in changelog
     assert "## 1.5.0.beta4" in changelog
     assert "## 1.5.0.beta5" in changelog
+    assert "## 1.5.1" in changelog
     assert "## 1.2.5" in changelog
     assert "## 1.2.4" in changelog
 

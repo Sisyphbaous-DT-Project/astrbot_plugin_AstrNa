@@ -11,6 +11,7 @@ from .astrna.modules.dashboard_catalog import (
     apply_switch,
     build_state,
 )
+from .astrna.modules.dashboard_settings import apply_setting
 from .astrna.runtime import AstrNaRuntime
 
 DASHBOARD_PLUGIN_NAME = "astrbot_plugin_AstrNa"
@@ -94,12 +95,22 @@ class AstrNa(Star):
                 ["POST"],
                 "AstrNa 功能控制台主开关",
             )
+            register(
+                f"{base}/setting",
+                self._webapi_dashboard_setting,
+                ["POST"],
+                "AstrNa 功能控制台子配置",
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[AstrNa] 注册功能控制台 Web API 失败: {exc}")
 
     async def _webapi_dashboard_state(self):
         return astrbot_web.json_response(
-            build_state(self._shared_config, version=self._plugin_version)
+            build_state(
+                self._shared_config,
+                version=self._plugin_version,
+                context=self.context,
+            )
         )
 
     async def _webapi_dashboard_switch(self):
@@ -126,6 +137,35 @@ class AstrNa(Star):
             )
         except Exception:  # noqa: BLE001
             logger.exception("[AstrNa] 功能控制台保存开关失败")
+            return astrbot_web.error_response(
+                "配置保存失败，已恢复原状态", status_code=500
+            )
+        return astrbot_web.json_response(result)
+
+    async def _webapi_dashboard_setting(self):
+        try:
+            payload = await astrbot_web.request.json(default={})
+        except Exception:  # noqa: BLE001
+            return astrbot_web.error_response("请求体不是合法 JSON", status_code=400)
+        if not isinstance(payload, dict):
+            return astrbot_web.error_response("请求体必须是 JSON 对象", status_code=400)
+        try:
+            result = await apply_setting(
+                self._shared_config,
+                self.runtime,
+                self.context,
+                payload,
+            )
+        except ValueError as exc:
+            return astrbot_web.error_response(str(exc), status_code=400)
+        except DashboardSwitchRollbackError:
+            logger.exception("[AstrNa] 功能控制台保存失败且自动回滚未能落盘")
+            return astrbot_web.error_response(
+                "配置保存失败，自动回滚也未能落盘；请刷新页面并在原配置页确认状态",
+                status_code=500,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[AstrNa] 功能控制台保存子配置失败")
             return astrbot_web.error_response(
                 "配置保存失败，已恢复原状态", status_code=500
             )

@@ -61,6 +61,27 @@ class ForwardNodesModule:
         self._installed = False
         self._enable_auto_node_split = True
 
+    def configure(self, *, target_length: Any, hard_limit: Any) -> None:
+        """热更新目标长度与硬上限，无需重启插件；与 __init__ 同一套清洗规则。"""
+        target = sanitize_positive_int(
+            target_length,
+            FORWARD_NODE_MAX_LENGTH_DEFAULT,
+        )
+        hard = sanitize_positive_int(
+            hard_limit,
+            FORWARD_NODE_HARD_LIMIT_DEFAULT,
+        )
+        if target > hard:
+            self.logger.warning(
+                "AstrNa 合并转发目标长度大于硬上限，已自动收敛到硬上限: "
+                "target=%s, hard_limit=%s",
+                target,
+                hard,
+            )
+            target = hard
+        self.target_length = target
+        self.hard_limit = hard
+
     def install(self) -> bool:
         result_decorate_stage_cls = self._load_result_decorate_stage()
         if result_decorate_stage_cls is None:

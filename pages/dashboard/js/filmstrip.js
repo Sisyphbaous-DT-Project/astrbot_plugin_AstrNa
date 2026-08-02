@@ -10,7 +10,7 @@ const WHEEL_TIMING = {
 };
 const CENTER_TOLERANCE = 6;
 
-export function createFilmstrip({ container, counterEl, features, onOpenDetail, isDetailOpen }) {
+export function createFilmstrip({ container, counterEl, features, onOpenDetail, onOpenSettings, isDetailOpen }) {
   const strip = container;
   const cards = new Map();
   // 三种帧身份分离：currentKey=视觉最近帧（计数/高亮），
@@ -58,6 +58,24 @@ export function createFilmstrip({ container, counterEl, features, onOpenDetail, 
     const status = document.createElement("span");
     status.className = "badge status-badge";
     noticesLine.appendChild(status);
+
+    // 有子配置的 8 帧：主开关 | 功能设置（N） | 放大查看 >>；其余帧不渲染占位。
+    const settingsCount = Array.isArray(feature.settings) ? feature.settings.length : 0;
+    if (settingsCount > 0 && typeof onOpenSettings === "function") {
+      const settingsBtn = document.createElement("button");
+      settingsBtn.className = "btn small settings-btn";
+      settingsBtn.type = "button";
+      settingsBtn.textContent = `功能设置（${settingsCount}）`;
+      settingsBtn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        gesture.disarm();
+        onOpenSettings(feature.key);
+      });
+      card.querySelector(".card-actions").insertBefore(
+        settingsBtn,
+        card.querySelector(".detail-btn"),
+      );
+    }
 
     // 详情按钮/双击/Enter 直达详情，不受滚轮武装限制
     card.querySelector(".detail-btn").addEventListener("click", (event) => {
@@ -205,6 +223,8 @@ export function createFilmstrip({ container, counterEl, features, onOpenDetail, 
   // 下一次独立向前手势才进入详情（由 wheel-gesture 状态机裁决）。
   strip.addEventListener("wheel", (event) => {
     event.preventDefault();
+    // 详情/设置窗口打开时胶卷不响应滚轮
+    if (detailOpen()) return;
     killSnapTween();
     clearQuietTimer();
     const delta = normalizeWheelDelta({
@@ -280,6 +300,8 @@ export function createFilmstrip({ container, counterEl, features, onOpenDetail, 
 
   // 键盘
   strip.addEventListener("keydown", (event) => {
+    // 详情/设置窗口打开时胶卷不响应键盘
+    if (detailOpen()) return;
     if (event.key === "ArrowRight") { event.preventDefault(); stepBy(1); }
     if (event.key === "ArrowLeft") { event.preventDefault(); stepBy(-1); }
   });

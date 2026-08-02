@@ -447,10 +447,19 @@ em { font-family: var(--serif); font-style: italic; }
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 6px;
   border-top: 1px solid var(--panel-dark);
   box-shadow: 0 1px 0 var(--panel-light);
   padding-top: 10px;
 }
+
+/* 功能设置按钮：固定在“放大查看”左侧，窄屏压缩内边距但不换行、不增高 */
+.film-card .card-actions .btn.small {
+  white-space: nowrap;
+  padding: 3px 8px;
+  font-size: 11.5px;
+}
+.film-card .card-actions .settings-btn { margin-left: auto; }
 
 .film-nav { display: flex; justify-content: center; align-items: center; gap: 16px; margin-top: 10px; }
 .film-counter {
@@ -567,6 +576,166 @@ em { font-family: var(--serif); font-style: italic; }
 
 .detail-footer { display: flex; justify-content: flex-start; padding: 4px 10px 10px; }
 
+/* ---------- 功能设置（Win98 控制面板窗口，与详情共用遮罩） ---------- */
+
+.settings-window {
+  width: min(980px, 96vw);
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.settings-body {
+  display: flex;
+  gap: 10px;
+  padding: 10px;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.settings-sidebar {
+  flex: 0 0 180px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+}
+
+.settings-tab {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  text-align: left;
+  background: var(--panel);
+  box-shadow: var(--raised);
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+}
+.settings-tab:active { box-shadow: var(--sunken); }
+.settings-tab.active {
+  box-shadow: var(--sunken);
+  background: var(--panel-light);
+}
+.settings-tab.active .tab-name { color: var(--title-a); font-weight: bold; }
+.settings-tab .tab-status { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+
+.settings-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+}
+
+.settings-picker {
+  display: none;
+  font-size: 13px;
+  padding: 4px 6px;
+  background: var(--panel-light);
+  box-shadow: var(--sunken);
+}
+
+.setting-panel { display: flex; flex-direction: column; gap: 8px; }
+.setting-head h3 {
+  margin: 0 0 4px;
+  font-size: 13px;
+  color: var(--title-a);
+  letter-spacing: 1px;
+}
+.setting-desc { margin: 4px 0; font-size: 12.5px; }
+.setting-notes { margin: 4px 0; padding-left: 18px; font-size: 12px; color: var(--muted); }
+
+.setting-banners { display: flex; flex-direction: column; gap: 4px; }
+.setting-banner {
+  padding: 4px 10px;
+  font-size: 12px;
+  box-shadow: var(--sunken);
+  background: var(--panel-light);
+}
+.setting-banner.dependency { color: #8a6d00; background: #fff8dc; }
+.setting-banner.overridden { color: #8a6d00; background: #fff8dc; }
+.setting-banner.master-off { color: var(--ok); }
+.setting-banner.conflict { color: var(--bad); background: #f8e0e0; }
+.setting-banner.unknown { color: var(--muted); }
+
+.setting-control {
+  background: var(--panel);
+  box-shadow: var(--raised);
+  padding: 8px 12px;
+}
+.control-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.control-row.conflict { opacity: 0.85; }
+
+.setting-input {
+  width: 120px;
+  font-size: 13px;
+  font-family: var(--mono);
+  padding: 3px 6px;
+  background: var(--panel-light);
+  box-shadow: var(--sunken);
+  border: none;
+  color: var(--text);
+}
+.secret-control .setting-input { width: 240px; }
+.setting-select {
+  font-size: 12.5px;
+  padding: 3px 6px;
+  max-width: 260px;
+  background: var(--panel-light);
+  box-shadow: var(--sunken);
+}
+
+.command-multi { display: flex; flex-direction: column; gap: 6px; }
+.command-multi .command-option { font-size: 12.5px; font-family: var(--mono); }
+.command-multi .apply-btn { align-self: flex-start; margin-top: 4px; }
+
+.secret-control .secret-status { margin: 0 0 6px; font-size: 12px; color: var(--muted); }
+
+.protected-list .list-summary { margin: 0 0 6px; font-size: 12px; color: var(--muted); }
+.protected-list .list-items {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+.protected-list .list-items li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 3px 8px;
+  font-size: 12.5px;
+  font-family: var(--mono);
+  background: var(--panel-light);
+  box-shadow: var(--sunken);
+}
+
+.setting-stage {
+  position: relative;
+  min-height: 240px;
+  background: var(--screen);
+  box-shadow: var(--sunken);
+  overflow: hidden;
+}
+.setting-stage svg { width: 100%; height: 100%; display: block; }
+.setting-stage .stage-caption {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  background: rgba(0, 0, 0, 0.65);
+  color: var(--screen-text);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 1px;
+  padding: 4px 10px;
+}
+
 /* ---------- 模态窗口 ---------- */
 
 .modal-backdrop {
@@ -612,6 +781,12 @@ em { font-family: var(--serif); font-style: italic; }
   .hero-title { font-size: clamp(44px, 14vw, 72px); }
   .hero-sub { font-size: 10px; letter-spacing: 2px; }
   .crt2d-frame { width: min(84vw, 540px); }
+  /* 功能设置：窄屏用顶部下拉代替竖向标签栏 */
+  .settings-sidebar { display: none; }
+  .settings-window.single-setting .settings-picker { display: none; }
+  .settings-picker { display: block; }
+  .settings-body { flex-direction: column; }
+  .film-card .card-actions .btn.small { padding: 3px 6px; font-size: 11px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

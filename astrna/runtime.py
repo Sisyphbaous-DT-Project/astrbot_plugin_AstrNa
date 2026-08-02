@@ -17,6 +17,7 @@ from .modules.image_caption import ImageCaptionModule
 from .modules.image_history_context import ImageHistoryContextModule
 from .modules.group_identity_tools import GroupIdentityToolsModule
 from .modules.group_chat_context_optimizer import GroupChatContextOptimizerModule
+from .modules.dashboard_settings import SETTING_KEYS as _DASHBOARD_SETTING_KEY_TUPLE
 from .modules.group_sender_concurrency import GroupSenderConcurrencyModule
 from .modules.group_wake_suppression import GroupWakeSuppressionModule
 from .modules.identity_metadata import IdentityMetadataModule
@@ -74,6 +75,37 @@ DEFAULT_CONFIG = {
     "custom_builtin_commands_enabled": False,
     "custom_builtin_commands_allowlist": [],
 }
+
+# Dashboard 允许编辑的子配置严格白名单（19 项，注册表见 dashboard_settings）。
+DASHBOARD_SETTING_KEYS = frozenset(_DASHBOARD_SETTING_KEY_TUPLE)
+
+_FORWARD_LENGTH_SETTING_KEYS = frozenset(
+    {"forward_node_max_length", "forward_node_hard_limit"}
+)
+_OUTPUT_LENGTH_SETTING_KEYS = frozenset(
+    {
+        "output_length_limit_whitelist_umos",
+        "output_length_limit_max_chars",
+        "output_length_limit_provider_id",
+        "output_length_limit_persona_id",
+    }
+)
+_WAKING_SETTING_KEYS = frozenset(
+    {
+        "disable_group_at_bot_wake_all_groups",
+        "disable_group_at_bot_wake_group_ids",
+        "disable_group_reply_to_bot_wake_all_groups",
+        "disable_group_reply_to_bot_wake_group_ids",
+        "custom_builtin_commands_allowlist",
+    }
+)
+_ISSUE_ASSISTANT_SETTING_KEYS = frozenset(
+    {
+        "issue_assistant_devkit_enabled",
+        "issue_assistant_github_token",
+        "issue_assistant_target_umo",
+    }
+)
 
 
 class AstrNaRuntime:
@@ -220,6 +252,71 @@ class AstrNaRuntime:
         if not isinstance(DEFAULT_CONFIG[key], bool) or type(value) is not bool:
             raise ValueError("仅允许修改布尔主开关")
         self.config[key] = value
+
+    def update_dashboard_setting(self, key: str, value: Any) -> None:
+        """同步功能控制台修改的单个子配置，并按组热同步相关模块。
+
+        严格白名单：只接受 DASHBOARD_SETTING_KEYS 中的 19 个键；列表值写入
+        副本，前端对象不会继续引用 Runtime 配置。各组同步规则：
+        - 身份元数据四项：只写配置，下一次 LLM 请求读取；
+        - 合并转发长度：重新配置 ForwardNodesModule，无需重启插件；
+        - 群聊压缩模型：调用现有 configure()；
+        - 输出限制四项：统一调用 OutputLengthLimiterModule.configure()；
+        - 群唤醒范围与内置指令允许列表：重建共享 WakingCheck 链；
+        - Issue 助手三项：调用现有配置同步入口（Token/UMO 不进日志）。
+        """
+        if key not in DASHBOARD_SETTING_KEYS:
+            raise ValueError(f"未知的子配置: {key}")
+        default = DEFAULT_CONFIG.get(key)
+        if isinstance(default, bool):
+            if type(value) is not bool:
+                raise ValueError("子开关值必须是布尔类型")
+            self.config[key] = value
+        elif isinstance(default, int):
+            if type(value) is not int or value <= 0:
+                raise ValueError("子配置数值必须是正整数")
+            self.config[key] = value
+        elif isinstance(default, list):
+            if not isinstance(value, list):
+                raise ValueError("子配置列表必须是数组")
+            self.config[key] = list(value)
+        elif isinstance(default, str):
+            if not isinstance(value, str):
+                raise ValueError("子配置必须是字符串")
+            self.config[key] = value
+        else:  # pragma: no cover - 白名单键必须存在于 DEFAULT_CONFIG
+            raise ValueError(f"未知的子配置: {key}")
+
+        if key in _FORWARD_LENGTH_SETTING_KEYS:
+            self.forward_nodes.configure(
+                target_length=self.config.get(
+                    "forward_node_max_length", FORWARD_NODE_MAX_LENGTH_DEFAULT
+                ),
+                hard_limit=self.config.get(
+                    "forward_node_hard_limit", FORWARD_NODE_HARD_LIMIT_DEFAULT
+                ),
+            )
+        elif key == "group_chat_context_compress_provider_id":
+            self.group_chat_context_optimizer.configure(
+                provider_id=self.config.get(
+                    "group_chat_context_compress_provider_id", ""
+                ),
+            )
+        elif key in _OUTPUT_LENGTH_SETTING_KEYS:
+            self.output_length_limiter.configure(
+                whitelist_umos=self.config.get("output_length_limit_whitelist_umos", []),
+                max_chars=self.config.get(
+                    "output_length_limit_max_chars",
+                    DEFAULT_OUTPUT_LENGTH_LIMIT,
+                ),
+                provider_id=self.config.get("output_length_limit_provider_id", ""),
+                persona_id=self.config.get("output_length_limit_persona_id", ""),
+            )
+        elif key in _WAKING_SETTING_KEYS:
+            self._configure_waking_check_chain()
+        elif key in _ISSUE_ASSISTANT_SETTING_KEYS:
+            self._configure_issue_assistant()
+        # 身份元数据四项只写配置，下一次 LLM 请求由 sanitize_request 读取。
 
     async def sanitize_request(self, event: Any, req: Any) -> None:
         lifecycle_token = self._lifecycle_token

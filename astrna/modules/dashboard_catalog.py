@@ -83,7 +83,7 @@ FEATURES: tuple[dict[str, Any], ...] = (
         "AstrBot 自带的身份识别文本格式不稳定，容易随对话漂移。AstrNa 把它整理为结构固定的 JSON，"
         "并以临时内容方式注入，模型每轮看到的身份格式一致，不会因为格式变化破坏提示词缓存。",
         ("拟人 Bot 需要稳定识别用户身份时", "希望身份信息不破坏提示词缓存时"),
-        ("依赖 AstrBot 自带身份识别已开启，AstrNa 不凭空制造身份信息", "真实昵称、群成员身份、生日等子项请在原配置页填写"),
+        ("依赖 AstrBot 自带身份识别已开启，AstrNa 不凭空制造身份信息", "真实昵称、群成员身份、生日等子项可在「功能设置」中调整"),
     ),
     _feature(
         "optimize_forward_nodes",
@@ -92,7 +92,7 @@ FEATURES: tuple[dict[str, Any], ...] = (
         "超长回复合并成转发节点后容易因单节点过长被平台拒收。AstrNa 先按目标长度自然拆分节点；"
         "发送失败时逐步缩小节点规模重试；仍然失败时回退为普通分段消息兜底。",
         ("Bot 经常输出长回复并通过合并转发发送时",),
-        ("自适应重试只针对 aiocqhttp 类平台的合并转发失败，其他发送异常会照常抛出", "目标长度与硬上限请在原配置页调整"),
+        ("自适应重试只针对 aiocqhttp 类平台的合并转发失败，其他发送异常会照常抛出", "目标长度与硬上限可在「功能设置」中调整"),
     ),
     _feature(
         "optimize_long_reply_context",
@@ -179,7 +179,7 @@ FEATURES: tuple[dict[str, Any], ...] = (
         ("拟人 Bot 需要保持简短自然的聊天节奏时",),
         (
             "清洗模型留空或调用失败时会直接硬截断到设定字符数",
-            "白名单、最大字数、清洗模型与参考人格请在原配置页调整",
+            "白名单、最大字数、清洗模型与参考人格可在「功能设置」中调整",
             "只处理普通纯文本最终回复；工具、报错、流式 chunk、媒体结果不处理",
         ),
     ),
@@ -208,7 +208,7 @@ FEATURES: tuple[dict[str, Any], ...] = (
         "在只想被动监听或配合主动回复的群里，每次 @Bot 都触发默认回复会很吵。"
         "AstrNa 在 AstrBot 完成原生识别后取消单独唤醒，消息本身、有效指令和主动回复流程仍然保留。",
         ("希望某些群里 @Bot 不再单独触发回复时",),
-        ("仅群聊生效；有效指令与主动回复不受影响", "应用范围（全部群或指定群 ID）请在原配置页调整"),
+        ("仅群聊生效；有效指令与主动回复不受影响", "应用范围（全部群或指定群 ID）可在「功能设置」中调整"),
     ),
     _feature(
         "disable_group_reply_to_bot_wake",
@@ -216,7 +216,7 @@ FEATURES: tuple[dict[str, Any], ...] = (
         "让指定群聊中引用 Bot 消息像普通群消息一样处理，不再单独触发默认回复。",
         "用户引用 Bot 消息时也会单独唤醒 Bot。AstrNa 可取消这种单独唤醒，其他群聊处理链不受影响。",
         ("希望某些群里引用 Bot 不再单独触发回复时",),
-        ("仅群聊生效；其他处理链不受影响", "应用范围（全部群或指定群 ID）请在原配置页调整"),
+        ("仅群聊生效；其他处理链不受影响", "应用范围（全部群或指定群 ID）可在「功能设置」中调整"),
     ),
     _feature(
         "unlock_group_sender_concurrency",
@@ -395,18 +395,28 @@ def _build_warnings(config: Mapping[str, Any]) -> list[str]:
     return warnings
 
 
-def build_state(config: Mapping[str, Any], version: Any = "unknown") -> dict[str, Any]:
+def build_state(
+    config: Mapping[str, Any],
+    version: Any = "unknown",
+    context: Any = None,
+) -> dict[str, Any]:
     """生成页面完整状态。config 为 AstrBot 注入的共享配置对象或其映射。
 
     version 由调用方从正式插件元数据读取后传入；本模块不自行探测工作目录。
     非空字符串以外的值一律降级为 "unknown"，绝不猜测版本。
+    context 用于读取模型/人格可选项；缺失时对应选项为空列表。
     """
+    # 延迟导入避免循环依赖：dashboard_settings 复用本模块的锁与警告逻辑。
+    from .dashboard_settings import build_feature_settings, settings_for_feature
+
     features: list[dict[str, Any]] = []
     for feature in FEATURES:
         key = feature["key"]
         entry = dict(feature)
         entry["enabled"] = _truthy_flag(config, key)
         entry["details"] = _build_details(key, config)
+        if settings_for_feature(key):
+            entry["settings"] = build_feature_settings(config, key, context)
         features.append(entry)
     normalized = version.strip() if isinstance(version, str) else ""
     return {

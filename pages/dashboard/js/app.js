@@ -10,6 +10,7 @@ import { runBoot, BootSkippedError } from "./boot.js";
 import { confirmDialog, errorDialog } from "./modal.js";
 import { createFilmstrip } from "./filmstrip.js";
 import { openDetail } from "./detail.js";
+import { openSettings } from "./settings-window.js";
 import { createCrtScene, isWebglAvailable } from "./crt-scene.js";
 
 if (!window.__astrnaDashboardStarted) {
@@ -235,7 +236,69 @@ async function bootstrap() {
     const switchRegistry = new Map();
     let stateReadOnly = Boolean(state.readOnly);
     let syncInFlight = false;
-    let detailHandle = null;
+    // 详情与功能设置共用同一遮罩：任一时刻最多一个会话，互相切换不嵌套。
+    let overlaySession = null;
+
+    function finalizeOverlay(session) {
+      if (session.finalized) return;
+      session.finalized = true;
+      overlaySession = null;
+      filmstrip.restoreAfterDetail(session.key);
+      const card = document.querySelector(`.film-card[data-key="${session.key}"]`);
+      if (card) card.focus({ preventScroll: true });
+    }
+
+    function openOverlay(kind, key) {
+      const feature = featureMap.get(key);
+      if (!feature) return;
+      if (overlaySession) {
+        if (overlaySession.kind === kind && overlaySession.key === key) return;
+        // 详情 ↔ 设置切换：关闭旧窗口但不恢复胶卷，继续使用同一遮罩。
+        const old = overlaySession;
+        old.finalized = true;
+        overlaySession = null;
+        old.api.close();
+      }
+      const session = { kind, key, finalized: false, api: null };
+      const onClose = () => finalizeOverlay(session);
+      if (kind === "detail") {
+        session.api = openDetail({
+          overlay: $("#detail-overlay"),
+          feature,
+          reducedMotion,
+          onOpenSettings: () => openOverlay("settings", key),
+          onClose,
+        });
+        session.api.mountToggle(createSwitch(feature));
+        refreshSwitch(key);
+      } else {
+        session.api = openSettings({
+          overlay: $("#detail-overlay"),
+          feature,
+          reducedMotion,
+          bridge,
+          masterEnabled: () => {
+            const current = featureMap.get(key);
+            return current && typeof current.enabled === "boolean"
+              ? current.enabled
+              : null;
+          },
+          readOnly: () => stateReadOnly,
+          onWarnings: (warnings) => {
+            // 子配置保存产生的 warnings 必须回写内存状态，否则主开关
+            // 保存失败时会重画旧 warnings，短暂隐藏刚产生的警告。
+            state.warnings = Array.isArray(warnings) ? warnings : [];
+            renderWarnings(state.warnings);
+          },
+          onDetails: (details) => {
+            const current = featureMap.get(key);
+            if (current && details) current.details = details;
+          },
+          onClose,
+        });
+      }
+      overlaySession = session;
+    }
 
     const warningsBox = $("#console-warnings");
     function renderWarnings(warnings) {
@@ -269,7 +332,10 @@ async function bootstrap() {
       if (!feature) return;
       feature.enabled = value;
       filmstrip.setEnabled(key, value);
-      if (detailHandle && detailHandle.key === key) detailHandle.setEnabled(value);
+      if (overlaySession && overlaySession.key === key) {
+        if (overlaySession.kind === "detail") overlaySession.api.setEnabled(value);
+        else overlaySession.api.refresh();
+      }
       refreshSwitch(key);
     }
 
@@ -302,8 +368,9 @@ async function bootstrap() {
         applyEnabled(key, Boolean(result.value));
         if (result.feature && result.feature.details) {
           feature.details = result.feature.details;
-          if (detailHandle && detailHandle.key === key) {
-            detailHandle.updateDetails(feature.details);
+          if (overlaySession && overlaySession.key === key
+            && overlaySession.kind === "detail") {
+            overlaySession.api.updateDetails(feature.details);
           }
         }
         state.warnings = result.warnings || [];
@@ -344,25 +411,9 @@ async function bootstrap() {
       container: $("#filmstrip"),
       counterEl: $("#film-counter"),
       features,
-      isDetailOpen: () => detailHandle !== null,
-      onOpenDetail: (key) => {
-        const feature = featureMap.get(key);
-        if (!feature) return;
-        detailHandle = openDetail({
-          overlay: $("#detail-overlay"),
-          feature,
-          reducedMotion,
-          onClose: () => {
-            detailHandle = null;
-            filmstrip.restoreAfterDetail(key);
-            const card = document.querySelector(`.film-card[data-key="${key}"]`);
-            if (card) card.focus({ preventScroll: true });
-          },
-        });
-        detailHandle.key = key;
-        detailHandle.mountToggle(createSwitch(feature));
-        refreshSwitch(key);
-      },
+      isDetailOpen: () => overlaySession !== null,
+      onOpenDetail: (key) => openOverlay("detail", key),
+      onOpenSettings: (key) => openOverlay("settings", key),
     });
 
     for (const feature of features) {
@@ -403,9 +454,16 @@ async function bootstrap() {
           if (!current) continue;
           const enabled = Boolean(nextFeature.enabled);
           current.details = nextFeature.details || {};
+          if (Array.isArray(nextFeature.settings)) {
+            current.settings = nextFeature.settings;
+          }
           if (!pending.has(nextFeature.key)) applyEnabled(nextFeature.key, enabled);
-          if (detailHandle && detailHandle.key === nextFeature.key) {
-            detailHandle.updateDetails(current.details);
+          if (overlaySession && overlaySession.key === nextFeature.key) {
+            if (overlaySession.kind === "detail") {
+              overlaySession.api.updateDetails(current.details);
+            } else {
+              overlaySession.api.refresh(current.settings);
+            }
           }
           refreshSwitch(nextFeature.key);
         }

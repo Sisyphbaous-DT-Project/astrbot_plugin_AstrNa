@@ -323,7 +323,7 @@
   },
   "issue_assistant_devkit_enabled": {
     "type": "bool",
-    "description": "提供阅读源码和修改源码的功能",
+    "description": "开发工具箱（提供阅读源码和修改源码的功能）",
     "hint": "开启后，AstrNa 会在自动报错分析与 Issue 助手流程中提供源码辅助分析入口。请先在插件市场搜索并安装并启用弥亚开发工具箱至少 2.6.0 版本；推荐先把维护者配置为 AstrBot 管理员，弥亚开发工具箱保持默认工具组全开通常即可使用。若使用者不是 AstrBot 管理员，需要在弥亚开发工具箱 allowed_ids 中额外放行该用户；若开启了弥亚开发工具箱分群配置，请确认当前群聊或私聊没有禁用 safe_read、rg_search、code_explore、code_pack、git_diff、test_runner、safe_edit 等源码阅读、搜索、测试和安全编辑工具。AstrNa 只负责流程协调，不绕过弥亚开发工具箱的权限和安全编辑机制；如果需要修改源码，必须由目标用户或管理员明确确认后，再交给弥亚开发工具箱的安全编辑工具处理。默认关闭。",
     "default": false,
     "collapsed": true,

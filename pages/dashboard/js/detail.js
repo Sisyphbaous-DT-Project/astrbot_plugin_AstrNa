@@ -37,9 +37,10 @@ function formatDetail(key, value) {
  * @param {HTMLElement} options.overlay 详情遮罩容器
  * @param {Object} options.feature 功能完整数据
  * @param {boolean} options.reducedMotion
+ * @param {(() => void)|null} [options.onOpenSettings] 有子配置时提供「打开功能设置」入口
  * @param {() => void} options.onClose
  */
-export function openDetail({ overlay, feature, reducedMotion, onClose }) {
+export function openDetail({ overlay, feature, reducedMotion, onOpenSettings = null, onClose }) {
   overlay.innerHTML = "";
   overlay.hidden = false;
 
@@ -76,9 +77,10 @@ export function openDetail({ overlay, feature, reducedMotion, onClose }) {
           <ul class="notices-list"></ul>
         </section>
         <section class="panel" data-subconfig>
-          <h3>子配置（只读摘要）</h3>
+          <h3>功能设置概览</h3>
           <ul class="details-list"></ul>
-          <p class="subconfig-tip">复杂子配置请前往 AstrBot 原插件配置页调整。</p>
+          <p class="subconfig-tip">敏感字段只显示安全状态，绝不回显原值。</p>
+          <button class="btn small" type="button" data-open-settings>打开功能设置</button>
         </section>
       </div>
       <div class="col">
@@ -119,6 +121,16 @@ export function openDetail({ overlay, feature, reducedMotion, onClose }) {
     }
   };
   updateDetails(feature.details);
+
+  // 有子配置的功能提供「打开功能设置」入口；与设置窗口共用同一遮罩，不嵌套。
+  const openSettingsBtn = window_.querySelector("[data-open-settings]");
+  if (typeof onOpenSettings === "function"
+    && Array.isArray(feature.settings) && feature.settings.length > 0) {
+    openSettingsBtn.hidden = false;
+    openSettingsBtn.addEventListener("click", () => onOpenSettings(feature.key));
+  } else {
+    openSettingsBtn.hidden = true;
+  }
 
   const animation = mountAnimation(feature.key, window_.querySelector(".detail-stage"), {
     reducedMotion,

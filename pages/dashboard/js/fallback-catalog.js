@@ -180,6 +180,128 @@ const FEATURES = [
   ),
 ];
 
+/**
+ * 8 个功能的 19 项子配置静态目录：状态接口失败时保留说明与动画，
+ * 所有状态值一律为空，控件显示“状态未知”并禁用。
+ */
+const COMMAND_OPTIONS = [
+  "help", "sid", "name", "reset", "stop", "new",
+  "stats", "provider", "dashboard_update", "set", "unset",
+].map((id) => ({ id, label: `/${id}` }));
+
+function setting(key, control, name, description, animation, extra = {}) {
+  return {
+    key,
+    name,
+    description,
+    control,
+    animation,
+    sensitive: extra.sensitive || "none",
+    notes: extra.notes || [],
+    dependency: { blocked: false, reason: null, inactive: false },
+    overridden: false,
+    options: extra.options,
+    state: extra.state,
+  };
+}
+
+const FALLBACK_SETTINGS = {
+  optimize_identity_metadata: [
+    setting("account_nickname_display", "bool", "追加真实昵称",
+      "在支持的平台上额外注入账号真实昵称；取不到、清洗后为空或与群昵称相同时自动跳过。",
+      "identity-nickname-append",
+      { notes: ["依赖 AstrBot 自带身份识别已开启"], state: { value: null } }),
+    setting("account_nickname_only", "bool", "仅使用真实昵称",
+      "把身份元数据里的 nickname 替换为账号真实昵称，不再同时提供群昵称；取不到时回退原群昵称。",
+      "identity-nickname-replace",
+      { notes: ["依赖 AstrBot 自带身份识别已开启"], state: { value: null } }),
+    setting("group_member_identity_display", "bool", "补充群成员身份",
+      "通过 NapCat/aiocqhttp 补充发言人的群身份、群等级和专属头衔；查不到自动跳过，不写入历史。",
+      "identity-group-role",
+      { notes: ["只支持群聊和可查询成员信息的平台"], state: { value: null } }),
+    setting("birthday_info_display", "bool", "注入生日信息",
+      "通过 NapCat/aiocqhttp 读取发言人 QQ 生日月日写入临时身份元数据；只注入月日，不注入年份。",
+      "identity-birthday",
+      { notes: ["查不到、字段为空或为 0 时自动跳过"], state: { value: null } }),
+  ],
+  optimize_forward_nodes: [
+    setting("forward_node_max_length", "int", "单个转发节点目标长度",
+      "单节点期望容纳的文本长度，达到后优先寻找句号、换行等自然断点，避免一句话被切得太碎。",
+      "forward-target-length",
+      { notes: ["不得大于硬上限", "修改后立即对后续合并转发生效"], state: { value: null } }),
+    setting("forward_node_hard_limit", "int", "单个转发节点硬上限",
+      "单节点最大文本长度，超过后一定强制切开，用来避开平台对单条转发节点的隐藏限制。",
+      "forward-hard-limit",
+      { notes: ["必须为正整数且不小于目标长度"], state: { value: null } }),
+  ],
+  optimize_group_chat_context: [
+    setting("group_chat_context_compress_provider_id", "provider", "群聊上下文压缩模型",
+      "筛选群聊相关上下文并生成简短摘要的小模型，不是主对话模型；建议选择便宜快速的小模型。",
+      "groupctx-model",
+      { notes: ["未配置时回退为少量原文摘录，不做相关性筛选"], options: [], state: { value: "", stale: false } }),
+  ],
+  output_length_limit_enabled: [
+    setting("output_length_limit_whitelist_umos", "protected_list", "输出限制白名单 UMO",
+      "命中的会话不关闭流式也不限制输出，适合放行写作群、管理群或需要长回复的私聊。",
+      "output-whitelist",
+      { notes: ["可用 AstrBot 的 /sid 指令获取 UMO", "条目以匿名编号显示，不暴露完整 UMO"],
+        sensitive: "list", state: { count: null, items: [] } }),
+    setting("output_length_limit_max_chars", "int", "最多输出字数",
+      "超过这个字符数才会触发清洗；清洗模型不可用或输出为空时硬截断到这个长度。",
+      "output-max-chars", { state: { value: null } }),
+    setting("output_length_limit_provider_id", "provider", "输出清洗模型",
+      "主模型最终文本超过限制时调用的清洗模型，使用临时 session，不写入会话历史。",
+      "output-clean-model",
+      { notes: ["留空或调用失败时直接硬截断"], options: [], state: { value: "", stale: false } }),
+    setting("output_length_limit_persona_id", "persona", "输出清洗参考人格",
+      "清洗模型参考该人格提示词改写短回复；留空时使用本轮实际 system prompt。",
+      "output-persona", { options: [], state: { value: "", stale: false } }),
+  ],
+  disable_group_at_bot_wake: [
+    setting("disable_group_at_bot_wake_all_groups", "bool", "应用于所有群聊",
+      "关闭所有群聊的 @Bot 唤醒，并覆盖下方群聊列表。",
+      "wake-at-all",
+      { notes: ["关闭且列表为空时不会影响任何群"], state: { value: null } }),
+    setting("disable_group_at_bot_wake_group_ids", "protected_list", "关闭 @Bot 唤醒的群聊 ID",
+      "逐项管理需要关闭 @Bot 唤醒的群聊 ID；不同平台恰好使用相同群 ID 时会同时命中。",
+      "wake-at-groups",
+      { notes: ["条目以匿名编号显示，不暴露群号"],
+        sensitive: "list", state: { count: null, items: [] } }),
+  ],
+  disable_group_reply_to_bot_wake: [
+    setting("disable_group_reply_to_bot_wake_all_groups", "bool", "应用于所有群聊",
+      "关闭所有群聊的引用 Bot 唤醒，并覆盖下方群聊列表。",
+      "wake-reply-all",
+      { notes: ["关闭且列表为空时不会影响任何群"], state: { value: null } }),
+    setting("disable_group_reply_to_bot_wake_group_ids", "protected_list", "关闭引用 Bot 唤醒的群聊 ID",
+      "逐项管理需要关闭引用 Bot 唤醒的群聊 ID；QQ 官方 Bot 缺少可靠引用身份，不会猜测。",
+      "wake-reply-groups",
+      { notes: ["条目以匿名编号显示，不暴露群号"],
+        sensitive: "list", state: { count: null, items: [] } }),
+  ],
+  custom_builtin_commands_enabled: [
+    setting("custom_builtin_commands_allowlist", "command_multi", "允许使用的内置指令",
+      "多选保留的 AstrBot 核心内置指令；选中项仍走原权限与参数检查，空列表等于全部关闭。",
+      "builtin-allowlist",
+      { notes: ["指令改名后仍按原始功能放行"], options: COMMAND_OPTIONS, state: { value: [] } }),
+  ],
+  issue_assistant_enabled: [
+    setting("issue_assistant_devkit_enabled", "bool", "开发工具箱",
+      "在报错分析与 Issue 流程中提供源码辅助分析入口，需要先安装并启用弥亚开发工具箱。",
+      "issue-devkit",
+      { notes: ["推荐把维护者配置为 AstrBot 管理员"], state: { value: null } }),
+    setting("issue_assistant_target_umo", "secret", "Issue 助手通知/处理 UMO",
+      "检测到插件报错时把提醒与待处理流程发送到这个绑定会话，建议填维护者私聊 UMO。",
+      "issue-notify-umo",
+      { notes: ["只显示已配置/未配置，绝不回显原值"], sensitive: "value", state: { configured: null } }),
+    setting("issue_assistant_github_token", "secret", "GitHub API Token",
+      "留空时只能生成 Issue 草稿，配置后才能提交到 GitHub；建议使用 Fine-grained Token。",
+      "issue-github-token",
+      { notes: ["只显示已配置/未配置，绝不回显原值", "Token 不进入模型与日志"],
+        sensitive: "value", state: { configured: null } }),
+  ],
+};
+
 export function buildFallbackState({ interactive = false } = {}) {
   return {
     readOnly: !interactive,
@@ -189,6 +311,19 @@ export function buildFallbackState({ interactive = false } = {}) {
       notices: [...item.notices],
       enabled: interactive ? false : null,
       details: {},
+      ...(FALLBACK_SETTINGS[item.key]
+        ? {
+          settings: FALLBACK_SETTINGS[item.key].map((item2) => ({
+            ...item2,
+            notes: [...item2.notes],
+            dependency: { ...item2.dependency },
+            options: item2.options ? item2.options.map((o) => ({ ...o })) : item2.options,
+            state: Array.isArray(item2.state && item2.state.items)
+              ? { ...item2.state, items: [] }
+              : { ...item2.state },
+          })),
+        }
+        : {}),
     })),
     warnings: interactive
       ? []

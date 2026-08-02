@@ -176,6 +176,7 @@ def test_registers_dashboard_apis_with_metadata_name_casing(webapi):
     assert routes == {
         "/astrbot_plugin_AstrNa/dashboard/state": ["GET"],
         "/astrbot_plugin_AstrNa/dashboard/switch": ["POST"],
+        "/astrbot_plugin_AstrNa/dashboard/setting": ["POST"],
     }
     asyncio.run(star.runtime.terminate())
 
@@ -273,4 +274,77 @@ def test_no_register_web_api_on_legacy_astrbot(monkeypatch, fakes):
     # 没有 register_web_api 的旧版 AstrBot：构造与运行不应报错
     star = module.AstrNa(context=LegacyContext(DummyContext()), config=FakeConfig())
     assert star is not None
+    asyncio.run(star.runtime.terminate())
+
+
+def test_setting_api_success(webapi):
+    config = FakeConfig()
+    star, _, _ = webapi(config, {"key": "birthday_info_display", "value": True})
+    kind, data = asyncio.run(star._webapi_dashboard_setting())
+    assert kind == "json"
+    assert data["key"] == "birthday_info_display"
+    assert config["birthday_info_display"] is True
+    assert star.runtime.config["birthday_info_display"] is True
+    assert data["feature"]["key"] == "optimize_identity_metadata"
+    assert len(data["feature"]["settings"]) == 4
+    assert "warnings" in data
+    asyncio.run(star.runtime.terminate())
+
+
+def test_setting_api_rejects_unknown_key_bad_type_and_shape(webapi):
+    config = FakeConfig()
+    star, _, _ = webapi(config, {"key": "evil_config", "value": True})
+    kind, message, status = asyncio.run(star._webapi_dashboard_setting())
+    assert (kind, status) == ("error", 400)
+    assert "未知" in message
+
+    star2, _, _ = webapi(config, {"key": "birthday_info_display", "value": "true"})
+    kind, _, status = asyncio.run(star2._webapi_dashboard_setting())
+    assert (kind, status) == ("error", 400)
+
+    star3, _, _ = webapi(config, ["not", "a", "dict"])
+    kind, _, status = asyncio.run(star3._webapi_dashboard_setting())
+    assert (kind, status) == ("error", 400)
+
+    # 主开关键不属于子配置接口
+    star4, _, _ = webapi(config, {"key": "fix_deepseek_v4_400", "value": True})
+    kind, _, status = asyncio.run(star4._webapi_dashboard_setting())
+    assert (kind, status) == ("error", 400)
+    assert config.save_count == 0
+    for item in (star, star2, star3, star4):
+        asyncio.run(item.runtime.terminate())
+
+
+def test_setting_api_save_failure_rolls_back(webapi):
+    config = FakeConfig(fail_save=True)
+    star, _, _ = webapi(config, {"key": "birthday_info_display", "value": True})
+    kind, message, status = asyncio.run(star._webapi_dashboard_setting())
+    assert (kind, status) == ("error", 500)
+    assert "已恢复原状态" in message
+    assert config.get("birthday_info_display", False) is False
+    assert star.runtime.config["birthday_info_display"] is False
+    asyncio.run(star.runtime.terminate())
+
+
+def test_setting_api_reports_when_persisted_rollback_also_fails(webapi):
+    config = FakeConfig(fail_save_always=True)
+    star, _, _ = webapi(config, {"key": "birthday_info_display", "value": True})
+    kind, message, status = asyncio.run(star._webapi_dashboard_setting())
+    assert (kind, status) == ("error", 500)
+    assert "回滚也未能落盘" in message
+    assert config.get("birthday_info_display", False) is False
+    asyncio.run(star.runtime.terminate())
+
+
+def test_setting_api_secret_never_echoes_value(webapi):
+    config = FakeConfig()
+    star, _, _ = webapi(config, {
+        "key": "issue_assistant_github_token",
+        "action": "replace",
+        "value": "ghp_API_TEST_SECRET",
+    })
+    kind, data = asyncio.run(star._webapi_dashboard_setting())
+    assert kind == "json"
+    assert config["issue_assistant_github_token"] == "ghp_API_TEST_SECRET"
+    assert "ghp_API_TEST_SECRET" not in str(data)
     asyncio.run(star.runtime.terminate())

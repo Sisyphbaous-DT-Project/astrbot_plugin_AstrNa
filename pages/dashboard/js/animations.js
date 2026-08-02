@@ -920,3 +920,6 @@ export function mountAnimation(key, stage, { reducedMotion = false } = {}) {
   }
   return builder(stage, { gsap: window.gsap, reducedMotion });
 }
+
+// 子配置动画复用同一套 SVG 视觉语言（见 setting-animations.js）。
+export { COLOR, arrow, box, chip, el, label };
