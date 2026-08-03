@@ -767,7 +767,7 @@ async def _apply_setting_transaction(
         canonical_value = shared_config.get(key, new_value)
         _restore_runtime_setting(runtime, key, canonical_value)
         # 函数内延迟导入，与 catalog 对 settings 的延迟导入保持单向，避免循环。
-        from astrna.modules.dashboard_catalog import _build_details
+        from .dashboard_catalog import _build_details
 
         return {
             "key": key,

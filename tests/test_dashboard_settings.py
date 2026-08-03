@@ -1,9 +1,15 @@
 """Dashboard 子配置目录、状态、安全边界与更新交易测试。"""
 
 import asyncio
+import builtins
+import sys
+from importlib.machinery import ModuleSpec
+from types import ModuleType
 
 import pytest
 
+import astrna.modules.dashboard_catalog as dashboard_catalog_module
+import astrna.modules.dashboard_settings as dashboard_settings_module
 from astrna.modules.dashboard_catalog import (
     DashboardSwitchRollbackError,
     build_state,
@@ -748,6 +754,60 @@ def test_apply_setting_response_includes_refreshed_details(fakes):
 # ---------------------------------------------------------------------------
 # apply_setting：交易语义
 # ---------------------------------------------------------------------------
+
+
+def test_apply_setting_uses_installed_plugin_package_relative_import(
+    monkeypatch,
+    fakes,
+):
+    """正式安装包没有顶层 astrna 时，保存后仍能构造成功响应。"""
+    package_name = "_astrna_installed_plugin.astrna.modules"
+    parent = ""
+    for part in package_name.split("."):
+        parent = f"{parent}.{part}" if parent else part
+        package = ModuleType(parent)
+        package.__path__ = []
+        monkeypatch.setitem(sys.modules, parent, package)
+    monkeypatch.setitem(
+        sys.modules,
+        f"{package_name}.dashboard_catalog",
+        dashboard_catalog_module,
+    )
+    monkeypatch.setattr(dashboard_settings_module, "__package__", package_name)
+    monkeypatch.setattr(
+        dashboard_settings_module,
+        "__spec__",
+        ModuleSpec(f"{package_name}.dashboard_settings", loader=None),
+    )
+
+    original_import = builtins.__import__
+
+    def reject_top_level_astrna(
+        name,
+        globals=None,
+        locals=None,
+        fromlist=(),
+        level=0,
+    ):
+        if level == 0 and (name == "astrna" or name.startswith("astrna.")):
+            raise ModuleNotFoundError("正式插件环境不存在顶层 astrna 包")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", reject_top_level_astrna)
+
+    config = FakeConfig({"birthday_info_display": False})
+    runtime = fakes.build_runtime(dict(config))
+    result = _run(dashboard_settings_module.apply_setting(
+        config,
+        runtime,
+        None,
+        {"key": "birthday_info_display", "value": True},
+    ))
+
+    assert config["birthday_info_display"] is True
+    assert runtime.config["birthday_info_display"] is True
+    assert result["feature"]["key"] == "optimize_identity_metadata"
+    _run(runtime.terminate())
 
 
 def test_apply_setting_rolls_back_when_save_fails(fakes):

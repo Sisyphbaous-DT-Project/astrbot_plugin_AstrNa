@@ -5,9 +5,9 @@ AstrNa 是一款面向 AstrBot 的优化插件，目标是在不修改 AstrBot C
 > 💌 售后：`777879783`
 > 有问题请加，清漪也会蹦出来一起捣鼓。
 
-🎉 AstrNa 当前正式版：`1.5.1`
+🎉 AstrNa 当前正式版：`1.5.2`
 
-当前已测试兼容 AstrBot 版本：`4.26.8`
+当前已测试兼容 AstrBot 版本：`4.27.1`
 
 - 仓库地址：[Sisyphbaous-DT-Project/astrbot_plugin_AstrNa](https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_AstrNa)
 - 作者主页：[Sisyphbaous-DT-Project](https://github.com/Sisyphbaous-DT-Project)
@@ -445,7 +445,7 @@ GitHub Token 是可选的。留空时只能生成草稿，不能自动提交。�
 
 ## 兼容性
 
-AstrNa 主要面向 AstrBot 当前 4.x 版本。当前正式版 `1.5.1` 已在 AstrBot `4.26.8` 源码环境中完成回归验证。
+AstrNa 主要面向 AstrBot 当前 4.x 版本。当前正式版 `1.5.2` 已在 AstrBot `4.27.1` 源码环境中完成回归验证。
 
 部分能力依赖平台：
 
@@ -466,7 +466,7 @@ AstrNa 主要面向 AstrBot 当前 4.x 版本。当前正式版 `1.5.1` 已在 A
 
 ## 验证状态
 
-最近版本发布前通过以下验证，当前已测试兼容 AstrBot `4.26.8`：
+最近版本发布前通过以下验证，当前已测试兼容 AstrBot `4.27.1`：
 
 ```bash
 TMPDIR=/tmp PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q -s
@@ -476,7 +476,7 @@ python -m compileall -q .
 git diff --check
 ```
 
-默认环境全量测试结果为 `728 passed, 9 skipped`；绑定 AstrBot `4.26.8` 源码运行全量测试结果为 `737 passed`。同时核对了 AstrNa 依赖的 Agent、发送、唤醒、消息事件和历史保存入口，未发现需要针对该版本调整的代码。
+默认环境全量测试结果为 `729 passed, 9 skipped`；绑定 AstrBot `4.27.1` 源码运行全量测试结果为 `738 passed`。同时核对了 AstrNa 依赖的 Agent、发送、唤醒、消息事件和历史保存入口，以及 Responses API、内置 Skill 和持久化群消息历史相关更新，未发现需要针对该版本调整的运行时补丁。
 
 ## 设计原则
 
