@@ -28,6 +28,7 @@ from .modules.output_length_limiter import (
     OutputLengthLimiterModule,
     normalize_whitelist_umo_items,
 )
+from .modules.parallel_tool_use import ParallelToolUseModule
 from .modules.quoted_image_input import QuotedImageInputModule
 from .modules.reply_target_history import ReplyTargetHistoryModule
 from .modules.send_message_to_user import SendMessageToUserModule
@@ -159,6 +160,10 @@ class AstrNaRuntime:
             context=context,
             logger=logger,
         )
+        self.parallel_tool_use = ParallelToolUseModule(
+            context=context,
+            logger=logger,
+        )
         self.group_sender_concurrency = GroupSenderConcurrencyModule(logger=logger)
         self.long_reply_context = LongReplyContextModule(logger=logger)
         self.group_chat_context_optimizer = GroupChatContextOptimizerModule(
@@ -232,6 +237,7 @@ class AstrNaRuntime:
             self.output_length_limiter.install()
         if self.config.get("provide_group_identity_tools", False):
             self.group_identity_tools.install()
+        self.parallel_tool_use.install()
         if self.config.get("optimize_long_reply_context", False):
             self.long_reply_context.install()
         if self.config.get("unlock_group_sender_concurrency", False):
@@ -784,6 +790,7 @@ class AstrNaRuntime:
         self.send_message_to_user.terminate()
         self.output_length_limiter.terminate()
         self.group_identity_tools.terminate()
+        self.parallel_tool_use.terminate()
         self.reply_target_history.terminate()
         self.deepseek_v4_400.terminate()
         self.auto_cache_cleanup.terminate()

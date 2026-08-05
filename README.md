@@ -35,6 +35,7 @@ AstrNa 是一款面向 AstrBot 的优化插件，目标是在不修改 AstrBot C
 - 开启群聊并发后，希望继续沿用 AstrBot 原生历史截断，并让群聊提示词缓存保持稳定。
 - 希望 Bot 在指定群聊里只认明确唤醒词，不会因为顺手 @Bot 或引用 Bot 消息就必定插话。
 - 希望插件报错后能自动脱敏分析，并辅助生成规范的 GitHub Issue 草稿。
+- 希望 Bot 在单次工具调用回合里并行批量执行多个独立工具，避免逐个串行等待。
 
 AstrNa 的所有功能默认关闭。建议按需打开，不要一次性全开。
 
@@ -103,6 +104,7 @@ AstrNa 在 AstrBot WebUI 中内置了一个“功能控制台”页面，作为�
 | 自动清理 AstrBot 缓存 | 关闭 | 每天 00:00 在 AstrBot 空闲时清理原生临时缓存，不清理日志。 |
 | 自定义开启 AstrBot 内置指令 | 关闭 | 用多选下拉控制 AstrBot 核心内置指令，选中的能用，没选中的不能用。 |
 | 自动报错分析与 Issue 助手（实验性） | 关闭 | ⚠️ 实验性。插件报错后自动脱敏分析，并在用户确认后生成/提交 GitHub Issue。 |
+| LLM 并发工具调用 | 默认启用 | 注册 `astrna_parallel_tool_use` 工具，允许 LLM 在单回合中并行批量执行最多 8 个互不依赖的独立工具。 |
 
 ## 功能说明
 
@@ -442,6 +444,16 @@ AstrBot 自带“禁用自带指令”是总开关，打开后核心内置指令
 - 第一版主要处理 AstrBot `on_plugin_error` 能捕获的插件报错。Core 级 `ERRO` 如果信息不足，AstrNa 会提示临时开启 DEBUG/文件日志后复现。
 
 GitHub Token 是可选的。留空时只能生成草稿，不能自动提交。若要自动提交，建议使用 GitHub Fine-grained Personal Access Token，只给目标仓库 `Issues: Read and write`；如果目标仓库是私有仓库且需要读取 Issue 模板，再给 `Contents: Read`。
+
+### LLM 并发工具调用
+
+AstrNa 启动时会自动注册 `astrna_parallel_tool_use` 工具。模型在需要同时调用多个互不依赖的独立工具时（如同时查询多个不同的信息、获取多份数据），可以使用本工具在单个回合里批量发起调用，而无需逐个串行等待。
+
+安全与限制：
+
+- 单次批量调用上限为 8 项（`MAX_PARALLEL_TOOL_CALLS = 8`）。
+- 内部使用 `asyncio.gather` 并行执行所有独立目标工具，并按提交顺序返回结构化 JSON 结果。
+- 防递归保护：禁止在参数内重复嵌套调用 `astrna_parallel_tool_use` 自身。
 
 ## 兼容性
 

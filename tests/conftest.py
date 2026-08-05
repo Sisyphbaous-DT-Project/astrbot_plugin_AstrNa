@@ -93,16 +93,27 @@ class DummyConversationManager:
         )
 
 
+class DummyFuncToolManager:
+    def __init__(self):
+        self.func_list = []
+        self.removed = []
+
+    def remove_func(self, name):
+        self.removed.append(name)
+        self.func_list = [tool for tool in self.func_list if tool.name != name]
+
+
 class DummyContext:
     def __init__(self, provider_settings=None):
         self.conversation_manager = DummyConversationManager()
         self.provider_settings = (
             provider_settings
             if provider_settings is not None
-            else {"identifier": True, "group_name_display": True}
+            else {"provider_id": "test_provider"}
         )
         self.llm_tools = []
         self.unregistered_tools = []
+        self.provider_manager = SimpleNamespace(llm_tools=DummyFuncToolManager())
 
     def get_config(self, umo=None):
         return {"provider_settings": self.provider_settings}
