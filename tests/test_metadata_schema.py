@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.5.2"
+    assert metadata["version"] == "1.5.3"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -52,6 +52,8 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "output_length_limit_provider_id",
         "output_length_limit_persona_id",
         "provide_group_identity_tools",
+        "parallel_tool_use_enabled",
+        "parallel_tool_use_allowlist",
         "optimize_reply_target_history",
         "disable_group_at_bot_wake",
         "disable_group_at_bot_wake_all_groups",
@@ -254,6 +256,13 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
     )
     assert "生日" in schema["provide_group_identity_tools"]["hint"]
     assert schema["provide_group_identity_tools"]["default"] is False
+    assert schema["parallel_tool_use_enabled"]["type"] == "bool"
+    assert schema["parallel_tool_use_enabled"]["default"] is False
+    assert "AstrNa Dashboard" in schema["parallel_tool_use_enabled"]["hint"]
+    assert "管理员权限" in schema["parallel_tool_use_enabled"]["hint"]
+    assert schema["parallel_tool_use_allowlist"]["type"] == "list"
+    assert schema["parallel_tool_use_allowlist"]["default"] == []
+    assert schema["parallel_tool_use_allowlist"]["invisible"] is True
     assert schema["optimize_reply_target_history"]["type"] == "bool"
     assert (
         schema["optimize_reply_target_history"]["description"]
@@ -450,6 +459,7 @@ def test_changelog_contains_release_notes():
     assert "## 1.5.0.beta5" in changelog
     assert "## 1.5.1" in changelog
     assert "## 1.5.2" in changelog
+    assert "## 1.5.3" in changelog
     assert "## 1.2.5" in changelog
     assert "## 1.2.4" in changelog
 

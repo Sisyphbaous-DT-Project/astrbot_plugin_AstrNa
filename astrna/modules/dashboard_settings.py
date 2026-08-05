@@ -1,6 +1,6 @@
 """Dashboard 子配置目录、安全状态与单项更新交易。
 
-本模块显式登记 8 个父功能共 19 项允许在 Dashboard 编辑的子配置。
+本模块显式登记 9 个父功能共 20 项允许在 Dashboard 编辑的子配置。
 未登记的配置键不会出现在状态接口里，也无法通过 setting 接口写入；
 不会从 `_conf_schema.json` 自动暴露任何新增配置。
 
@@ -37,6 +37,7 @@ from .forward_nodes import (
     FORWARD_NODE_HARD_LIMIT_DEFAULT,
     FORWARD_NODE_MAX_LENGTH_DEFAULT,
 )
+from .parallel_tool_use import ambiguous_tool_names, blocked_tool_reason
 
 # ---------------------------------------------------------------------------
 # 注册表
@@ -47,6 +48,7 @@ CONTROL_INT = "int"
 CONTROL_PROVIDER = "provider"
 CONTROL_PERSONA = "persona"
 CONTROL_COMMAND_MULTI = "command_multi"
+CONTROL_TOOL_MULTI = "tool_multi"
 CONTROL_PROTECTED_LIST = "protected_list"
 CONTROL_SECRET = "secret"
 
@@ -241,6 +243,19 @@ SETTINGS: tuple[dict[str, Any], ...] = (
         "builtin-allowlist",
         notes=("指令改名后仍按原始功能放行",),
     ),
+    # LLM 并发工具调用（1）
+    _setting(
+        "parallel_tool_use_allowlist",
+        "parallel_tool_use_enabled",
+        CONTROL_TOOL_MULTI,
+        "允许并发的工具",
+        "按来源逐项选择适合并发的工具；名单只表示适合并发，不会授予管理员权限。",
+        "parallel-tool-allowlist",
+        notes=(
+            "只选择互不依赖、主要返回数据、不会直接操纵聊天或共享状态的工具",
+            "新安装的工具默认不授权，必须由管理员再次选择",
+        ),
+    ),
     # Issue 助手（3）
     _setting(
         "issue_assistant_devkit_enabled",
@@ -350,6 +365,238 @@ def _persona_options(context: Any) -> list[dict[str, str]]:
         label = str(name).strip() or persona_id
         options.append({"id": persona_id, "label": label})
     return options
+
+
+def _tool_manager(context: Any) -> Any:
+    getter = getattr(context, "get_llm_tool_manager", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _plugin_sources(context: Any) -> dict[str, tuple[str, str]]:
+    """handler_module_path -> (稳定插件名, 显示名)。"""
+    getter = getattr(context, "get_all_stars", None)
+    if not callable(getter):
+        return {}
+    try:
+        stars = getter()
+    except Exception:  # noqa: BLE001
+        return {}
+    result: dict[str, tuple[str, str]] = {}
+    if not isinstance(stars, (list, tuple)):
+        return result
+    for star in stars:
+        module_path = getattr(star, "module_path", None)
+        name = getattr(star, "name", None)
+        if not isinstance(module_path, str) or not module_path:
+            continue
+        stable_name = str(name or module_path)
+        display_name = str(getattr(star, "display_name", None) or stable_name)
+        result[module_path] = (stable_name, display_name)
+    return result
+
+
+def _tool_permission_snapshot() -> dict[str, str]:
+    try:
+        from astrbot.core import sp  # type: ignore
+
+        raw = sp.get("tool_permissions", {}, scope="global", scope_id="global")
+        defaults = raw.get("_default", {}) if isinstance(raw, dict) else {}
+        if isinstance(defaults, dict):
+            return {
+                str(name): value
+                for name, value in defaults.items()
+                if value in {"member", "admin"}
+            }
+    except Exception:  # noqa: BLE001 - 旧版或极简环境回退默认值
+        pass
+    return {}
+
+
+def _permission_for_tool(
+    manager: Any,
+    name: str,
+    *,
+    builtin: bool,
+    configured: Mapping[str, str],
+) -> str:
+    if builtin:
+        return "builtin"
+    value = configured.get(name)
+    if value in {"member", "admin"}:
+        return value
+    default_getter = getattr(manager, "_default_permission", None)
+    if callable(default_getter):
+        try:
+            value = default_getter(name)
+        except Exception:  # noqa: BLE001
+            value = None
+        if value in {"member", "admin"}:
+            return value
+    return "member"
+
+
+def _iter_builtin_catalog_tools(manager: Any) -> list[Any]:
+    iterator = getattr(manager, "iter_builtin_tools", None)
+    if not callable(iterator):
+        return []
+    try:
+        tools = iterator()
+    except Exception:  # noqa: BLE001
+        return []
+    return list(tools) if isinstance(tools, list) else []
+
+
+def _catalog_tools(manager: Any, builtin_tools: list[Any]) -> list[Any]:
+    """按 AstrBot ToolSet 的同名覆盖规则生成目录快照。"""
+    chosen: dict[str, Any] = {}
+    ordered_names: list[str] = []
+    func_list = getattr(manager, "func_list", None)
+    for tool in list(func_list) if isinstance(func_list, list) else []:
+        name = getattr(tool, "name", None)
+        if not isinstance(name, str) or not name:
+            continue
+        existing = chosen.get(name)
+        if existing is None:
+            ordered_names.append(name)
+            chosen[name] = tool
+        elif bool(getattr(tool, "active", True)) or not bool(
+            getattr(existing, "active", True)
+        ):
+            chosen[name] = tool
+
+    for tool in builtin_tools:
+        name = getattr(tool, "name", None)
+        if not isinstance(name, str) or not name or name in chosen:
+            continue
+        ordered_names.append(name)
+        chosen[name] = tool
+    return [chosen[name] for name in ordered_names]
+
+
+def _build_tool_groups(
+    config: Mapping[str, Any],
+    context: Any,
+) -> list[dict[str, Any]]:
+    manager = _tool_manager(context)
+    selected = [
+        item
+        for item in _current_list(config, "parallel_tool_use_allowlist")
+        if isinstance(item, str) and item
+    ]
+    plugin_sources = _plugin_sources(context)
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    known_names: set[str] = set()
+    builtin_tools = _iter_builtin_catalog_tools(manager)
+    builtin_ids = {id(tool) for tool in builtin_tools}
+    ambiguous_names = (
+        ambiguous_tool_names(manager, builtin_tools) if manager is not None else set()
+    )
+    permission_snapshot = _tool_permission_snapshot()
+
+    for tool in _catalog_tools(manager, builtin_tools) if manager is not None else []:
+        name = getattr(tool, "name", None)
+        if not isinstance(name, str) or not name:
+            continue
+        known_names.add(name)
+        builtin = id(tool) in builtin_ids
+
+        if builtin:
+            source_type = "builtin"
+            source_id = "astrbot-core"
+            source_display_name = "AstrBot 内置工具"
+        elif isinstance(getattr(tool, "mcp_server_name", None), str):
+            source_type = "mcp"
+            source_id = str(tool.mcp_server_name)
+            source_display_name = f"MCP：{source_id}"
+        else:
+            module_path = getattr(tool, "handler_module_path", None)
+            plugin = plugin_sources.get(module_path)
+            if plugin is not None:
+                source_type = "plugin"
+                source_id, display = plugin
+                source_display_name = f"插件：{display}"
+            else:
+                source_type = "unknown"
+                source_id = str(module_path or "unknown")
+                source_display_name = "未知来源"
+
+        active = bool(getattr(tool, "active", True))
+        reason = blocked_tool_reason(tool)
+        if not active:
+            reason = "工具当前已停用"
+        elif name in ambiguous_names:
+            reason = "同名工具来自多个实际对象，无法安全确认执行目标"
+        elif source_type == "unknown":
+            reason = "无法确认工具来源"
+        selectable = reason is None
+        group_key = (source_type, source_id)
+        group = groups.setdefault(
+            group_key,
+            {
+                "source_type": source_type,
+                "source_id": source_id,
+                "display_name": source_display_name,
+                "tools": [],
+            },
+        )
+        description = getattr(tool, "description", "")
+        group["tools"].append(
+            {
+                "name": name,
+                "description": str(description or ""),
+                "source_type": source_type,
+                "source_id": source_id,
+                "display_name": name,
+                "active": active,
+                "permission": _permission_for_tool(
+                    manager,
+                    name,
+                    builtin=builtin,
+                    configured=permission_snapshot,
+                ),
+                "selectable": selectable,
+                "blocked_reason": reason,
+            }
+        )
+
+    stale = [name for name in selected if name not in known_names]
+    if stale:
+        groups[("stale", "stale")] = {
+            "source_type": "stale",
+            "source_id": "stale",
+            "display_name": "失效项",
+            "tools": [
+                {
+                    "name": name,
+                    "description": "该工具已卸载、改名或当前未载入。",
+                    "source_type": "stale",
+                    "source_id": "stale",
+                    "display_name": name,
+                    "active": False,
+                    "permission": "unknown",
+                    "selectable": False,
+                    "blocked_reason": "工具当前不存在，只能从名单中移除",
+                }
+                for name in stale
+            ],
+        }
+
+    order = {"plugin": 0, "mcp": 1, "builtin": 2, "unknown": 3, "stale": 4}
+    result = list(groups.values())
+    result.sort(
+        key=lambda group: (
+            order.get(str(group["source_type"]), 9),
+            str(group["display_name"]).casefold(),
+        )
+    )
+    for group in result:
+        group["tools"].sort(key=lambda tool: str(tool["display_name"]).casefold())
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +786,15 @@ def _build_setting_state(
             for command in SUPPORTED_BUILTIN_COMMANDS
         ]
         entry["state"] = {"value": current}
+    elif control == CONTROL_TOOL_MULTI:
+        entry["groups"] = _build_tool_groups(config, context)
+        entry["state"] = {
+            "value": [
+                item
+                for item in _current_list(config, key)
+                if isinstance(item, str) and item
+            ]
+        }
     elif control == CONTROL_PROTECTED_LIST:
         current = _current_list(config, key)
         entry["state"] = {
@@ -658,6 +914,37 @@ def _resolve_new_value(
             normalized.append(item)
         return normalized
 
+    if control == CONTROL_TOOL_MULTI:
+        if action is not None:
+            raise ValueError("未知的操作类型")
+        value = payload.get("value")
+        if not isinstance(value, list):
+            raise ValueError("工具名单必须是数组")
+        current = {
+            item
+            for item in _current_list(config, key)
+            if isinstance(item, str) and item
+        }
+        selectable = {
+            tool["name"]
+            for group in _build_tool_groups(config, context)
+            for tool in group["tools"]
+            if tool["selectable"]
+        }
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError("工具名单包含无效名称")
+            name = item.strip()
+            if name not in selectable and name not in current:
+                raise ValueError("工具名单包含当前不可选择的新工具")
+            if name in seen:
+                continue
+            seen.add(name)
+            normalized.append(name)
+        return normalized
+
     if control == CONTROL_SECRET:
         if action == "replace":
             value = _validate_optional_text(payload.get("value"), "敏感配置")
@@ -702,7 +989,7 @@ def _default_for(setting: dict[str, Any]) -> Any:
         if setting["key"] == "forward_node_hard_limit":
             return FORWARD_NODE_HARD_LIMIT_DEFAULT
         return 1
-    if control in (CONTROL_COMMAND_MULTI, CONTROL_PROTECTED_LIST):
+    if control in (CONTROL_COMMAND_MULTI, CONTROL_TOOL_MULTI, CONTROL_PROTECTED_LIST):
         return []
     return ""
 

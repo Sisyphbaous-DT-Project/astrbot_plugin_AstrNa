@@ -21,6 +21,15 @@ from astrna.modules.identity_metadata import (
     remove_builtin_identity_lines,
     sanitize_metadata_value,
 )
+from astrna.modules import identity_metadata as identity_metadata_module
+
+
+def assert_temp_part(part):
+    """真实 TextPart 用 _no_save 标记临时内容，FallbackTextPart 用 is_temp。"""
+    if identity_metadata_module.TextPart is None:
+        assert part.is_temp is True
+    else:
+        assert part._no_save is True
 
 
 def extract_identity_json(text):
@@ -64,7 +73,7 @@ def test_optimize_identity_metadata_replaces_builtin_user_and_group_metadata(fak
         "</system_reminder>"
     )
     part = request.extra_user_content_parts[1]
-    assert part.is_temp is True
+    assert_temp_part(part)
     assert part.text == (
         "<system_reminder>\n"
         'AstrNa identity metadata: {"user":{"user_id":"user123","nickname":"GroupCard"},'

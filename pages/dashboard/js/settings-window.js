@@ -26,6 +26,7 @@ function semanticValue(setting) {
     case "provider":
     case "persona": return state.value || "";
     case "command_multi": return Array.isArray(state.value) ? state.value : [];
+    case "tool_multi": return Array.isArray(state.value) ? state.value : null;
     case "protected_list":
       return { count: state.count, overridden: Boolean(setting.overridden) };
     case "secret": return state.configured;
@@ -50,6 +51,7 @@ function statusSummary(setting) {
       if (state.stale) return "已失效配置";
       return state.value ? "已选择" : "未配置";
     case "command_multi":
+    case "tool_multi":
       return Array.isArray(state.value) ? `已选 ${state.value.length} 项` : "状态未知";
     case "protected_list":
       return typeof state.count === "number" ? `${state.count} 条` : "状态未知";
@@ -505,6 +507,222 @@ export function openSettings({
     return control;
   }
 
+  function makeToolMultiControl(setting) {
+    const control = baseControl(setting);
+    const wrap = document.createElement("div");
+    wrap.className = "tool-multi";
+    control.el = wrap;
+    control.draft = Array.isArray(control.base) ? [...control.base] : [];
+    control.displayValue = () => (control.dirty ? control.draft : control.base);
+    let activeGroupKey = null;
+
+    const groupKey = (group) => `${group.source_type}:${group.source_id}`;
+    const catalogSignature = (current) => JSON.stringify((current && current.groups) || []);
+    let catalogBase = catalogSignature(setting);
+
+    const setDraft = (next) => {
+      control.draft = [...new Set(next)];
+      control.dirty = !sameValue(control.draft, control.base);
+      control.conflict = false;
+      if (animation) animation.setValue(control.draft);
+      control.render();
+      renderBanners(getSetting(setting.key) || setting);
+    };
+
+    const selectionStats = (group, shown) => {
+      const relevant = group.tools.filter(
+        (tool) => tool.selectable || shown.includes(tool.name),
+      );
+      return {
+        selected: relevant.filter((tool) => shown.includes(tool.name)).length,
+        total: relevant.length,
+      };
+    };
+
+    control.render = () => {
+      wrap.innerHTML = "";
+      const current = getSetting(setting.key) || setting;
+      const groups = Array.isArray(current.groups) ? current.groups : [];
+      const rawShown = control.dirty ? control.draft : control.base;
+      const known = Array.isArray(rawShown);
+      const shown = known ? rawShown : [];
+      const disabled = control.busy || readOnly() || control.conflict || !known;
+      let activeGroup = groups.find((group) => groupKey(group) === activeGroupKey);
+      if (!activeGroup) {
+        activeGroupKey = null;
+        activeGroup = null;
+      }
+
+      const summary = document.createElement("div");
+      summary.className = "tool-multi-summary";
+      summary.textContent = known
+        ? `已选 ${shown.length} 个工具`
+        : "当前状态未知";
+      wrap.appendChild(summary);
+
+      if (!activeGroup) {
+        const list = document.createElement("div");
+        list.className = "tool-source-list";
+        if (!groups.length) {
+          const empty = document.createElement("div");
+          empty.className = "tool-empty";
+          empty.textContent = "暂时没有可读取的工具来源";
+          list.appendChild(empty);
+        }
+        for (const group of groups) {
+          const row = document.createElement("div");
+          row.className = "tool-source-row";
+          const marker = document.createElement("input");
+          marker.type = "checkbox";
+          marker.disabled = true;
+          const stats = selectionStats(group, shown);
+          marker.checked = stats.total > 0 && stats.selected === stats.total;
+          marker.indeterminate = stats.selected > 0 && stats.selected < stats.total;
+
+          const open = document.createElement("button");
+          open.type = "button";
+          open.className = "tool-source-open";
+          open.disabled = control.busy;
+          const title = document.createElement("span");
+          title.className = "tool-source-name";
+          title.textContent = group.display_name;
+          const count = document.createElement("span");
+          count.className = "tool-source-count";
+          count.textContent = `已选 ${stats.selected}/${stats.total}`;
+          open.appendChild(title);
+          open.appendChild(count);
+          open.addEventListener("click", () => {
+            activeGroupKey = groupKey(group);
+            control.render();
+          });
+          row.appendChild(marker);
+          row.appendChild(open);
+          list.appendChild(row);
+        }
+        wrap.appendChild(list);
+      } else {
+        const toolbar = document.createElement("div");
+        toolbar.className = "tool-group-toolbar";
+        const back = document.createElement("button");
+        back.type = "button";
+        back.className = "btn small";
+        back.textContent = "« 来源";
+        back.addEventListener("click", () => {
+          activeGroupKey = null;
+          control.render();
+        });
+        const title = document.createElement("strong");
+        title.textContent = activeGroup.display_name;
+        const selectAll = document.createElement("button");
+        selectAll.type = "button";
+        selectAll.className = "btn small";
+        selectAll.textContent = "全选";
+        selectAll.disabled = disabled || !activeGroup.tools.some((tool) => tool.selectable);
+        selectAll.addEventListener("click", () => {
+          const names = activeGroup.tools.filter((tool) => tool.selectable).map((tool) => tool.name);
+          setDraft([...shown, ...names]);
+        });
+        const selectNone = document.createElement("button");
+        selectNone.type = "button";
+        selectNone.className = "btn small";
+        selectNone.textContent = "全不选";
+        selectNone.disabled = disabled || !activeGroup.tools.some((tool) => shown.includes(tool.name));
+        selectNone.addEventListener("click", () => {
+          const names = new Set(activeGroup.tools.map((tool) => tool.name));
+          setDraft(shown.filter((name) => !names.has(name)));
+        });
+        toolbar.appendChild(back);
+        toolbar.appendChild(title);
+        toolbar.appendChild(selectAll);
+        toolbar.appendChild(selectNone);
+        wrap.appendChild(toolbar);
+
+        const list = document.createElement("div");
+        list.className = "tool-option-list";
+        for (const tool of activeGroup.tools) {
+          const row = document.createElement("label");
+          row.className = "tool-option";
+          const box = document.createElement("input");
+          box.type = "checkbox";
+          box.checked = shown.includes(tool.name);
+          // 失效项只能取消，不能从未选状态重新加入。
+          box.disabled = disabled || (!tool.selectable && !box.checked);
+          box.addEventListener("change", () => {
+            const next = shown.filter((name) => name !== tool.name);
+            if (box.checked && tool.selectable) next.push(tool.name);
+            setDraft(next);
+          });
+          const text = document.createElement("span");
+          text.className = "tool-option-text";
+          const name = document.createElement("strong");
+          name.textContent = tool.display_name || tool.name;
+          const meta = document.createElement("small");
+          const permission = tool.permission === "admin"
+            ? "管理员"
+            : (tool.permission === "builtin"
+              ? "内置权限"
+              : (tool.permission === "unknown" ? "状态未知" : "成员"));
+          meta.textContent = tool.blocked_reason
+            ? `${permission} · ${tool.blocked_reason}`
+            : `${permission} · 可选择`;
+          const description = document.createElement("small");
+          description.textContent = tool.description || "暂无说明";
+          text.appendChild(name);
+          text.appendChild(meta);
+          text.appendChild(description);
+          row.appendChild(box);
+          row.appendChild(text);
+          list.appendChild(row);
+        }
+        wrap.appendChild(list);
+      }
+
+      const footer = document.createElement("div");
+      footer.className = "tool-multi-footer";
+      const applyBtn = document.createElement("button");
+      applyBtn.type = "button";
+      applyBtn.className = "btn small apply-btn";
+      applyBtn.textContent = "应用";
+      applyBtn.disabled = disabled || !control.dirty;
+      applyBtn.addEventListener("click", () => {
+        save(setting, { key: setting.key, value: [...control.draft] }, control);
+      });
+      footer.appendChild(applyBtn);
+      wrap.appendChild(footer);
+      wrap.classList.toggle("conflict", control.conflict);
+    };
+
+    control.applyServerState = (nextSetting) => {
+      const nextBase = semanticValue(nextSetting);
+      const nextCatalog = catalogSignature(nextSetting);
+      if (control.dirty && (
+        !sameValue(nextBase, control.base) || nextCatalog !== catalogBase
+      )) {
+        control.conflict = true;
+      } else if (!control.dirty) {
+        control.base = nextBase;
+        control.draft = Array.isArray(nextBase) ? [...nextBase] : [];
+        catalogBase = nextCatalog;
+      }
+      control.render();
+    };
+    control.commit = () => {
+      catalogBase = catalogSignature(getSetting(setting.key) || setting);
+    };
+    control.rollback = () => {
+      const latest = getSetting(setting.key) || setting;
+      control.dirty = false;
+      control.conflict = false;
+      control.base = semanticValue(latest);
+      control.draft = Array.isArray(control.base) ? [...control.base] : [];
+      catalogBase = catalogSignature(latest);
+      if (animation) animation.setValue(control.base);
+      control.render();
+    };
+    control.render();
+    return control;
+  }
+
   function makeSecretControl(setting) {
     const control = baseControl(setting);
     const wrap = document.createElement("div");
@@ -653,6 +871,7 @@ export function openSettings({
     provider: makeSelectControl,
     persona: makeSelectControl,
     command_multi: makeCommandMultiControl,
+    tool_multi: makeToolMultiControl,
     secret: makeSecretControl,
     protected_list: makeProtectedListControl,
   };

@@ -97,11 +97,11 @@ def test_js_modules_relative_imports_resolve():
             assert target.is_file(), f"{path.name} 的导入无法解析: {ref}"
 
 
-def test_fallback_catalog_keeps_all_twenty_features_read_only():
+def test_fallback_catalog_keeps_all_twenty_one_features_read_only():
     text = (PAGES_DIR / "js" / "fallback-catalog.js").read_text(encoding="utf-8")
     keys = re.findall(r'^\s+"([a-z0-9_]+)",\s*$', text, flags=re.MULTILINE)
-    assert len(keys) == 20
-    assert len(set(keys)) == 20
+    assert len(keys) == 21
+    assert len(set(keys)) == 21
     assert "readOnly: !interactive" in text
     assert "enabled: interactive ? false : null" in text
 

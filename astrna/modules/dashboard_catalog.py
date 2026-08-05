@@ -2,7 +2,7 @@
 
 本模块只负责两件事：
 
-1. 生成 20 个主开关的静态文案与安全状态摘要（绝不包含 Token、UMO、
+1. 生成 21 个主开关的静态文案与安全状态摘要（绝不包含 Token、UMO、
    群号等敏感原文）。
 2. 校验并应用单个主开关的修改，写回共享配置对象、持久化，并同步
    Runtime 的合并配置副本。
@@ -32,6 +32,7 @@ SWITCH_KEYS: tuple[str, ...] = (
     "optimize_send_message_to_user",
     "output_length_limit_enabled",
     "provide_group_identity_tools",
+    "parallel_tool_use_enabled",
     "optimize_reply_target_history",
     "disable_group_at_bot_wake",
     "disable_group_reply_to_bot_wake",
@@ -191,6 +192,23 @@ FEATURES: tuple[dict[str, Any], ...] = (
         "模型需要时按需查询，结果更准确。",
         ("Bot 需要了解群成员身份但又不想每轮占用上下文时",),
         ("依赖平台提供群成员资料，部分平台数据可能缺失",),
+    ),
+    _feature(
+        "parallel_tool_use_enabled",
+        "LLM 并发工具调用",
+        "让模型把多个互不依赖的工具同时执行；只允许 Dashboard 中由管理员明确选择的工具。",
+        "模型逐个调用搜索、查询等独立工具时会反复等待。AstrNa 提供一个批量入口，让这些工具并行运行；"
+        "真正能执行的范围始终是“当前请求本来可用的工具”和“管理员允许名单”的交集，白名单不会授予额外权限。",
+        ("同一轮需要查询多个互不依赖的数据来源时",),
+        (
+            "默认关闭；名单为空时不会注册批量工具",
+            "允许名单请在「功能设置」中按插件、MCP 服务或 AstrBot 内置工具逐项选择",
+            "只选择互不依赖、主要返回数据且不会直接操纵聊天或共享状态的工具",
+            "send_message_to_user、Handoff、后台任务和批量工具自身永远不能选择",
+            "管理员权限、人格工具范围、会话插件开关和工具停用状态仍然生效",
+        ),
+        experimental=True,
+        confirm_before_enable=True,
     ),
     _feature(
         "optimize_reply_target_history",
@@ -357,6 +375,10 @@ def _build_details(key: str, config: Mapping[str, Any]) -> dict[str, Any]:
         return {
             "allowlist_count": _list_count(config, "custom_builtin_commands_allowlist"),
         }
+    if key == "parallel_tool_use_enabled":
+        return {
+            "allowlist_count": _list_count(config, "parallel_tool_use_allowlist"),
+        }
     if key == "issue_assistant_enabled":
         return {
             "devkit_enabled": _truthy_flag(config, "issue_assistant_devkit_enabled"),
@@ -377,6 +399,12 @@ def _build_warnings(config: Mapping[str, Any]) -> list[str]:
     ):
         warnings.append(
             "内置指令控制已开启但允许列表为空：全部 AstrBot Core 内置指令当前不可用。"
+        )
+    if _truthy_flag(config, "parallel_tool_use_enabled") and not _list_count(
+        config, "parallel_tool_use_allowlist"
+    ):
+        warnings.append(
+            "LLM 并发工具调用已开启但尚未选择允许并发的工具：批量工具当前不会注册。"
         )
     if _truthy_flag(config, "issue_assistant_enabled") and not _nonempty_text(
         config, "issue_assistant_target_umo"
