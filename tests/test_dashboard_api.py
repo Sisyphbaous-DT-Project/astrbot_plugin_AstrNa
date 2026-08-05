@@ -186,7 +186,7 @@ def test_state_api_returns_full_state(webapi):
     star, _, _ = webapi(config, {})
     kind, data = asyncio.run(star._webapi_dashboard_state())
     assert kind == "json"
-    assert len(data["features"]) == 20
+    assert len(data["features"]) == 21
     first = data["features"][0]
     assert first["key"] == "fix_deepseek_v4_400"
     assert first["enabled"] is True

@@ -27,6 +27,7 @@ EXPECTED_ORDER = [
     "optimize_send_message_to_user",
     "output_length_limit_enabled",
     "provide_group_identity_tools",
+    "parallel_tool_use_enabled",
     "optimize_reply_target_history",
     "disable_group_at_bot_wake",
     "disable_group_reply_to_bot_wake",
@@ -67,7 +68,7 @@ def _walk_strings(payload):
 
 def test_switch_keys_exact_order_and_count():
     assert list(SWITCH_KEYS) == EXPECTED_ORDER
-    assert len(SWITCH_KEYS) == 20
+    assert len(SWITCH_KEYS) == 21
     assert [feature["key"] for feature in FEATURES] == EXPECTED_ORDER
 
 
@@ -79,14 +80,18 @@ def test_feature_copy_is_complete():
         assert feature["scenes"]
         assert isinstance(feature["notices"], list)
     experimental = {f["key"] for f in FEATURES if f["experimental"]}
-    assert experimental == {"unlock_group_sender_concurrency", "issue_assistant_enabled"}
+    assert experimental == {
+        "parallel_tool_use_enabled",
+        "unlock_group_sender_concurrency",
+        "issue_assistant_enabled",
+    }
     confirm = {f["key"] for f in FEATURES if f["confirm_before_enable"]}
     assert confirm == experimental
 
 
 def test_build_state_defaults_all_disabled():
     state = build_state({})
-    assert len(state["features"]) == 20
+    assert len(state["features"]) == 21
     assert all(feature["enabled"] is False for feature in state["features"])
     assert state["warnings"] == []
 
@@ -147,6 +152,9 @@ def test_build_state_warnings():
     state = build_state({"output_length_limit_enabled": True})
     assert any("清洗模型" in text for text in state["warnings"])
 
+    state = build_state({"parallel_tool_use_enabled": True})
+    assert any("尚未选择允许并发" in text for text in state["warnings"])
+
     state = build_state({
         "custom_builtin_commands_enabled": True,
         "custom_builtin_commands_allowlist": ["help"],
@@ -156,6 +164,8 @@ def test_build_state_warnings():
         "group_chat_context_compress_provider_id": "p",
         "output_length_limit_enabled": True,
         "output_length_limit_provider_id": "p",
+        "parallel_tool_use_enabled": True,
+        "parallel_tool_use_allowlist": ["search"],
     })
     assert state["warnings"] == []
 
@@ -168,7 +178,7 @@ def test_validate_switch_rejects_unknown_and_wrong_type():
     with pytest.raises(ValueError):
         validate_switch("fix_deepseek_v4_400", 1)
     with pytest.raises(ValueError):
-        # 子配置不属于 20 个主开关，必须拒绝
+        # 子配置不属于 21 个主开关，必须拒绝
         validate_switch("output_length_limit_max_chars", True)
     validate_switch("fix_deepseek_v4_400", True)
     validate_switch("fix_deepseek_v4_400", False)

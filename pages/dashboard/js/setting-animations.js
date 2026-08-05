@@ -1,5 +1,5 @@
 /**
- * 19 项子配置的专属原理动画。
+ * 20 项子配置的专属原理动画。
  * 与主功能动画共用同一套 SVG 视觉语言；每个标签驱动真实的数据流与解释，
  * 布尔值立即切换，数字/选择项以草稿值预览；减少动态模式下不启动循环时间轴，
  * 布尔场景始终以双路径静态呈现“关闭路径 / 开启路径”的前后状态。
@@ -530,6 +530,35 @@ function buildBuiltinAllowlist(stage, ctx) {
   });
 }
 
+function buildParallelToolAllowlist(stage, ctx) {
+  return scene(stage, ctx, (g, value) => {
+    const allowed = Array.isArray(value) ? value : [];
+    const sourceLabels = ["插件工具", "MCP 工具", "内置工具"];
+    const nodes = sourceLabels.map((text, index) => {
+      const y = 45 + index * 60;
+      const node = box(g, 10, y, 100, 38, "#123f5a", { stroke: COLOR.info });
+      label(g, 20, y + 24, text, { size: 10 });
+      arrow(g, 112, y + 19, 180, 112, allowed.length ? COLOR.ok : COLOR.gray);
+      return node;
+    });
+    box(g, 182, 75, 100, 75, "#0a2b2b", { stroke: COLOR.warn });
+    label(g, 194, 101, "并发允许名单", { size: 10, color: COLOR.warn, bold: true });
+    label(g, 194, 124, `已选 ${allowed.length} 项`, { size: 11, color: allowed.length ? COLOR.ok : COLOR.gray });
+    arrow(g, 284, 112, 325, 112, allowed.length ? COLOR.ok : COLOR.bad);
+    box(g, 327, 88, 72, 48, allowed.length ? "#1d4a1d" : "#2b2b2b");
+    label(g, 337, 108, "当前请求", { size: 9, color: allowed.length ? COLOR.ok : COLOR.gray });
+    label(g, 337, 125, "权限复核", { size: 9, color: allowed.length ? COLOR.ok : COLOR.gray });
+    return {
+      caption: allowed.length
+        ? `已选择 ${allowed.length} 个适合并发的工具；执行时仍与当前请求工具范围取交集并复核权限`
+        : "尚未选择允许并发的工具：批量工具不会注册",
+      animate: allowed.length
+        ? () => ctx.gsap.to(nodes, { opacity: 0.45, duration: 0.65, repeat: -1, yoyo: true })
+        : null,
+    };
+  });
+}
+
 /* ---------- Issue 助手 ---------- */
 
 function buildIssueDevkit(stage, ctx) {
@@ -633,6 +662,7 @@ const BUILDERS = {
   "wake-reply-all": buildWakeAll("reply"),
   "wake-reply-groups": buildWakeGroups("reply"),
   "builtin-allowlist": buildBuiltinAllowlist,
+  "parallel-tool-allowlist": buildParallelToolAllowlist,
   "issue-devkit": buildIssueDevkit,
   "issue-notify-umo": buildIssueNotify,
   "issue-github-token": buildIssueToken,

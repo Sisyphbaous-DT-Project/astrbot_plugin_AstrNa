@@ -28,6 +28,7 @@ from .modules.output_length_limiter import (
     OutputLengthLimiterModule,
     normalize_whitelist_umo_items,
 )
+from .modules.parallel_tool_use import ParallelToolUseModule
 from .modules.quoted_image_input import QuotedImageInputModule
 from .modules.reply_target_history import ReplyTargetHistoryModule
 from .modules.send_message_to_user import SendMessageToUserModule
@@ -58,6 +59,8 @@ DEFAULT_CONFIG = {
     "output_length_limit_provider_id": "",
     "output_length_limit_persona_id": "",
     "provide_group_identity_tools": False,
+    "parallel_tool_use_enabled": False,
+    "parallel_tool_use_allowlist": [],
     "optimize_reply_target_history": False,
     "disable_group_at_bot_wake": False,
     "disable_group_at_bot_wake_all_groups": False,
@@ -76,7 +79,7 @@ DEFAULT_CONFIG = {
     "custom_builtin_commands_allowlist": [],
 }
 
-# Dashboard 允许编辑的子配置严格白名单（19 项，注册表见 dashboard_settings）。
+# Dashboard 允许编辑的子配置严格白名单（20 项，注册表见 dashboard_settings）。
 DASHBOARD_SETTING_KEYS = frozenset(_DASHBOARD_SETTING_KEY_TUPLE)
 
 _FORWARD_LENGTH_SETTING_KEYS = frozenset(
@@ -106,6 +109,7 @@ _ISSUE_ASSISTANT_SETTING_KEYS = frozenset(
         "issue_assistant_target_umo",
     }
 )
+_PARALLEL_TOOL_SETTING_KEYS = frozenset({"parallel_tool_use_allowlist"})
 
 
 class AstrNaRuntime:
@@ -158,6 +162,11 @@ class AstrNaRuntime:
         self.group_identity_tools = GroupIdentityToolsModule(
             context=context,
             logger=logger,
+        )
+        self.parallel_tool_use = ParallelToolUseModule(
+            context=context,
+            logger=logger,
+            allowlist=self.config.get("parallel_tool_use_allowlist", []),
         )
         self.group_sender_concurrency = GroupSenderConcurrencyModule(logger=logger)
         self.long_reply_context = LongReplyContextModule(logger=logger)
@@ -232,6 +241,7 @@ class AstrNaRuntime:
             self.output_length_limiter.install()
         if self.config.get("provide_group_identity_tools", False):
             self.group_identity_tools.install()
+        self._configure_parallel_tool_use()
         if self.config.get("optimize_long_reply_context", False):
             self.long_reply_context.install()
         if self.config.get("unlock_group_sender_concurrency", False):
@@ -252,11 +262,13 @@ class AstrNaRuntime:
         if not isinstance(DEFAULT_CONFIG[key], bool) or type(value) is not bool:
             raise ValueError("仅允许修改布尔主开关")
         self.config[key] = value
+        if key == "parallel_tool_use_enabled":
+            self._configure_parallel_tool_use()
 
     def update_dashboard_setting(self, key: str, value: Any) -> None:
         """同步功能控制台修改的单个子配置，并按组热同步相关模块。
 
-        严格白名单：只接受 DASHBOARD_SETTING_KEYS 中的 19 个键；列表值写入
+        严格白名单：只接受 DASHBOARD_SETTING_KEYS 中的 20 个键；列表值写入
         副本，前端对象不会继续引用 Runtime 配置。各组同步规则：
         - 身份元数据四项：只写配置，下一次 LLM 请求读取；
         - 合并转发长度：重新配置 ForwardNodesModule，无需重启插件；
@@ -316,6 +328,8 @@ class AstrNaRuntime:
             self._configure_waking_check_chain()
         elif key in _ISSUE_ASSISTANT_SETTING_KEYS:
             self._configure_issue_assistant()
+        elif key in _PARALLEL_TOOL_SETTING_KEYS:
+            self._configure_parallel_tool_use()
         # 身份元数据四项只写配置，下一次 LLM 请求由 sanitize_request 读取。
 
     async def sanitize_request(self, event: Any, req: Any) -> None:
@@ -450,6 +464,15 @@ class AstrNaRuntime:
             self.deepseek_v4_400.sanitize(event, req)
         else:
             self.deepseek_v4_400.terminate()
+
+        if (
+            self.config.get("parallel_tool_use_enabled", False)
+            or getattr(self.parallel_tool_use, "_installed", False)
+            or getattr(self.parallel_tool_use, "_yielded_tool", None) is not None
+        ):
+            # 每个 LLM 请求复核并发工具注册：插件动态加载/卸载不会通知本插件，
+            # 同名第三方对象的出现或消失都在这里按让名/自愈规则收敛。
+            self._configure_parallel_tool_use()
 
         forward_nodes_enabled = self.config.get("optimize_forward_nodes", False)
         long_reply_enabled = bool(
@@ -596,6 +619,19 @@ class AstrNaRuntime:
             target_umo=self.config.get("issue_assistant_target_umo", ""),
         )
 
+    def _configure_parallel_tool_use(self) -> None:
+        """按主开关与非空允许名单热安装或卸载并发工具。"""
+        if getattr(self, "_closed", False):
+            # 插件已终止：被 shield 保护的旧 Dashboard 保存任务不得重新激活并发工具。
+            return
+        allowlist = self.config.get("parallel_tool_use_allowlist", [])
+        self.parallel_tool_use.configure(allowlist)
+        enabled = bool(self.config.get("parallel_tool_use_enabled", False))
+        if enabled and self.parallel_tool_use.allowlist:
+            self.parallel_tool_use.install()
+        else:
+            self.parallel_tool_use.terminate()
+
     def _configure_group_context_persist_callback(self) -> None:
         if self.config.get("optimize_group_chat_context", False):
             self.long_reply_context.group_context_persist_callback = (
@@ -703,6 +739,9 @@ class AstrNaRuntime:
         if getattr(self, "_closed", False):
             return
         self._configure_auto_cache_cleanup()
+        # 全部插件加载完成后复核并发工具注册：后加载插件的同名 @llm_tool 会
+        # 经 AstrBot add_func 按名删除我们的注册对象，需要在此让名或自愈。
+        self._configure_parallel_tool_use()
 
     def record_activity(self) -> None:
         self.auto_cache_cleanup.mark_activity()
@@ -772,6 +811,7 @@ class AstrNaRuntime:
         # 共享唤醒链必须在第一个 await 前拆除，避免旧 Runtime 继续占用全局入口。
         self.group_wake_suppression.terminate()
         self.builtin_command_allowlist.terminate()
+        self.parallel_tool_use.terminate()
         await self.issue_assistant.terminate()
         self.group_sender_concurrency.terminate()
         self.group_chat_context_optimizer.terminate()

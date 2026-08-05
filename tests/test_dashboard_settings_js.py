@@ -23,6 +23,7 @@ EXPECTED_PARENTS_WITH_SETTINGS = {
     "disable_group_at_bot_wake",
     "disable_group_reply_to_bot_wake",
     "custom_builtin_commands_enabled",
+    "parallel_tool_use_enabled",
     "issue_assistant_enabled",
 }
 
@@ -43,7 +44,7 @@ def test_setting_animation_ids_match_backend_registry():
       const {{ SETTING_ANIMATION_IDS }} = await import(moduleUrl);
       const backend = {backend};
       assert.deepEqual(SETTING_ANIMATION_IDS, backend);
-      assert.equal(new Set(SETTING_ANIMATION_IDS).size, 19);
+      assert.equal(new Set(SETTING_ANIMATION_IDS).size, 20);
     """
     subprocess.run(
         ["node", "--input-type=module", "--eval", script],
@@ -167,12 +168,12 @@ def test_setting_save_warnings_sync_memory_state():
     assert "state.warnings = Array.isArray(warnings) ? warnings : [];" in app
 
 
-def test_fallback_catalog_keeps_19_settings_readonly():
+def test_fallback_catalog_keeps_20_settings_readonly():
     text = _read("fallback-catalog.js")
     for parent in EXPECTED_PARENTS_WITH_SETTINGS:
         assert f"{parent}: [" in text, parent
-    # 19 个静态子配置条目
-    assert text.count("    setting(") == 19
+    # 20 个静态子配置条目
+    assert text.count("    setting(") == 20
     # 状态未知时不能伪装成真实值
     assert "value: null" in text
     assert "configured: null" in text
@@ -191,8 +192,24 @@ def test_settings_css_hooks():
         ".settings-btn",
         ".protected-list",
         ".command-multi",
+        ".tool-multi",
         ".secret-control",
     ):
         assert hook in css, hook
     # 窄屏切换为顶部下拉
     assert ".settings-sidebar { display: none; }" in css
+
+
+def test_tool_multi_uses_two_level_view_and_preserves_dirty_draft():
+    text = _read("settings-window.js")
+    assert 'case "tool_multi": return Array.isArray(state.value) ? state.value : null;' in text
+    assert "const known = Array.isArray(rawShown);" in text
+    assert 'summary.textContent = known' in text
+    assert "tool-source-list" in text
+    assert "tool-option-list" in text
+    assert 'selectAll.textContent = "全选"' in text
+    assert 'selectNone.textContent = "全不选"' in text
+    assert "marker.indeterminate" in text
+    assert "nextCatalog !== catalogBase" in text
+    assert "失效项只能取消" in text
+    assert "tool_multi: makeToolMultiControl" in text

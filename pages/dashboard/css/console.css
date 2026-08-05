@@ -693,6 +693,48 @@ em { font-family: var(--serif); font-style: italic; }
 .command-multi .command-option { font-size: 12.5px; font-family: var(--mono); }
 .command-multi .apply-btn { align-self: flex-start; margin-top: 4px; }
 
+.tool-multi { display: flex; flex-direction: column; gap: 7px; min-height: 190px; }
+.tool-multi.conflict { opacity: 0.85; }
+.tool-multi-summary { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+.tool-source-list,
+.tool-option-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 230px;
+  overflow-y: auto;
+  padding: 3px;
+  background: var(--panel-light);
+  box-shadow: var(--sunken);
+}
+.tool-source-row { display: flex; align-items: center; gap: 6px; min-height: 42px; }
+.tool-source-open {
+  flex: 1;
+  min-width: 0;
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 8px;
+  text-align: left;
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: var(--raised);
+}
+.tool-source-open:active { box-shadow: var(--sunken); }
+.tool-source-name { overflow-wrap: anywhere; }
+.tool-source-count { flex: 0 0 auto; color: var(--muted); font-family: var(--mono); font-size: 11px; }
+.tool-group-toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.tool-group-toolbar strong { flex: 1; min-width: 120px; font-size: 12px; overflow-wrap: anywhere; }
+.tool-option { display: flex; align-items: flex-start; gap: 7px; padding: 6px 7px; }
+.tool-option + .tool-option { border-top: 1px solid var(--panel-dark); }
+.tool-option-text { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.tool-option-text strong { font-size: 12px; font-family: var(--mono); overflow-wrap: anywhere; }
+.tool-option-text small { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+.tool-multi-footer { display: flex; justify-content: flex-start; }
+.tool-empty { padding: 12px; color: var(--muted); font-size: 12px; }
+
 .secret-control .secret-status { margin: 0 0 6px; font-size: 12px; color: var(--muted); }
 
 .protected-list .list-summary { margin: 0 0 6px; font-size: 12px; color: var(--muted); }

@@ -1,5 +1,5 @@
 /**
- * 20 个功能的专属 SVG 原理动画。
+ * 21 个功能的专属 SVG 原理动画。
  * 每个功能都有“开启前 / 开启后”两个语义场景，使用统一视觉语言但表达内容不同。
  */
 
@@ -835,7 +835,47 @@ function buildBuiltinCommands(stage, ctx) {
   });
 }
 
-/* ---------- 20. 自动报错分析与 Issue 助手 ---------- */
+/* ---------- 20. LLM 并发工具调用 ---------- */
+function buildParallelToolUse(stage, ctx) {
+  return stateful(stage, {
+    before: "开启前：互不依赖的工具也只能逐个等待",
+    after: "开启后：当前请求工具 ∩ 管理员允许名单 → 并发执行",
+  }, ctx, (svg, beforeG, afterG, { gsap }) => {
+    const beforeNodes = ["搜索 A", "查询 B", "读取 C"].map((text, i) => {
+      const x = 35 + i * 120;
+      const node = box(beforeG, x, 105, 90, 42, "#123f5a");
+      label(beforeG, x + 45, 131, text, { size: 10, anchor: "middle" });
+      if (i < 2) arrow(beforeG, x + 92, 126, x + 116, 126, COLOR.warn);
+      return node;
+    });
+    label(beforeG, 95, 185, "逐个等待，耗时累加", { size: 11, color: COLOR.warn });
+
+    chip(afterG, "当前请求可用", 12, 50, COLOR.info);
+    chip(afterG, "管理员允许", 12, 95, COLOR.warn);
+    arrow(afterG, 125, 64, 175, 105, COLOR.ok);
+    arrow(afterG, 125, 109, 175, 105, COLOR.ok);
+    box(afterG, 177, 78, 88, 55, "#0a2b2b", { stroke: COLOR.ok });
+    label(afterG, 221, 101, "交集 + 权限", { size: 10, anchor: "middle", color: COLOR.ok });
+    label(afterG, 221, 119, "安全闸门", { size: 10, anchor: "middle" });
+    const flows = [0, 1, 2].map((i) => {
+      const y = 48 + i * 65;
+      const flow = arrow(afterG, 267, 105, 313, y + 18, COLOR.ok);
+      box(afterG, 315, y, 78, 36, "#1d4a1d");
+      label(afterG, 354, y + 23, `工具 ${i + 1}`, { size: 10, anchor: "middle", color: COLOR.ok });
+      return flow;
+    });
+    label(afterG, 138, 225, "管理员权限、人格范围和会话开关仍然生效 √", { size: 10, color: COLOR.ok });
+    return {
+      animateBefore: () => gsap.timeline({ repeat: -1 })
+        .to(beforeNodes[0], { opacity: 0.35, duration: 0.35 })
+        .to(beforeNodes[1], { opacity: 0.35, duration: 0.35 })
+        .to(beforeNodes[2], { opacity: 0.35, duration: 0.35 }),
+      animateAfter: () => gsap.to(flows, { opacity: 0.25, duration: 0.55, stagger: 0.12, repeat: -1, yoyo: true }),
+    };
+  });
+}
+
+/* ---------- 21. 自动报错分析与 Issue 助手 ---------- */
 function buildIssueAssistant(stage, ctx) {
   return stateful(stage, {
     before: "开启前：报错堆栈带敏感信息，人工排查费时",
@@ -895,6 +935,7 @@ const BUILDERS = {
   optimize_send_message_to_user: buildSendMessageToUser,
   output_length_limit_enabled: buildOutputLength,
   provide_group_identity_tools: buildGroupIdentityTools,
+  parallel_tool_use_enabled: buildParallelToolUse,
   optimize_reply_target_history: buildReplyTarget,
   disable_group_at_bot_wake: buildWakeSuppression("at"),
   disable_group_reply_to_bot_wake: buildWakeSuppression("reply"),

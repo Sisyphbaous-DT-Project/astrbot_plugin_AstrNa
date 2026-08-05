@@ -124,6 +124,15 @@ const FEATURES = [
     ["需要群身份信息但不想持续占用上下文时"],
   ),
   feature(
+    "parallel_tool_use_enabled",
+    "LLM 并发工具调用",
+    "只并行管理员逐项允许、且当前请求本来可用的工具。",
+    "多个互不依赖的工具可以同时运行；允许名单不会增加权限，也不会绕过会话工具范围。",
+    ["同一轮需要查询多个独立数据来源时"],
+    ["名单为空时不会注册批量工具", "直接发送、Handoff 与后台任务不能选择"],
+    true,
+  ),
+  feature(
     "optimize_reply_target_history",
     "优化回复历史标记",
     "明确当前发言人、引用发送者和 Bot 原回复对象。",
@@ -181,7 +190,7 @@ const FEATURES = [
 ];
 
 /**
- * 8 个功能的 19 项子配置静态目录：状态接口失败时保留说明与动画，
+ * 9 个功能的 20 项子配置静态目录：状态接口失败时保留说明与动画，
  * 所有状态值一律为空，控件显示“状态未知”并禁用。
  */
 const COMMAND_OPTIONS = [
@@ -201,6 +210,7 @@ function setting(key, control, name, description, animation, extra = {}) {
     dependency: { blocked: false, reason: null, inactive: false },
     overridden: false,
     options: extra.options,
+    groups: extra.groups,
     state: extra.state,
   };
 }
@@ -285,6 +295,13 @@ const FALLBACK_SETTINGS = {
       "builtin-allowlist",
       { notes: ["指令改名后仍按原始功能放行"], options: COMMAND_OPTIONS, state: { value: [] } }),
   ],
+  parallel_tool_use_enabled: [
+    setting("parallel_tool_use_allowlist", "tool_multi", "允许并发的工具",
+      "按来源逐项选择适合并发的工具；名单只表示适合并发，不会授予管理员权限。",
+      "parallel-tool-allowlist",
+      { notes: ["只选择互不依赖、主要返回数据且不会直接操纵聊天或共享状态的工具",
+        "新安装的工具默认不授权，必须由管理员再次选择"], groups: [], state: { value: null } }),
+  ],
   issue_assistant_enabled: [
     setting("issue_assistant_devkit_enabled", "bool", "开发工具箱",
       "在报错分析与 Issue 流程中提供源码辅助分析入口，需要先安装并启用弥亚开发工具箱。",
@@ -318,6 +335,10 @@ export function buildFallbackState({ interactive = false } = {}) {
             notes: [...item2.notes],
             dependency: { ...item2.dependency },
             options: item2.options ? item2.options.map((o) => ({ ...o })) : item2.options,
+            groups: item2.groups ? item2.groups.map((group) => ({
+              ...group,
+              tools: group.tools.map((tool) => ({ ...tool })),
+            })) : item2.groups,
             state: Array.isArray(item2.state && item2.state.items)
               ? { ...item2.state, items: [] }
               : { ...item2.state },

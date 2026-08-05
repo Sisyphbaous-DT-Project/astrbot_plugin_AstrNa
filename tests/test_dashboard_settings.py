@@ -4,7 +4,7 @@ import asyncio
 import builtins
 import sys
 from importlib.machinery import ModuleSpec
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -41,6 +41,7 @@ EXPECTED_SETTING_ORDER = [
     "disable_group_reply_to_bot_wake_all_groups",
     "disable_group_reply_to_bot_wake_group_ids",
     "custom_builtin_commands_allowlist",
+    "parallel_tool_use_allowlist",
     "issue_assistant_devkit_enabled",
     "issue_assistant_target_umo",
     "issue_assistant_github_token",
@@ -54,6 +55,7 @@ EXPECTED_PARENTS = {
     "disable_group_at_bot_wake": 2,
     "disable_group_reply_to_bot_wake": 2,
     "custom_builtin_commands_enabled": 1,
+    "parallel_tool_use_enabled": 1,
     "issue_assistant_enabled": 3,
 }
 
@@ -74,6 +76,7 @@ EXPECTED_ANIMATIONS = {
     "disable_group_reply_to_bot_wake_all_groups": "wake-reply-all",
     "disable_group_reply_to_bot_wake_group_ids": "wake-reply-groups",
     "custom_builtin_commands_allowlist": "builtin-allowlist",
+    "parallel_tool_use_allowlist": "parallel-tool-allowlist",
     "issue_assistant_devkit_enabled": "issue-devkit",
     "issue_assistant_target_umo": "issue-notify-umo",
     "issue_assistant_github_token": "issue-github-token",
@@ -132,6 +135,56 @@ class FakeOptionContext:
         return list(self._providers)
 
 
+class FakeToolManager:
+    def __init__(self, tools=(), builtins=(), admin_tools=()):
+        self.func_list = list(tools)
+        self._builtins = list(builtins)
+        self._admin_tools = set(admin_tools)
+
+    def iter_builtin_tools(self):
+        return list(self._builtins)
+
+    def is_builtin_tool(self, name):
+        return any(tool.name == name for tool in self._builtins)
+
+    def _default_permission(self, name):
+        return "admin" if name in self._admin_tools else "member"
+
+
+class FakeToolContext(FakeOptionContext):
+    def __init__(self, manager, stars=()):
+        super().__init__()
+        self._manager = manager
+        self._stars = list(stars)
+
+    def get_llm_tool_manager(self):
+        return self._manager
+
+    def get_all_stars(self):
+        return list(self._stars)
+
+
+def fake_catalog_tool(
+    name,
+    *,
+    module_path=None,
+    active=True,
+    description="说明",
+    background=False,
+    mcp_server_name=None,
+):
+    values = {
+        "name": name,
+        "description": description,
+        "handler_module_path": module_path,
+        "active": active,
+        "is_background_task": background,
+    }
+    if mcp_server_name is not None:
+        values["mcp_server_name"] = mcp_server_name
+    return type("CatalogTool", (), values)()
+
+
 def _walk_strings(payload):
     if isinstance(payload, str):
         yield payload
@@ -155,12 +208,12 @@ def _run(coro):
 
 def test_settings_registry_exact_order_count_and_parents():
     assert list(SETTING_KEYS) == EXPECTED_SETTING_ORDER
-    assert len(SETTINGS) == 19
+    assert len(SETTINGS) == 20
     parents = {}
     for item in SETTINGS:
         parents[item["parent"]] = parents.get(item["parent"], 0) + 1
     assert parents == EXPECTED_PARENTS
-    assert len(EXPECTED_PARENTS) == 8
+    assert len(EXPECTED_PARENTS) == 9
 
 
 def test_settings_registry_copy_complete():
@@ -174,10 +227,11 @@ def test_settings_registry_copy_complete():
             "provider",
             "persona",
             "command_multi",
+            "tool_multi",
             "protected_list",
             "secret",
         }
-    assert len({item["animation"] for item in SETTINGS}) == 19
+    assert len({item["animation"] for item in SETTINGS}) == 20
 
 
 def test_settings_animation_ids_match_frontend_registry():
@@ -253,11 +307,192 @@ def test_build_feature_settings_provider_and_persona_options():
     ]
 
 
+def test_tool_multi_catalog_groups_sources_permissions_and_blocked_items():
+    plugin = fake_catalog_tool("plugin_search", module_path="plugins.search")
+    direct = fake_catalog_tool("send_message_to_user", module_path="plugins.search")
+    background = fake_catalog_tool(
+        "background_job", module_path="plugins.search", background=True
+    )
+    inactive = fake_catalog_tool(
+        "inactive_tool", module_path="plugins.search", active=False
+    )
+    mcp_tool = fake_catalog_tool("mcp_fetch", mcp_server_name="weather")
+    builtin = fake_catalog_tool("builtin_read")
+    unknown = fake_catalog_tool("mystery", module_path="missing.module")
+    manager = FakeToolManager(
+        [plugin, direct, background, inactive, mcp_tool, unknown],
+        builtins=[builtin],
+        admin_tools=["plugin_search"],
+    )
+    star = type(
+        "Star",
+        (),
+        {
+            "module_path": "plugins.search",
+            "name": "astrbot_plugin_search",
+            "display_name": "搜索插件",
+        },
+    )()
+    context = FakeToolContext(manager, [star])
+    config = {
+        "parallel_tool_use_allowlist": [
+            "plugin_search",
+            "send_message_to_user",
+            "removed_tool",
+        ]
+    }
+
+    setting = build_feature_settings(
+        config, "parallel_tool_use_enabled", context
+    )[0]
+    groups = setting["groups"]
+    assert [group["source_type"] for group in groups] == [
+        "plugin",
+        "mcp",
+        "builtin",
+        "unknown",
+        "stale",
+    ]
+    tools = {
+        tool["name"]: tool
+        for group in groups
+        for tool in group["tools"]
+    }
+    assert set(tools["plugin_search"]) == {
+        "name",
+        "description",
+        "source_type",
+        "source_id",
+        "display_name",
+        "active",
+        "permission",
+        "selectable",
+        "blocked_reason",
+    }
+    assert tools["plugin_search"]["source_id"] == "astrbot_plugin_search"
+    assert tools["plugin_search"]["permission"] == "admin"
+    assert tools["plugin_search"]["selectable"] is True
+    assert tools["mcp_fetch"]["source_id"] == "weather"
+    assert tools["builtin_read"]["permission"] == "builtin"
+    assert tools["send_message_to_user"]["selectable"] is False
+    assert "直接发送消息" in tools["send_message_to_user"]["blocked_reason"]
+    assert tools["background_job"]["selectable"] is False
+    assert tools["inactive_tool"]["blocked_reason"] == "工具当前已停用"
+    assert tools["mystery"]["selectable"] is False
+    assert tools["removed_tool"]["source_type"] == "stale"
+    assert setting["state"]["value"] == config["parallel_tool_use_allowlist"]
+
+
+def test_tool_multi_transaction_accepts_real_options_and_existing_stale_only(fakes):
+    plugin = fake_catalog_tool("plugin_search", module_path="plugins.search")
+    blocked = fake_catalog_tool("send_message_to_user", module_path="plugins.search")
+    star = type(
+        "Star",
+        (),
+        {
+            "module_path": "plugins.search",
+            "name": "astrbot_plugin_search",
+            "display_name": "搜索插件",
+        },
+    )()
+    context = FakeToolContext(FakeToolManager([plugin, blocked]), [star])
+    config = FakeConfig({"parallel_tool_use_allowlist": ["removed_tool"]})
+    runtime = fakes.build_runtime(dict(config))
+
+    result = _run(
+        apply_setting(
+            config,
+            runtime,
+            context,
+            {
+                "key": "parallel_tool_use_allowlist",
+                "value": ["plugin_search", "removed_tool", "plugin_search"],
+            },
+        )
+    )
+    assert config["parallel_tool_use_allowlist"] == [
+        "plugin_search",
+        "removed_tool",
+    ]
+    assert result["feature"]["details"]["allowlist_count"] == 2
+
+    for invalid in (["forged"], ["send_message_to_user"]):
+        with pytest.raises(ValueError, match="不可选择"):
+            _run(
+                apply_setting(
+                    config,
+                    runtime,
+                    context,
+                    {"key": "parallel_tool_use_allowlist", "value": invalid},
+                )
+            )
+
+    _run(
+        apply_setting(
+            config,
+            runtime,
+            context,
+            {"key": "parallel_tool_use_allowlist", "value": ["plugin_search"]},
+        )
+    )
+    assert config["parallel_tool_use_allowlist"] == ["plugin_search"]
+    _run(runtime.terminate())
+
+
+def test_tool_multi_blocks_names_shared_by_multiple_real_tools(fakes):
+    first = fake_catalog_tool("shared", module_path="plugins.first")
+    second = fake_catalog_tool("shared", module_path="plugins.second")
+    stars = [
+        type(
+            "Star",
+            (),
+            {
+                "module_path": module_path,
+                "name": name,
+                "display_name": name,
+            },
+        )()
+        for module_path, name in (
+            ("plugins.first", "第一个插件"),
+            ("plugins.second", "第二个插件"),
+        )
+    ]
+    manager = FakeToolManager([first, second])
+    context = FakeToolContext(manager, stars)
+    config = FakeConfig({"parallel_tool_use_allowlist": []})
+
+    setting = build_feature_settings(
+        config, "parallel_tool_use_enabled", context
+    )[0]
+    tool = next(
+        tool
+        for group in setting["groups"]
+        for tool in group["tools"]
+        if tool["name"] == "shared"
+    )
+
+    assert tool["selectable"] is False
+    assert "同名工具" in tool["blocked_reason"]
+
+    runtime = fakes.build_runtime(dict(config))
+    with pytest.raises(ValueError, match="不可选择"):
+        _run(
+            apply_setting(
+                config,
+                runtime,
+                context,
+                {"key": "parallel_tool_use_allowlist", "value": ["shared"]},
+            )
+        )
+    _run(runtime.terminate())
+
+
 def test_build_state_includes_settings_arrays():
     state = build_state({"optimize_identity_metadata": True})
     by_key = {f["key"]: f for f in state["features"]}
     assert len(by_key["optimize_identity_metadata"]["settings"]) == 4
     assert len(by_key["issue_assistant_enabled"]["settings"]) == 3
+    assert len(by_key["parallel_tool_use_enabled"]["settings"]) == 1
     assert "settings" not in by_key["fix_deepseek_v4_400"]
 
 
@@ -931,6 +1166,72 @@ def test_error_messages_never_leak_sensitive_values(fakes):
 # ---------------------------------------------------------------------------
 # Runtime 热同步
 # ---------------------------------------------------------------------------
+
+
+def test_closed_runtime_ignores_stale_dashboard_parallel_update(fakes):
+    """插件终止后，被 shield 保护的旧 Dashboard 保存任务不得重新激活并发工具。"""
+    runtime = fakes.build_runtime({})
+    calls = []
+    runtime.parallel_tool_use.install = lambda: calls.append("install") or True
+    runtime.parallel_tool_use.terminate = lambda: calls.append("terminate")
+    runtime._closed = True  # terminate() 的第一步；此后到达的都是过期保存任务。
+
+    runtime.update_dashboard_switch("parallel_tool_use_enabled", True)
+    runtime.update_dashboard_setting("parallel_tool_use_allowlist", ["some_tool"])
+
+    assert calls == []
+    assert runtime.config["parallel_tool_use_enabled"] is True
+    assert runtime.config["parallel_tool_use_allowlist"] == ["some_tool"]
+
+
+def _install_parallel_with_fake_runner(runtime, monkeypatch):
+    class Runner:
+        async def _handle_function_tools(self, req, llm_response):
+            if False:
+                yield None
+
+    monkeypatch.setattr(
+        runtime.parallel_tool_use, "_load_runner_cls", lambda: Runner
+    )
+    runtime._configure_parallel_tool_use()
+    return Runner
+
+
+def test_lifecycle_rechecks_yield_and_heal_parallel_registration(fakes, monkeypatch):
+    """后加载同名工具在 on_astrbot_loaded 重检时让名，卸载后由请求重检自愈。"""
+    runtime = fakes.build_runtime(
+        {
+            "parallel_tool_use_enabled": True,
+            "parallel_tool_use_allowlist": ["some_tool"],
+        }
+    )
+    runner_cls = _install_parallel_with_fake_runner(runtime, monkeypatch)
+    module = runtime.parallel_tool_use
+    manager = runtime.context.provider_manager.llm_tools
+    assert module._registered_tool is not None
+
+    # 后加载插件按真实 add_func 语义注册同名工具：先按名删除再追加。
+    foreign = SimpleNamespace(
+        name="astrna_parallel_tool_use", active=True, handler=None
+    )
+    manager.func_list[:] = [
+        tool
+        for tool in manager.func_list
+        if getattr(tool, "name", None) != "astrna_parallel_tool_use"
+    ]
+    manager.func_list.append(foreign)
+
+    _run(runtime.on_astrbot_loaded())
+
+    assert module._registered_tool is None
+    assert manager.func_list[-1] is foreign
+    assert runner_cls._handle_function_tools.__name__ == "_handle_function_tools"
+
+    # 第三方卸载后，sanitize_request 的每请求重检自愈。
+    manager.func_list.remove(foreign)
+    _run(runtime.sanitize_request(fakes.Event(), fakes.Request(contexts=[])))
+    assert module._registered_tool is not None
+    _run(runtime.terminate())
 
 
 def test_runtime_hot_sync_output_length_group(fakes):
