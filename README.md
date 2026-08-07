@@ -5,9 +5,9 @@ AstrNa 是一款面向 AstrBot 的优化插件，目标是在不修改 AstrBot C
 > 💌 售后：`777879783`
 > 有问题请加，清漪也会蹦出来一起捣鼓。
 
-🎉 AstrNa 当前正式版：`1.5.3`
+🎉 AstrNa 当前正式版：`1.5.4`
 
-当前已测试兼容 AstrBot 版本：`4.27.1`
+当前已测试兼容 AstrBot 版本：`4.27.2`
 
 - 仓库地址：[Sisyphbaous-DT-Project/astrbot_plugin_AstrNa](https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_AstrNa)
 - 作者主页：[Sisyphbaous-DT-Project](https://github.com/Sisyphbaous-DT-Project)
@@ -468,7 +468,7 @@ GitHub Token 是可选的。留空时只能生成草稿，不能自动提交。�
 
 ## 兼容性
 
-AstrNa 主要面向 AstrBot 当前 4.x 版本。当前正式版 `1.5.3` 已在 AstrBot `4.27.1` 源码环境中完成回归验证。
+AstrNa 主要面向 AstrBot 当前 4.x 版本。当前正式版 `1.5.4` 已在 AstrBot `4.27.2` 源码环境中完成回归验证。
 
 部分能力依赖平台：
 
@@ -477,7 +477,7 @@ AstrNa 主要面向 AstrBot 当前 4.x 版本。当前正式版 `1.5.3` 已在 A
 - 图像转述优化依赖 AstrBot 自带图片转述模型。
 - 图片历史上下文优化只清理 conversation history 中的 `data:image/...;base64` 图片块，不会改动当前请求的 `req.image_urls`。
 - 工具调用历史上下文优化只压缩已闭合工具事务的历史 `tool.content`；保留工具调用配对和最终回答，不处理当前 Agent Loop，也不移除每轮固定工具定义 schema。
-- LLM 并发工具调用依赖 AstrBot `4.27.1` 的真实请求 ToolSet、权限包装、Runner 钩子和原生工具执行器；允许名单不扩大当前会话权限范围，其他版本若更改这些内部入口会自动拒绝安装或拒绝执行。
+- LLM 并发工具调用依赖 AstrBot `4.27.2` 的真实请求 ToolSet、权限包装、Runner 钩子和原生工具执行器；允许名单不扩大当前会话权限范围，其他版本若更改这些内部入口会自动拒绝安装或拒绝执行。
 - 引用图片视觉输入优化依赖 AstrBot 自带引用图片解析能力；AstrNa 会兼容 NapCat / aiocqhttp 下 `bot.call_action` 的取图方式，并在当前 Reply 本地临时图片路径失效时尝试通过 OneBot 接口重新取图，只补当前 Reply 引用图片，可能增加本轮图片 token。
 - 回复历史标记依赖平台提供可靠的引用消息发送者信息；QQ 官方 Bot 当前引用消息缺少这个字段，无法安全区分被引用消息发送者和当前发言人，因此不支持该平台的引用回复指向优化。
 - 合并转发相关优化依赖 AstrBot 或输出插件使用标准 `Node` / `Nodes` 消息组件；OutputPro 生成的标准合并转发也会进入发送失败自适应拆包重试。
@@ -490,7 +490,7 @@ AstrNa 主要面向 AstrBot 当前 4.x 版本。当前正式版 `1.5.3` 已在 A
 
 ## 验证状态
 
-最近版本发布前通过以下验证，当前已测试兼容 AstrBot `4.27.1`：
+最近版本发布前通过以下验证，当前已测试兼容 AstrBot `4.27.2`：
 
 ```bash
 TMPDIR=/tmp PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q -s
@@ -500,7 +500,7 @@ python -m compileall -q .
 git diff --check
 ```
 
-默认环境全量测试结果为 `729 passed, 9 skipped`；绑定 AstrBot `4.27.1` 源码运行全量测试结果为 `738 passed`。同时核对了 AstrNa 依赖的 Agent、发送、唤醒、消息事件和历史保存入口，以及 Responses API、内置 Skill 和持久化群消息历史相关更新，未发现需要针对该版本调整的运行时补丁。
+默认环境全量测试结果为 `808 passed, 11 skipped`；绑定 AstrBot `4.27.2` 源码运行全量测试结果为 `819 passed`（仅 1 条第三方弃用警告）。同时核对了 AstrNa 依赖的 Agent、发送、唤醒、消息事件和历史保存入口，`v4.27.1` 到 `v4.27.2` 的变更不涉及这些共享面，未发现需要针对该版本调整的运行时补丁。
 
 ## 设计原则
 

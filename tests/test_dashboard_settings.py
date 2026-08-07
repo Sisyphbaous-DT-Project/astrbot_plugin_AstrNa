@@ -487,6 +487,302 @@ def test_tool_multi_blocks_names_shared_by_multiple_real_tools(fakes):
     _run(runtime.terminate())
 
 
+# ---------------------------------------------------------------------------
+# 插件来源根目录匹配
+# ---------------------------------------------------------------------------
+
+
+def fake_star(
+    module_path,
+    name,
+    display_name=None,
+    root_dir_name=None,
+    reserved=False,
+):
+    attrs = {
+        "module_path": module_path,
+        "name": name,
+        "display_name": display_name or name,
+        "reserved": reserved,
+    }
+    if root_dir_name is not None:
+        attrs["root_dir_name"] = root_dir_name
+    return type("Star", (), attrs)()
+
+
+def _tool_groups(tools, stars, config=None):
+    context = FakeToolContext(FakeToolManager(tools), stars)
+    setting = build_feature_settings(
+        config or {}, "parallel_tool_use_enabled", context
+    )[0]
+    return setting["groups"]
+
+
+def _tool_entry(groups, name):
+    for group in groups:
+        for tool in group["tools"]:
+            if tool["name"] == name:
+                return tool
+    raise AssertionError(f"工具 {name} 不在目录中")
+
+
+def test_tool_multi_matches_plugin_root_irmia_devkit_shape():
+    # 弥亚现场：Star 正式路径带 .main，工具被统一改到插件根路径。
+    star = fake_star(
+        "data.plugins.astrbot_plugin_irmia_devkit.main",
+        "astrbot_plugin_irmia_devkit",
+        display_name="弥亚开发工具箱",
+        root_dir_name="astrbot_plugin_irmia_devkit",
+    )
+    tool = fake_catalog_tool(
+        "devkit_lookup", module_path="data.plugins.astrbot_plugin_irmia_devkit"
+    )
+    entry = _tool_entry(_tool_groups([tool], [star]), "devkit_lookup")
+    assert entry["source_type"] == "plugin"
+    assert entry["source_id"] == "astrbot_plugin_irmia_devkit"
+    assert entry["selectable"] is True
+    assert entry["blocked_reason"] is None
+
+
+def test_tool_multi_groups_main_root_and_submodule_under_same_plugin():
+    star = fake_star(
+        "data.plugins.astrbot_plugin_suite.main",
+        "astrbot_plugin_suite",
+        root_dir_name="astrbot_plugin_suite",
+    )
+    tools = [
+        fake_catalog_tool(
+            "via_main", module_path="data.plugins.astrbot_plugin_suite.main"
+        ),
+        fake_catalog_tool(
+            "via_root", module_path="data.plugins.astrbot_plugin_suite"
+        ),
+        fake_catalog_tool(
+            "via_sub", module_path="data.plugins.astrbot_plugin_suite.tools.helper"
+        ),
+    ]
+    groups = _tool_groups(tools, [star])
+    assert len(groups) == 1
+    assert groups[0]["source_type"] == "plugin"
+    assert groups[0]["source_id"] == "astrbot_plugin_suite"
+    assert {tool["name"] for tool in groups[0]["tools"]} == {
+        "via_main",
+        "via_root",
+        "via_sub",
+    }
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "data.plugins.foobar.main",
+        "data.plugins.foo_extra.main",
+        "data.plugins.foo2",
+        "other.data.plugins.foo",
+        "astrbot_plugin_foo",
+        "astrbot_plugin_foo.tools",
+    ],
+)
+def test_tool_multi_rejects_paths_outside_segment_boundary(path):
+    star = fake_star(
+        "data.plugins.foo.main",
+        "astrbot_plugin_foo",
+        root_dir_name="foo",
+    )
+    tool = fake_catalog_tool("boundary_tool", module_path=path)
+    entry = _tool_entry(_tool_groups([tool], [star]), "boundary_tool")
+    assert entry["source_type"] == "unknown"
+    assert entry["selectable"] is False
+
+
+def test_tool_multi_namespaces_do_not_cross_claim():
+    reserved_star = fake_star(
+        "astrbot.builtin_stars.corestar.main",
+        "corestar",
+        root_dir_name="corestar",
+        reserved=True,
+    )
+    normal_star = fake_star(
+        "data.plugins.web.main",
+        "astrbot_plugin_web",
+        root_dir_name="web",
+    )
+    tools = [
+        fake_catalog_tool("under_reserved", module_path="astrbot.builtin_stars.corestar"),
+        fake_catalog_tool("cross_normal", module_path="data.plugins.corestar"),
+        fake_catalog_tool("cross_reserved", module_path="astrbot.builtin_stars.web"),
+    ]
+    groups = _tool_groups(tools, [reserved_star, normal_star])
+    assert _tool_entry(groups, "under_reserved")["source_type"] == "plugin"
+    assert _tool_entry(groups, "under_reserved")["source_id"] == "corestar"
+    for name in ("cross_normal", "cross_reserved"):
+        assert _tool_entry(groups, name)["source_type"] == "unknown"
+
+
+def test_tool_multi_contradictory_root_dir_name_keeps_exact_only():
+    # metadata 根与正式路径矛盾：只保留正式精确匹配，不扩展根目录。
+    star = fake_star(
+        "data.plugins.real.main",
+        "astrbot_plugin_real",
+        root_dir_name="fake",
+    )
+    tools = [
+        fake_catalog_tool("exact_tool", module_path="data.plugins.real.main"),
+        fake_catalog_tool("sub_tool", module_path="data.plugins.real.tools"),
+        fake_catalog_tool("fake_tool", module_path="data.plugins.fake"),
+    ]
+    groups = _tool_groups(tools, [star])
+    assert _tool_entry(groups, "exact_tool")["source_type"] == "plugin"
+    assert _tool_entry(groups, "sub_tool")["source_type"] == "unknown"
+    assert _tool_entry(groups, "fake_tool")["source_type"] == "unknown"
+
+
+def test_tool_multi_shared_root_between_plugins_falls_back_to_unknown():
+    stars = [
+        fake_star(
+            "data.plugins.dup.main",
+            "astrbot_plugin_dup_a",
+            root_dir_name="dup",
+        ),
+        fake_star(
+            "data.plugins.dup.extra",
+            "astrbot_plugin_dup_b",
+            root_dir_name="dup",
+        ),
+    ]
+    tools = [
+        fake_catalog_tool("root_tool", module_path="data.plugins.dup"),
+        fake_catalog_tool("main_tool", module_path="data.plugins.dup.main"),
+    ]
+    groups = _tool_groups(tools, stars)
+    # 根路径被两个插件争用：不可安全归属；正式精确路径不受影响。
+    assert _tool_entry(groups, "root_tool")["source_type"] == "unknown"
+    main = _tool_entry(groups, "main_tool")
+    assert main["source_type"] == "plugin"
+    assert main["source_id"] == "astrbot_plugin_dup_a"
+
+
+def test_tool_multi_shared_module_path_between_plugins_falls_back_to_unknown():
+    stars = [
+        fake_star("data.plugins.same.main", "astrbot_plugin_same_a"),
+        fake_star("data.plugins.same.main", "astrbot_plugin_same_b"),
+    ]
+    tool = fake_catalog_tool("exact_tool", module_path="data.plugins.same.main")
+    entry = _tool_entry(_tool_groups([tool], stars), "exact_tool")
+    assert entry["source_type"] == "unknown"
+    assert entry["selectable"] is False
+
+
+def test_tool_multi_stars_sharing_root_path_itself_fall_back_to_unknown():
+    # 两个不同插件的正式 module_path 都等于同一插件根路径：精确冲突
+    # 不得被根目录匹配重新认给先登记的插件。
+    stars = [
+        fake_star(
+            "data.plugins.same", "astrbot_plugin_same_a", root_dir_name="same"
+        ),
+        fake_star(
+            "data.plugins.same", "astrbot_plugin_same_b", root_dir_name="same"
+        ),
+    ]
+    tool = fake_catalog_tool("root_tool", module_path="data.plugins.same")
+    entry = _tool_entry(_tool_groups([tool], stars), "root_tool")
+    assert entry["source_type"] == "unknown"
+    assert entry["selectable"] is False
+
+
+def test_tool_multi_stars_sharing_derived_root_path_fall_back_to_unknown():
+    # root_dir_name 缺失、根由正式路径推导时，同一路径冲突同样回落 unknown。
+    stars = [
+        fake_star("data.plugins.same", "astrbot_plugin_same_a"),
+        fake_star("data.plugins.same", "astrbot_plugin_same_b"),
+    ]
+    tool = fake_catalog_tool("root_tool", module_path="data.plugins.same")
+    entry = _tool_entry(_tool_groups([tool], stars), "root_tool")
+    assert entry["source_type"] == "unknown"
+    assert entry["selectable"] is False
+
+
+def test_tool_multi_conflicted_root_with_contradictory_metadata_stays_unknown():
+    # 一方 root_dir_name 与正式路径矛盾（不产生根所有者）时，
+    # 冲突路径也不能被另一方单独认领。
+    stars = [
+        fake_star(
+            "data.plugins.same", "astrbot_plugin_same_a", root_dir_name="same"
+        ),
+        fake_star(
+            "data.plugins.same", "astrbot_plugin_same_b", root_dir_name="other"
+        ),
+    ]
+    tool = fake_catalog_tool("root_tool", module_path="data.plugins.same")
+    entry = _tool_entry(_tool_groups([tool], stars), "root_tool")
+    assert entry["source_type"] == "unknown"
+    assert entry["selectable"] is False
+
+
+def test_tool_multi_malformed_stars_and_paths_degrade_safely():
+    class ExplodingStar:
+        @property
+        def module_path(self):
+            raise RuntimeError("bad star")
+
+    stars = [
+        ExplodingStar(),
+        fake_star(None, "astrbot_plugin_broken"),
+        fake_star("", "astrbot_plugin_empty"),
+        fake_star(
+            "data.plugins.good.main",
+            "astrbot_plugin_good",
+            root_dir_name="good",
+        ),
+    ]
+    tools = [
+        fake_catalog_tool("good_tool", module_path="data.plugins.good"),
+        fake_catalog_tool("no_path_tool", module_path=None),
+        fake_catalog_tool("empty_segment_tool", module_path="data.plugins..good"),
+        fake_catalog_tool("whitespace_tool", module_path=" data.plugins.good"),
+    ]
+    groups = _tool_groups(tools, stars)
+    assert _tool_entry(groups, "good_tool")["source_type"] == "plugin"
+    for name in ("no_path_tool", "empty_segment_tool", "whitespace_tool"):
+        assert _tool_entry(groups, name)["source_type"] == "unknown"
+
+
+def test_tool_multi_transaction_saves_irmia_shaped_tool_name(fakes):
+    star = fake_star(
+        "data.plugins.astrbot_plugin_irmia_devkit.main",
+        "astrbot_plugin_irmia_devkit",
+        root_dir_name="astrbot_plugin_irmia_devkit",
+    )
+    tool = fake_catalog_tool(
+        "devkit_lookup", module_path="data.plugins.astrbot_plugin_irmia_devkit"
+    )
+    context = FakeToolContext(FakeToolManager([tool]), [star])
+    config = FakeConfig({"parallel_tool_use_allowlist": []})
+    runtime = fakes.build_runtime(dict(config))
+
+    result = _run(
+        apply_setting(
+            config,
+            runtime,
+            context,
+            {"key": "parallel_tool_use_allowlist", "value": ["devkit_lookup"]},
+        )
+    )
+    assert config["parallel_tool_use_allowlist"] == ["devkit_lookup"]
+    assert result["feature"]["details"]["allowlist_count"] == 1
+
+    with pytest.raises(ValueError, match="不可选择"):
+        _run(
+            apply_setting(
+                config,
+                runtime,
+                context,
+                {"key": "parallel_tool_use_allowlist", "value": ["forged"]},
+            )
+        )
+    _run(runtime.terminate())
+
+
 def test_build_state_includes_settings_arrays():
     state = build_state({"optimize_identity_metadata": True})
     by_key = {f["key"]: f for f in state["features"]}

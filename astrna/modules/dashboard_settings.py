@@ -377,27 +377,138 @@ def _tool_manager(context: Any) -> Any:
         return None
 
 
-def _plugin_sources(context: Any) -> dict[str, tuple[str, str]]:
-    """handler_module_path -> (稳定插件名, 显示名)。"""
+def _clean_path_segment(segment: Any) -> bool:
+    """单个模块路径段必须是非空、无首尾空白且不含 ``.`` 的字符串。"""
+    return (
+        isinstance(segment, str)
+        and bool(segment)
+        and segment == segment.strip()
+        and "." not in segment
+    )
+
+
+def _valid_module_path(value: Any) -> bool:
+    """模块路径必须是非空字符串，无首尾空白且不含空路径段。"""
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    return all(value.split("."))
+
+
+def _star_plugin_root(star: Any, module_path: str) -> str | None:
+    """返回该 Star 可代表的插件根路径；无法确认归属时返回 None。
+
+    普通插件的正式根是 ``data.plugins.<root_dir_name>``，保留插件是
+    ``astrbot.builtin_stars.<root_dir_name>``。只有 Star 的正式
+    ``module_path`` 等于该根或位于其下（严格 ``.`` 段边界）时才允许
+    该根代表此插件，防止错误的 ``root_dir_name`` 冒领无关命名空间；
+    根与正式路径矛盾时不扩展根目录。``root_dir_name`` 缺失时只从以
+    ``data.plugins.``、``astrbot.builtin_stars.`` 或旧式 ``plugins.``
+    开头的正式 ``module_path`` 自身推导根，不扫描路径中间出现的
+    ``plugins``，也不兼容裸插件目录名。
+    """
+    reserved = bool(getattr(star, "reserved", False))
+    root_dir = getattr(star, "root_dir_name", None)
+    if isinstance(root_dir, str) and _clean_path_segment(root_dir):
+        prefix = "astrbot.builtin_stars." if reserved else "data.plugins."
+        root = prefix + root_dir
+        if module_path == root or module_path.startswith(root + "."):
+            return root
+        return None
+    for prefix in ("data.plugins.", "astrbot.builtin_stars.", "plugins."):
+        if module_path.startswith(prefix):
+            segment = module_path[len(prefix) :].split(".", 1)[0]
+            if _clean_path_segment(segment):
+                return prefix + segment
+            return None
+    return None
+
+
+def _plugin_source_index(
+    context: Any,
+) -> tuple[dict[str, tuple[str, str]], dict[str, tuple[str, str]]]:
+    """返回 (精确 module_path 映射, 插件根映射)，值均为 (稳定插件名, 显示名)。
+
+    来源识别只供 Dashboard 目录分组与允许名单编辑使用，绝不授予执行
+    权限；并发执行仍由真实 ToolSet、允许名单、Runtime 名单与 AstrBot
+    权限复核决定。禁止未来把这里的解析结果作为执行授权依据。
+    """
+    empty: tuple[dict[str, tuple[str, str]], dict[str, tuple[str, str]]] = ({}, {})
     getter = getattr(context, "get_all_stars", None)
     if not callable(getter):
-        return {}
+        return empty
     try:
         stars = getter()
     except Exception:  # noqa: BLE001
-        return {}
-    result: dict[str, tuple[str, str]] = {}
+        return empty
     if not isinstance(stars, (list, tuple)):
-        return result
+        return empty
+    exact: dict[str, tuple[str, str]] = {}
+    conflicted_paths: set[str] = set()
+    root_info: dict[str, tuple[str, str]] = {}
+    root_owners: dict[str, set[str]] = {}
     for star in stars:
-        module_path = getattr(star, "module_path", None)
-        name = getattr(star, "name", None)
-        if not isinstance(module_path, str) or not module_path:
+        try:
+            module_path = getattr(star, "module_path", None)
+            name = getattr(star, "name", None)
+            if not _valid_module_path(module_path):
+                continue
+            stable_name = str(name or module_path)
+            display_name = str(getattr(star, "display_name", None) or stable_name)
+            existing = exact.get(module_path)
+            if existing is not None and existing[0] != stable_name:
+                # 两个不同插件争用同一正式路径：双方都不得精确命中；
+                # 该路径若同时是插件根，也必须在最终根索引中剔除，
+                # 否则冲突路径会被根匹配重新认给先登记的插件。
+                conflicted_paths.add(module_path)
+                del exact[module_path]
+            elif module_path not in conflicted_paths:
+                exact[module_path] = (stable_name, display_name)
+            # 根所有者始终照常登记：即使根本身处于精确冲突中，也要让
+            # 争用双方都留下记录，由最终过滤统一剔除，避免只剩单所有者。
+            root = _star_plugin_root(star, module_path)
+            if root is None:
+                continue
+            root_owners.setdefault(root, set()).add(stable_name)
+            root_info.setdefault(root, (stable_name, display_name))
+        except Exception:  # noqa: BLE001 - 一个坏插件不能拖垮整个工具目录
             continue
-        stable_name = str(name or module_path)
-        display_name = str(getattr(star, "display_name", None) or stable_name)
-        result[module_path] = (stable_name, display_name)
-    return result
+    roots = {
+        root: root_info[root]
+        for root, owners in root_owners.items()
+        if len(owners) == 1 and root not in conflicted_paths
+    }
+    return exact, roots
+
+
+def _match_plugin_source(
+    exact: Mapping[str, tuple[str, str]],
+    roots: Mapping[str, tuple[str, str]],
+    module_path: Any,
+) -> tuple[str, str] | None:
+    """解析工具的插件来源：正式 module_path 精确命中优先，其次段边界根匹配。
+
+    根匹配必须使用 ``path == root`` 或 ``path.startswith(root + ".")``，
+    禁止裸 ``startswith``，确保 ``foo`` 不会认领 ``foobar``、``foo_extra``
+    或 ``foo2``。多个不同插件的根同时命中同一工具路径时视为来源冲突，
+    返回 None（目录归为 unknown 且不可选择）。
+    """
+    if not _valid_module_path(module_path):
+        return None
+    hit = exact.get(module_path)
+    if hit is not None:
+        return hit
+    matches = [
+        (root, info)
+        for root, info in roots.items()
+        if module_path == root or module_path.startswith(root + ".")
+    ]
+    if not matches:
+        return None
+    owners = {info[0] for _, info in matches}
+    if len(owners) != 1:
+        return None
+    matches.sort(key=lambda item: len(item[0]), reverse=True)
+    return matches[0][1]
 
 
 def _tool_permission_snapshot() -> dict[str, str]:
@@ -488,7 +599,7 @@ def _build_tool_groups(
         for item in _current_list(config, "parallel_tool_use_allowlist")
         if isinstance(item, str) and item
     ]
-    plugin_sources = _plugin_sources(context)
+    plugin_exact, plugin_roots = _plugin_source_index(context)
     groups: dict[tuple[str, str], dict[str, Any]] = {}
     known_names: set[str] = set()
     builtin_tools = _iter_builtin_catalog_tools(manager)
@@ -515,7 +626,7 @@ def _build_tool_groups(
             source_display_name = f"MCP：{source_id}"
         else:
             module_path = getattr(tool, "handler_module_path", None)
-            plugin = plugin_sources.get(module_path)
+            plugin = _match_plugin_source(plugin_exact, plugin_roots, module_path)
             if plugin is not None:
                 source_type = "plugin"
                 source_id, display = plugin

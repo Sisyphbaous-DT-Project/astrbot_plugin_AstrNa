@@ -213,3 +213,159 @@ def test_tool_multi_uses_two_level_view_and_preserves_dirty_draft():
     assert "nextCatalog !== catalogBase" in text
     assert "失效项只能取消" in text
     assert "tool_multi: makeToolMultiControl" in text
+
+
+# ---------------------------------------------------------------------------
+# tool_multi 渲染守卫（Node 行为测试 + 接线静态断言）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="需要 Node.js 校验渲染守卫")
+def test_render_guard_skip_and_scroll_memory_behavior():
+    source = base64.b64encode(
+        (DASHBOARD_JS / "settings-render-guard.js").read_bytes()
+    ).decode("ascii")
+    script = rf"""
+      import assert from "node:assert/strict";
+      const moduleUrl = "data:text/javascript;base64,{source}";
+      const {{
+        SOURCE_LIST_VIEW_KEY,
+        buildToolVisualSignature,
+        clampScroll,
+        createRenderGuard,
+        toolGroupViewKey,
+      }} = await import(moduleUrl);
+
+      const catalog = [
+        {{
+          source_type: "plugin",
+          source_id: "astrbot_plugin_irmia_devkit",
+          display_name: "插件：弥亚开发工具箱",
+          tools: [
+            {{
+              name: "devkit_lookup",
+              description: "查询",
+              source_type: "plugin",
+              source_id: "astrbot_plugin_irmia_devkit",
+              display_name: "devkit_lookup",
+              active: true,
+              permission: "member",
+              selectable: true,
+              blocked_reason: null,
+            }},
+          ],
+        }},
+      ];
+      const baseParts = {{
+        groups: catalog,
+        shown: ["devkit_lookup"],
+        known: true,
+        dirty: false,
+        busy: false,
+        readOnly: false,
+        conflict: false,
+        viewKey: SOURCE_LIST_VIEW_KEY,
+      }};
+      const groupKey = toolGroupViewKey(catalog[0]);
+      assert.equal(groupKey, "plugin:astrbot_plugin_irmia_devkit");
+      assert.notEqual(groupKey, SOURCE_LIST_VIEW_KEY);
+
+      // 首次渲染不得跳过。
+      const guard = createRenderGuard();
+      const firstSig = buildToolVisualSignature(baseParts);
+      assert.equal(guard.plan(firstSig, SOURCE_LIST_VIEW_KEY).skip, false);
+      guard.commit(firstSig, SOURCE_LIST_VIEW_KEY);
+
+      // 轮询返回新对象但内容相同：签名相同，必须跳过。
+      const polled = buildToolVisualSignature({{
+        ...baseParts,
+        groups: JSON.parse(JSON.stringify(catalog)),
+        shown: [...baseParts.shown],
+      }});
+      assert.equal(polled, firstSig);
+      assert.equal(guard.plan(polled, SOURCE_LIST_VIEW_KEY).skip, true);
+
+      // 状态未知（known=false → shown 为 null）与空名单必须区分。
+      const unknownSig = buildToolVisualSignature({{
+        ...baseParts, shown: null, known: false,
+      }});
+      const emptySig = buildToolVisualSignature({{ ...baseParts, shown: [] }});
+      assert.notEqual(unknownSig, emptySig);
+
+      // 目录、显示值、dirty、busy、readOnly、conflict、视图任一变化都必须重画。
+      const variants = [
+        {{ ...baseParts, groups: [] }},
+        {{ ...baseParts, shown: [] }},
+        {{ ...baseParts, dirty: true }},
+        {{ ...baseParts, busy: true }},
+        {{ ...baseParts, readOnly: true }},
+        {{ ...baseParts, conflict: true }},
+        {{ ...baseParts, viewKey: groupKey }},
+      ];
+      for (const parts of variants) {{
+        const sig = buildToolVisualSignature(parts);
+        assert.notEqual(sig, firstSig);
+        assert.equal(guard.plan(sig, parts.viewKey).skip, false);
+      }}
+
+      // 视图导航：来源页滚动位置按视图键分别记忆。
+      const nav = createRenderGuard();
+      const sourceSig = buildToolVisualSignature(baseParts);
+      assert.equal(nav.plan(sourceSig, SOURCE_LIST_VIEW_KEY).viewChanged, false);
+      nav.commit(sourceSig, SOURCE_LIST_VIEW_KEY);
+      nav.rememberInner(SOURCE_LIST_VIEW_KEY, 300);
+
+      // 进入工具来源：视图切换，新视图首次从顶部开始。
+      const groupSig = buildToolVisualSignature({{ ...baseParts, viewKey: groupKey }});
+      const into = nav.plan(groupSig, groupKey);
+      assert.equal(into.skip, false);
+      assert.equal(into.viewChanged, true);
+      assert.equal(nav.innerFor(groupKey), 0);
+      nav.commit(groupSig, groupKey);
+      nav.rememberInner(groupKey, 80);
+
+      // 同视图重画（勾选/轮询变化）：不视为导航，恢复本视图位置。
+      const regroupSig = buildToolVisualSignature({{
+        ...baseParts, shown: [], viewKey: groupKey,
+      }});
+      assert.equal(nav.plan(regroupSig, groupKey).viewChanged, false);
+      assert.equal(nav.innerFor(groupKey), 80);
+      nav.commit(regroupSig, groupKey);
+
+      // 返回来源页：恢复来源页自己的旧位置，不继承工具页位置。
+      assert.equal(nav.innerFor(SOURCE_LIST_VIEW_KEY), 300);
+
+      // 夹值：内容缩短或非法输入安全收缩。
+      assert.equal(clampScroll(300, 120), 120);
+      assert.equal(clampScroll(-5, 120), 0);
+      assert.equal(clampScroll(Number.NaN, 120), 0);
+      assert.equal(clampScroll(50, Number.NaN), 0);
+      nav.rememberInner(groupKey, -10);
+      assert.equal(nav.innerFor(groupKey), 0);
+    """
+    subprocess.run(
+        ["node", "--input-type=module", "--eval", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_tool_multi_render_guard_wiring():
+    text = _read("settings-window.js")
+    # 渲染守卫必须以相对导入接入 tool_multi 控件。
+    assert 'from "./settings-render-guard.js"' in text
+    assert "buildToolVisualSignature" in text
+    assert "createRenderGuard()" in text
+    # 签名相同直接返回，不得触碰 innerHTML。
+    assert "if (renderGuard.plan(signature, viewKey).skip) return;" in text
+    # 重画前保存当前视图内层位置，重画后按视图键恢复并夹值。
+    assert "renderGuard.rememberInner(previousViewKey, previousInner.scrollTop);" in text
+    assert "renderGuard.innerFor(viewKey)" in text
+    assert "clampScroll(" in text
+    # 外层 .settings-main 位置在重画与来源导航中始终保持。
+    assert 'wrap.closest(".settings-main")' in text
+    assert "scroller.scrollTop = clampScroll(" in text
+    # 同步恢复，不用无令牌 requestAnimationFrame（注释允许提及，禁止真实调用）。
+    render = text.split("function makeToolMultiControl(setting) {", 1)[1]
+    assert "requestAnimationFrame(" not in render

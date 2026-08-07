@@ -6,6 +6,13 @@
 
 import { confirmDialog, errorDialog } from "./modal.js";
 import { mountSettingAnimation } from "./setting-animations.js";
+import {
+  buildToolVisualSignature,
+  clampScroll,
+  createRenderGuard,
+  SOURCE_LIST_VIEW_KEY,
+  toolGroupViewKey,
+} from "./settings-render-guard.js";
 
 const STEP_BY_KEY = {
   forward_node_max_length: 100,
@@ -516,9 +523,10 @@ export function openSettings({
     control.displayValue = () => (control.dirty ? control.draft : control.base);
     let activeGroupKey = null;
 
-    const groupKey = (group) => `${group.source_type}:${group.source_id}`;
+    const groupKey = toolGroupViewKey;
     const catalogSignature = (current) => JSON.stringify((current && current.groups) || []);
     let catalogBase = catalogSignature(setting);
+    const renderGuard = createRenderGuard();
 
     const setDraft = (next) => {
       control.draft = [...new Set(next)];
@@ -540,7 +548,6 @@ export function openSettings({
     };
 
     control.render = () => {
-      wrap.innerHTML = "";
       const current = getSetting(setting.key) || setting;
       const groups = Array.isArray(current.groups) ? current.groups : [];
       const rawShown = control.dirty ? control.draft : control.base;
@@ -552,6 +559,33 @@ export function openSettings({
         activeGroupKey = null;
         activeGroup = null;
       }
+      const viewKey = activeGroup ? activeGroupKey : SOURCE_LIST_VIEW_KEY;
+      const signature = buildToolVisualSignature({
+        groups,
+        shown,
+        known,
+        dirty: control.dirty,
+        busy: control.busy,
+        readOnly: readOnly(),
+        conflict: control.conflict,
+        viewKey,
+      });
+      // 视觉签名完全相同的轮询/保存回调不得重建列表：节点必须保持身份，
+      // 内层滚动与焦点才不会被重置。
+      if (renderGuard.plan(signature, viewKey).skip) return;
+
+      // 确实需要重画：先保存外层窗口与当前视图内层列表的滚动位置。
+      const scroller = wrap.closest(".settings-main");
+      const outerTop = scroller ? scroller.scrollTop : 0;
+      const previousViewKey = renderGuard.currentViewKey();
+      const previousInner = wrap.querySelector(
+        ".tool-source-list, .tool-option-list",
+      );
+      if (previousViewKey && previousInner) {
+        renderGuard.rememberInner(previousViewKey, previousInner.scrollTop);
+      }
+
+      wrap.innerHTML = "";
 
       const summary = document.createElement("div");
       summary.className = "tool-multi-summary";
@@ -690,6 +724,26 @@ export function openSettings({
       footer.appendChild(applyBtn);
       wrap.appendChild(footer);
       wrap.classList.toggle("conflict", control.conflict);
+
+      // 恢复滚动：外层窗口在所有重画与来源导航中始终保持；内层按视图键
+      // 恢复各自记忆的位置（新视图默认 0，即首次从顶部开始），恢复值随
+      // 内容缩短安全夹取。同步完成，不用无令牌 requestAnimationFrame。
+      if (scroller) {
+        scroller.scrollTop = clampScroll(
+          outerTop,
+          scroller.scrollHeight - scroller.clientHeight,
+        );
+      }
+      const nextInner = wrap.querySelector(
+        ".tool-source-list, .tool-option-list",
+      );
+      if (nextInner) {
+        nextInner.scrollTop = clampScroll(
+          renderGuard.innerFor(viewKey),
+          nextInner.scrollHeight - nextInner.clientHeight,
+        );
+      }
+      renderGuard.commit(signature, viewKey);
     };
 
     control.applyServerState = (nextSetting) => {
