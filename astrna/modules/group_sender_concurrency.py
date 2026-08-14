@@ -98,6 +98,25 @@ class SendRound:
             self.acquired = False
 
 
+@dataclass(slots=True)
+class _SenderStopCallbackRecord:
+    """群发送者 Runner 在 AstrBot 4.27.3 事件级停止回调表中的登记记录。
+
+    只弱引用 Runner/事件/callback，不反向保活任何对象：registry 持有
+    callback 期间事件与 Runner 必然存活，scheduler 收尾或功能关闭后记录
+    随对象回收自动失效。``owner_ref`` 标记登记实例，安装失败的最终清理
+    只能动自己拥有的记录。注销与替换按 callback 身份（``same_callable``）
+    核对，避免误删外部覆盖者或新 Runtime 接管的回调。
+    """
+
+    sender_key: tuple[str, str]
+    owner_ref: Any
+    runner_ref: Any
+    event_ref: Any
+    registry: Any
+    callback_ref: Any
+
+
 class GroupSenderConcurrencyModule:
     """解锁群聊内不同发送者的 LLM 并发，同时保护会话历史写入。"""
 
@@ -133,6 +152,11 @@ class GroupSenderConcurrencyModule:
     _internal_unregister_runner_wrapper: Any = None
     _internal_try_capture_wrapper: Any = None
     _active_module: GroupSenderConcurrencyModule | None = None
+    # 停止回调记录在同一代模块内跨实例共享：AstrBot reload 先 terminate
+    # 旧插件再 load 新插件，实例级记录会让旧实例 terminate 注销仍在途
+    # Runner 的回调；跨模块代则依靠 registry 单例存活与 scheduler 收尾。
+    # 回调只引用 Runner 本身，terminate 不应主动注销。
+    _stop_callback_records: dict[tuple[str, str], _SenderStopCallbackRecord] = {}
 
     def __init__(self, logger: Any):
         self.logger = logger
@@ -161,6 +185,13 @@ class GroupSenderConcurrencyModule:
             and follow_up_installed
         ):
             type(self).restore_patch()
+            # preserve_state=True 后重装失败属于最终失败：清理本实例拥有的
+            # 停止回调记录与 Runner 状态；其他仍有效实例登记的记录不在
+            # 清理范围内，避免误删其在途 Runner 的 /stop 回调。
+            for record in list(type(self)._stop_callback_records.values()):
+                if record.owner_ref() is self:
+                    self._discard_stop_callback(record)
+            self._active_runners.clear()
             self._log("warning", "AstrNa 未能完整安装群聊并发补丁，已跳过该功能。")
             return False
 
@@ -175,6 +206,9 @@ class GroupSenderConcurrencyModule:
             module_cls.restore_patch()
         self._installed = False
         if not preserve_state:
+            # 停止回调记录不在此注销：在途 Runner 的即时停止应跨 reload
+            # 存活到 Runner 正常注销；事件结束时 AstrBot scheduler 的
+            # unregister(event) 会顺带清理 registry 中的 callback。
             self._group_gates.clear()
             self._write_locks.clear()
             self._active_runners.clear()
@@ -1138,24 +1172,224 @@ class GroupSenderConcurrencyModule:
             return SharedGroupLockContext(group_gate, original_lock)
         return ExclusiveGroupLockContext(group_gate, original_lock)
 
+    def _stop_callback_registry(self) -> Any:
+        """能力探测 AstrBot 4.27.3 的事件级停止回调表；4.27.2 返回 None。"""
+        follow_up_module = type(self)._follow_up_module
+        registry = getattr(follow_up_module, "active_event_registry", None)
+        if registry is None:
+            return None
+        if not callable(getattr(registry, "register_agent_stop_callback", None)):
+            return None
+        if not callable(getattr(registry, "unregister_agent_stop_callback", None)):
+            return None
+        return registry
+
+    def _register_stop_callback(
+        self,
+        key: tuple[str, str],
+        runner: Any,
+        event: Any,
+    ) -> None:
+        """为群发送者 Runner 镜像登记 AstrBot 4.27.3 的事件级停止回调。
+
+        任何一步不可用（无 API、缺事件、对象不可弱引用、request_stop 不可
+        调用、registry 抛异常）都只跳过 callback，sender map 仍然生效，绝
+        不回退到 AstrBot 原生全局 Runner 表。记录只弱引用 Runner/事件/
+        callback，对象被回收时记录自动失效，不会反向保活。
+        """
+        registry = self._stop_callback_registry()
+        callback = getattr(runner, "request_stop", None)
+        if registry is None or event is None or not callable(callback):
+            return
+        module_cls = type(self)
+        # 顺手清理 registry 已不再持有其 callback 的死亡记录（scheduler 已
+        # 收尾等），让跨实例共享的记录表始终约等于在途 Runner 集合。
+        callbacks_table = getattr(registry, "_agent_stop_callbacks", None)
+        if isinstance(callbacks_table, dict):
+            for dead_key, dead in list(module_cls._stop_callback_records.items()):
+                if dead.registry is not registry:
+                    continue
+                dead_event = dead.event_ref()
+                dead_callback = dead.callback_ref()
+                if dead_event is None or dead_callback is None:
+                    module_cls._stop_callback_records.pop(dead_key, None)
+                    continue
+                try:
+                    if same_callable(callbacks_table.get(dead_event), dead_callback):
+                        continue
+                except Exception:  # noqa: BLE001
+                    continue
+                module_cls._stop_callback_records.pop(dead_key, None)
+        existing = module_cls._stop_callback_records.get(key)
+        if (
+            existing is not None
+            and existing.runner_ref() is runner
+            and existing.event_ref() is event
+            and existing.registry is registry
+            and same_callable(existing.callback_ref(), callback)
+        ):
+            return  # 重复登记同一 Runner/事件/registry：幂等，无副作用
+        try:
+            runner_ref = weakref.ref(runner, module_cls._make_stop_record_purge(key))
+            event_ref = weakref.ref(event, module_cls._make_stop_record_purge(key))
+            try:
+                callback_ref = weakref.WeakMethod(callback)
+            except TypeError:
+                callback_ref = weakref.ref(callback)
+        except TypeError:
+            return  # 第三方对象不可弱引用：跳过 callback，sender map 仍生效
+        if existing is not None:
+            # runner/event/registry 任一漂移：旧登记整体失效，先回收。
+            self._discard_stop_callback(existing)
+        # 同一事件对象被其他 sender 记录占用时，先回收旧记录的登记。
+        for other in list(module_cls._stop_callback_records.values()):
+            if other.sender_key != key and other.event_ref() is event:
+                self._discard_stop_callback(other)
+        try:
+            registry.register_agent_stop_callback(event, callback)
+        except Exception:  # noqa: BLE001
+            return
+        module_cls._stop_callback_records[key] = _SenderStopCallbackRecord(
+            sender_key=key,
+            owner_ref=weakref.ref(self),
+            runner_ref=runner_ref,
+            event_ref=event_ref,
+            registry=registry,
+            callback_ref=callback_ref,
+        )
+
+    @classmethod
+    def _make_stop_record_purge(cls, key: tuple[str, str]) -> Any:
+        """Runner 或事件被回收时自动丢弃对应记录（对象死亡意味着 registry
+        侧条目已被 scheduler 收尾或从未成立，这里只清理簿记）。"""
+
+        def purge(_ref: Any) -> None:
+            try:
+                record = cls._stop_callback_records.get(key)
+                if record is not None and (
+                    record.event_ref() is None or record.runner_ref() is None
+                ):
+                    cls._stop_callback_records.pop(key, None)
+            except Exception:  # noqa: BLE001 - GC 回调必须静默
+                pass
+
+        return purge
+
+    def _discard_stop_callback(self, record: _SenderStopCallbackRecord) -> None:
+        """注销记录仍拥有的事件回调；身份不明时一律不动 registry。"""
+        module_cls = type(self)
+        if module_cls._stop_callback_records.get(record.sender_key) is record:
+            module_cls._stop_callback_records.pop(record.sender_key, None)
+        event = record.event_ref()
+        callback = record.callback_ref()
+        if event is None or callback is None:
+            return  # 对象已回收，registry 侧条目不可能仍然存在
+        registry = record.registry
+        unregister = getattr(registry, "unregister_agent_stop_callback", None)
+        if not callable(unregister):
+            return
+        callbacks = getattr(registry, "_agent_stop_callbacks", None)
+        if not isinstance(callbacks, dict):
+            # 无法按 callable 身份核对时放弃注销，避免误删外部覆盖者；
+            # 遗留 callback 会由 AstrBot scheduler 的 unregister(event) 收尾。
+            return
+        try:
+            if not same_callable(callbacks.get(event), callback):
+                return  # 已被外部覆盖/新记录接管，或 scheduler 已先行清理
+        except Exception:  # noqa: BLE001
+            return
+        try:
+            unregister(event)
+        except Exception:  # noqa: BLE001
+            pass
+
     def register_sender_runner(self, umo: str, runner: Any) -> bool:
         event = get_runner_event(runner)
         sender_key = build_group_sender_key(event)
         if sender_key is None or sender_key.umo != str(umo):
             return False
-        self._active_runners[(sender_key.umo, sender_key.sender_id)] = runner
+        key = (sender_key.umo, sender_key.sender_id)
+        old_record = type(self)._stop_callback_records.get(key)
+        if old_record is not None and (
+            old_record.runner_ref() is not runner
+            or old_record.event_ref() is not event
+        ):
+            self._discard_stop_callback(old_record)
+        self._active_runners[key] = runner
         self.capture_turn_anchor(event, runner)
+        self._register_stop_callback(key, runner, event)
         return True
 
     def unregister_sender_runner(self, umo: str, runner: Any) -> bool:
         event = get_runner_event(runner)
         sender_key = build_group_sender_key(event)
-        if sender_key is None or sender_key.umo != str(umo):
+        if sender_key is not None and sender_key.umo == str(umo):
+            key = (sender_key.umo, sender_key.sender_id)
+            removed = False
+            if self._active_runners.get(key) is runner:
+                self._active_runners.pop(key, None)
+                removed = True
+            record = type(self)._stop_callback_records.get(key)
+            if record is not None and record.runner_ref() is runner:
+                self._discard_stop_callback(record)
+                removed = True
+            if removed:
+                return True
+            if self._discard_runner_state_by_identity(runner):
+                return True
+            if self._native_table_owns_runner(umo, runner):
+                # 热开启前由原生路径登记的 Runner：交还原生注销，让它完整
+                # 清理原生全局表与原生登记的 callback，不能由 AstrNa 代管。
+                return False
+            # 跨模块代等 AstrNa 记录缺失场景：原生注销只在原生表命中时才
+            # 清 registry 回调，这里按 callback 身份直接核对。
+            self._unregister_runner_callback_direct(event, runner)
+            return True
+        # 事件缺失或 UMO 漂移：按 Runner 对象身份兜底清理。
+        return self._discard_runner_state_by_identity(runner)
+
+    def _native_table_owns_runner(self, umo: str, runner: Any) -> bool:
+        """AstrBot 原生全局 Runner 表是否按对象身份持有该 Runner。"""
+        follow_up_module = type(self)._follow_up_module
+        table = getattr(follow_up_module, "_ACTIVE_AGENT_RUNNERS", None)
+        if not isinstance(table, dict):
             return False
-        key = (sender_key.umo, sender_key.sender_id)
-        if self._active_runners.get(key) is runner:
-            self._active_runners.pop(key, None)
-        return True
+        try:
+            return table.get(str(umo)) is runner
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _unregister_runner_callback_direct(self, event: Any, runner: Any) -> None:
+        """记录缺失时按 ``runner.request_stop`` 身份直接核对并注销回调。"""
+        registry = self._stop_callback_registry()
+        callback = getattr(runner, "request_stop", None)
+        if registry is None or event is None or not callable(callback):
+            return
+        unregister = getattr(registry, "unregister_agent_stop_callback", None)
+        if not callable(unregister):
+            return
+        callbacks = getattr(registry, "_agent_stop_callbacks", None)
+        if not isinstance(callbacks, dict):
+            return
+        try:
+            if not same_callable(callbacks.get(event), callback):
+                return  # 不是为本 Runner 登记的回调，不动
+            unregister(event)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _discard_runner_state_by_identity(self, runner: Any) -> bool:
+        """正常 key 路径未命中时按 Runner 对象身份兜底清理 sender 状态。"""
+        handled = False
+        for key, active_runner in list(self._active_runners.items()):
+            if active_runner is runner:
+                self._active_runners.pop(key, None)
+                handled = True
+        for record in list(type(self)._stop_callback_records.values()):
+            if record.runner_ref() is runner:
+                self._discard_stop_callback(record)
+                handled = True
+        return handled
 
     def try_capture_sender_follow_up(
         self,

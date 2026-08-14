@@ -3,11 +3,15 @@ from __future__ import annotations
 import asyncio
 import copy
 import functools
+import gc
 import importlib
 import json
 import os
+import subprocess
 import sys
+import textwrap
 import time
+import weakref
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -423,11 +427,33 @@ def fake_astrbot_modules(monkeypatch):
             self.monitor_task = monitor_task
 
     def register_active_runner(umo, runner):
+        # 镜像 AstrBot 4.27.3：原生登记同时写全局表并登记事件级停止回调。
         follow_up_module._ACTIVE_AGENT_RUNNERS[umo] = runner
+        registry = getattr(follow_up_module, "active_event_registry", None)
+        event = getattr(
+            getattr(getattr(runner, "run_context", None), "context", None),
+            "event",
+            None,
+        )
+        callback = getattr(runner, "request_stop", None)
+        if registry is not None and event is not None and callable(callback):
+            register_cb = getattr(registry, "register_agent_stop_callback", None)
+            if callable(register_cb):
+                register_cb(event, callback)
 
     def unregister_active_runner(umo, runner):
         if follow_up_module._ACTIVE_AGENT_RUNNERS.get(umo) is runner:
             follow_up_module._ACTIVE_AGENT_RUNNERS.pop(umo, None)
+            registry = getattr(follow_up_module, "active_event_registry", None)
+            event = getattr(
+                getattr(getattr(runner, "run_context", None), "context", None),
+                "event",
+                None,
+            )
+            if registry is not None and event is not None:
+                unregister_cb = getattr(registry, "unregister_agent_stop_callback", None)
+                if callable(unregister_cb):
+                    unregister_cb(event)
 
     def try_capture_follow_up(event):
         runner = follow_up_module._ACTIVE_AGENT_RUNNERS.get(event.unified_msg_origin)
@@ -451,6 +477,48 @@ def fake_astrbot_modules(monkeypatch):
     follow_up_module._event_follow_up_text = _event_follow_up_text
     follow_up_module._allocate_follow_up_order = _allocate_follow_up_order
     follow_up_module._monitor_follow_up_ticket = _monitor_follow_up_ticket
+
+    class FakeActiveEventRegistry:
+        """镜像 AstrBot 4.27.3 的事件级停止回调表。"""
+
+        def __init__(self):
+            self._events = {}
+            self._agent_stop_callbacks = {}
+
+        def register(self, event):
+            self._events.setdefault(event.unified_msg_origin, set()).add(event)
+
+        def unregister(self, event):
+            self._agent_stop_callbacks.pop(event, None)
+            events = self._events.get(event.unified_msg_origin)
+            if events is not None:
+                events.discard(event)
+                if not events:
+                    self._events.pop(event.unified_msg_origin, None)
+
+        def register_agent_stop_callback(self, event, callback):
+            self._agent_stop_callbacks[event] = callback
+
+        def unregister_agent_stop_callback(self, event):
+            self._agent_stop_callbacks.pop(event, None)
+
+        def request_agent_stop_all(self, umo, exclude=None):
+            count = 0
+            for event in list(self._events.get(umo, ())):
+                if event is exclude:
+                    continue
+                event.set_extra("agent_stop_requested", True)
+                callback = self._agent_stop_callbacks.get(event)
+                if callback:
+                    callback()
+                count += 1
+            return count
+
+    active_event_registry = FakeActiveEventRegistry()
+    follow_up_module.active_event_registry = active_event_registry
+
+    # 停止回调记录是跨实例共享的类级状态，测试间必须显式隔离。
+    GroupSenderConcurrencyModule._stop_callback_records.clear()
 
     internal_module.register_active_runner = register_active_runner
     internal_module.unregister_active_runner = unregister_active_runner
@@ -565,9 +633,11 @@ def fake_astrbot_modules(monkeypatch):
         internal_module=internal_module,
         conversation_cls=ConversationManager,
         context_cls=Context,
+        active_event_registry=active_event_registry,
     )
 
     GroupSenderConcurrencyModule.restore_patch()
+    GroupSenderConcurrencyModule._stop_callback_records.clear()
 
 
 def collect_async_generator(async_gen):
@@ -2467,3 +2537,871 @@ def test_follow_up_is_isolated_by_group_sender(fake_astrbot_modules):
 
 async def collect_one(async_gen):
     return [item async for item in async_gen]
+
+
+class StoppableRunner(DummyRunner):
+    """带 request_stop 的 Runner，用于验证 4.27.3 事件级停止回调。"""
+
+    def __init__(self, event):
+        super().__init__(event)
+        self.stop_calls = 0
+
+    def request_stop(self):
+        self.stop_calls += 1
+
+
+def test_group_runner_stop_callback_registered_without_native_runner_table(
+    fakes,
+    fake_astrbot_modules,
+):
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+    module = runtime.group_sender_concurrency
+    registry = fake_astrbot_modules.active_event_registry
+    follow_up = fake_astrbot_modules.follow_up
+    umo = "aiocqhttp:GroupMessage:group-1"
+    event = DummyEvent(umo=umo, sender_id="user-1")
+    runner = StoppableRunner(event)
+    registry.register(event)
+
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner)
+
+    assert module._active_runners[(umo, "user-1")] is runner
+    assert follow_up._ACTIVE_AGENT_RUNNERS == {}  # 不写原生全局 Runner 表
+    assert registry._agent_stop_callbacks.get(event) == runner.request_stop
+
+    assert registry.request_agent_stop_all(umo) == 1
+    assert event.get_extra("agent_stop_requested") is True
+    assert runner.stop_calls == 1
+
+    fake_astrbot_modules.internal_module.unregister_active_runner(umo, runner)
+    assert event not in registry._agent_stop_callbacks
+    assert module._stop_callback_records == {}
+    registry.request_agent_stop_all(umo)
+    assert runner.stop_calls == 1  # 注销后 callback 不再触发
+
+    run(runtime.terminate())
+
+
+def test_stop_callbacks_are_sender_scoped_within_same_umo(
+    fakes,
+    fake_astrbot_modules,
+):
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+    module = runtime.group_sender_concurrency
+    registry = fake_astrbot_modules.active_event_registry
+    umo = "aiocqhttp:GroupMessage:group-1"
+    event_a = DummyEvent(umo=umo, sender_id="user-a")
+    event_b = DummyEvent(umo=umo, sender_id="user-b")
+    runner_a = StoppableRunner(event_a)
+    runner_b = StoppableRunner(event_b)
+    registry.register(event_a)
+    registry.register(event_b)
+
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner_a)
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner_b)
+
+    assert module._active_runners[(umo, "user-a")] is runner_a
+    assert module._active_runners[(umo, "user-b")] is runner_b
+
+    assert registry.request_agent_stop_all(umo) == 2
+    assert runner_a.stop_calls == 1
+    assert runner_b.stop_calls == 1
+
+    # 注销 A 不影响 B 的 callback。
+    fake_astrbot_modules.internal_module.unregister_active_runner(umo, runner_a)
+    registry.request_agent_stop_all(umo)
+    assert runner_a.stop_calls == 1
+    assert runner_b.stop_calls == 2
+
+    run(runtime.terminate())
+
+
+def test_runner_replace_and_late_unregister_cleanup(fakes, fake_astrbot_modules):
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+    module = runtime.group_sender_concurrency
+    registry = fake_astrbot_modules.active_event_registry
+    umo = "aiocqhttp:GroupMessage:group-1"
+    event1 = DummyEvent(umo=umo, sender_id="user-1")
+    event2 = DummyEvent(umo=umo, sender_id="user-1")
+    runner1 = StoppableRunner(event1)
+    runner2 = StoppableRunner(event2)
+    registry.register(event1)
+    registry.register(event2)
+
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner1)
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner2)
+
+    # 替换：旧 callback 被注销，新 callback 生效。
+    assert event1 not in registry._agent_stop_callbacks
+    assert registry._agent_stop_callbacks.get(event2) == runner2.request_stop
+    assert module._active_runners[(umo, "user-1")] is runner2
+
+    registry.request_agent_stop_all(umo)
+    assert runner1.stop_calls == 0
+    assert runner2.stop_calls == 1
+
+    # 旧 Runner 迟到注销：不能删除新 Runner 或新 callback。
+    fake_astrbot_modules.internal_module.unregister_active_runner(umo, runner1)
+    assert module._active_runners[(umo, "user-1")] is runner2
+    assert registry._agent_stop_callbacks.get(event2) == runner2.request_stop
+    registry.request_agent_stop_all(umo)
+    assert runner2.stop_calls == 2
+
+    run(runtime.terminate())
+
+
+def test_same_event_object_reused_by_replacement_runner(fakes, fake_astrbot_modules):
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+    registry = fake_astrbot_modules.active_event_registry
+    umo = "aiocqhttp:GroupMessage:group-1"
+    event = DummyEvent(umo=umo, sender_id="user-1")
+    runner1 = StoppableRunner(event)
+    runner2 = StoppableRunner(event)
+    registry.register(event)
+
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner1)
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner2)
+
+    # registry 按事件只保存单个 callback：替换后归 runner2 所有。
+    assert registry._agent_stop_callbacks.get(event) == runner2.request_stop
+    registry.request_agent_stop_all(umo)
+    assert runner1.stop_calls == 0
+    assert runner2.stop_calls == 1
+
+    # 旧 Runner 迟到注销不得清掉 runner2 的 callback。
+    fake_astrbot_modules.internal_module.unregister_active_runner(umo, runner1)
+    assert registry._agent_stop_callbacks.get(event) == runner2.request_stop
+
+    run(runtime.terminate())
+
+
+def test_duplicate_register_unregister_are_idempotent(fakes, fake_astrbot_modules):
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+    module = runtime.group_sender_concurrency
+    registry = fake_astrbot_modules.active_event_registry
+    umo = "aiocqhttp:GroupMessage:group-1"
+    event = DummyEvent(umo=umo, sender_id="user-1")
+    runner = StoppableRunner(event)
+
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner)
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner)
+    assert len(registry._agent_stop_callbacks) == 1
+    assert len(module._stop_callback_records) == 1
+
+    fake_astrbot_modules.internal_module.unregister_active_runner(umo, runner)
+    fake_astrbot_modules.internal_module.unregister_active_runner(umo, runner)
+    assert registry._agent_stop_callbacks == {}
+    assert module._stop_callback_records == {}
+    assert module._active_runners == {}
+
+    run(runtime.terminate())
+
+
+def test_runner_without_request_stop_skips_callback(fakes, fake_astrbot_modules):
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+    module = runtime.group_sender_concurrency
+    registry = fake_astrbot_modules.active_event_registry
+    umo = "aiocqhttp:GroupMessage:group-1"
+    event = DummyEvent(umo=umo, sender_id="user-1")
+    runner = DummyRunner(event)  # 无 request_stop
+
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner)
+
+    assert module._active_runners[(umo, "user-1")] is runner
+    assert registry._agent_stop_callbacks == {}
+    assert module._stop_callback_records == {}
+
+    fake_astrbot_modules.internal_module.unregister_active_runner(umo, runner)
+    assert module._active_runners == {}
+
+    run(runtime.terminate())
+
+
+def test_stop_callback_api_missing_does_not_break_sender_map(
+    fakes,
+    fake_astrbot_modules,
+    monkeypatch,
+):
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+    module = runtime.group_sender_concurrency
+    registry = fake_astrbot_modules.active_event_registry
+    umo = "aiocqhttp:GroupMessage:group-1"
+    event = DummyEvent(umo=umo, sender_id="user-1")
+    runner = StoppableRunner(event)
+
+    # 4.27.2 形态：registry 没有 callback API。
+    monkeypatch.delattr(type(registry), "register_agent_stop_callback")
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner)
+
+    assert module._active_runners[(umo, "user-1")] is runner
+    assert module._stop_callback_records == {}
+
+    run(runtime.terminate())
+
+
+def test_stop_callback_registry_exception_does_not_break_sender_map(
+    fakes,
+    fake_astrbot_modules,
+    monkeypatch,
+):
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+    module = runtime.group_sender_concurrency
+    registry = fake_astrbot_modules.active_event_registry
+    umo = "aiocqhttp:GroupMessage:group-1"
+    event = DummyEvent(umo=umo, sender_id="user-1")
+    runner = StoppableRunner(event)
+
+    def raising_register(event, callback):
+        raise RuntimeError("registry down")
+
+    monkeypatch.setattr(registry, "register_agent_stop_callback", raising_register)
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner)
+
+    assert module._active_runners[(umo, "user-1")] is runner
+    assert module._stop_callback_records == {}
+
+    run(runtime.terminate())
+
+
+def test_terminate_keeps_inflight_stop_callback_until_runner_exit(
+    fakes,
+    fake_astrbot_modules,
+):
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+    module = runtime.group_sender_concurrency
+    registry = fake_astrbot_modules.active_event_registry
+    umo = "aiocqhttp:GroupMessage:group-1"
+    event = DummyEvent(umo=umo, sender_id="user-1")
+    runner = StoppableRunner(event)
+    registry.register(event)
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner)
+    assert registry._agent_stop_callbacks.get(event) == runner.request_stop
+
+    # 共享包装链重排：保留 sender map、callback records 与已登记 callback。
+    module.terminate(preserve_state=True)
+    assert registry._agent_stop_callbacks.get(event) == runner.request_stop
+    assert module._active_runners[(umo, "user-1")] is runner
+    assert module.install() is True
+    assert len(registry._agent_stop_callbacks) == 1  # 重装不重复登记
+
+    registry.request_agent_stop_all(umo)
+    assert runner.stop_calls == 1
+
+    # 最终卸载同样不注销在途回调：/stop 跨 unload 仍可即时停止 Runner。
+    module.terminate()
+    assert registry._agent_stop_callbacks.get(event) == runner.request_stop
+    assert module._active_runners == {}
+    registry.request_agent_stop_all(umo)
+    assert runner.stop_calls == 2
+
+    # 事件结束时由 AstrBot scheduler 的 unregister(event) 兜底清理。
+    registry.unregister(event)
+    assert registry._agent_stop_callbacks == {}
+
+    run(runtime.terminate())
+
+
+def test_reload_interleave_keeps_inflight_stop_callback(fake_astrbot_modules):
+    """新旧实例交错（两种顺序）都不能丢失在途 Runner 的即时停止回调。"""
+    registry = fake_astrbot_modules.active_event_registry
+    umo = "aiocqhttp:GroupMessage:group-1"
+
+    # 顺序一：new.install -> old.terminate。
+    old = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert old.install() is True
+    event1 = DummyEvent(umo=umo, sender_id="user-1")
+    runner1 = StoppableRunner(event1)
+    registry.register(event1)
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner1)
+    new = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert new.install() is True
+    old.terminate()
+    assert registry.request_agent_stop_all(umo) == 1
+    assert runner1.stop_calls == 1
+    # 新实例注销旧实例登记的 Runner：按 Runner 身份正常清理共享记录。
+    fake_astrbot_modules.internal_module.unregister_active_runner(umo, runner1)
+    assert event1 not in registry._agent_stop_callbacks
+    assert GroupSenderConcurrencyModule._stop_callback_records == {}
+
+    # 顺序二（AstrBot reload 真实顺序）：old.terminate -> new.install。
+    old2 = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert old2.install() is True
+    event2 = DummyEvent(umo=umo, sender_id="user-2")
+    runner2 = StoppableRunner(event2)
+    registry.register(event2)
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner2)
+    old2.terminate()
+    new2 = GroupSenderConcurrencyModule(logger=DummyLogger())
+    assert new2.install() is True
+    registry.request_agent_stop_all(umo)
+    assert runner2.stop_calls == 1
+    fake_astrbot_modules.internal_module.unregister_active_runner(umo, runner2)
+    assert event2 not in registry._agent_stop_callbacks
+    assert GroupSenderConcurrencyModule._stop_callback_records == {}
+
+    new.terminate()
+    new2.terminate()
+
+
+def test_same_runner_event_swap_discards_stale_callback(fakes, fake_astrbot_modules):
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+    registry = fake_astrbot_modules.active_event_registry
+    umo = "aiocqhttp:GroupMessage:group-1"
+    event1 = DummyEvent(umo=umo, sender_id="user-1")
+    event2 = DummyEvent(umo=umo, sender_id="user-1")
+    runner = StoppableRunner(event1)
+
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner)
+    assert registry._agent_stop_callbacks.get(event1) == runner.request_stop
+
+    # 同一 Runner 更换事件对象：旧事件的 callback 必须立即回收。
+    runner.run_context.context.event = event2
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner)
+    assert event1 not in registry._agent_stop_callbacks
+    assert registry._agent_stop_callbacks.get(event2) == runner.request_stop
+    assert len(registry._agent_stop_callbacks) == 1
+    assert len(GroupSenderConcurrencyModule._stop_callback_records) == 1
+
+    run(runtime.terminate())
+
+
+def test_unregister_with_missing_event_falls_back_to_runner_identity(
+    fakes,
+    fake_astrbot_modules,
+):
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+    module = runtime.group_sender_concurrency
+    registry = fake_astrbot_modules.active_event_registry
+    follow_up = fake_astrbot_modules.follow_up
+    umo = "aiocqhttp:GroupMessage:group-1"
+    event = DummyEvent(umo=umo, sender_id="user-1")
+    runner = StoppableRunner(event)
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner)
+
+    # Runner 注销时事件已丢失：按 Runner 身份兜底清理，不回退原生表。
+    runner.run_context.context.event = None
+    fake_astrbot_modules.internal_module.unregister_active_runner(umo, runner)
+
+    assert module._active_runners == {}
+    assert GroupSenderConcurrencyModule._stop_callback_records == {}
+    assert registry._agent_stop_callbacks == {}
+    assert follow_up._ACTIVE_AGENT_RUNNERS == {}
+
+    run(runtime.terminate())
+
+
+def test_failed_reinstall_after_preserve_cleans_runner_state(
+    fakes,
+    fake_astrbot_modules,
+    monkeypatch,
+):
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+    module = runtime.group_sender_concurrency
+    registry = fake_astrbot_modules.active_event_registry
+    umo = "aiocqhttp:GroupMessage:group-1"
+    event = DummyEvent(umo=umo, sender_id="user-1")
+    runner = StoppableRunner(event)
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner)
+
+    module.terminate(preserve_state=True)
+    assert registry._agent_stop_callbacks.get(event) == runner.request_stop
+
+    # preserve 后重装失败：最终清理保留的 Runner 状态与已登记 callback。
+    monkeypatch.setattr(module, "_install_process_patch", lambda: False)
+    assert module.install() is False
+    assert registry._agent_stop_callbacks == {}
+    assert GroupSenderConcurrencyModule._stop_callback_records == {}
+    assert module._active_runners == {}
+
+    run(runtime.terminate())
+
+
+def test_scheduler_pre_cleanup_makes_discard_a_noop(fakes, fake_astrbot_modules):
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+    module = runtime.group_sender_concurrency
+    registry = fake_astrbot_modules.active_event_registry
+    umo = "aiocqhttp:GroupMessage:group-1"
+    event = DummyEvent(umo=umo, sender_id="user-1")
+    runner = StoppableRunner(event)
+    registry.register(event)
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner)
+
+    # AstrBot scheduler 先行 unregister(event)，AstrNa 后续清理视为正常 no-op。
+    registry.unregister(event)
+    fake_astrbot_modules.internal_module.unregister_active_runner(umo, runner)
+
+    assert registry._agent_stop_callbacks == {}
+    assert module._stop_callback_records == {}
+    assert module._active_runners == {}
+
+    run(runtime.terminate())
+
+
+def test_discard_does_not_remove_foreign_overriding_callback(
+    fakes,
+    fake_astrbot_modules,
+):
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+    module = runtime.group_sender_concurrency
+    registry = fake_astrbot_modules.active_event_registry
+    umo = "aiocqhttp:GroupMessage:group-1"
+    event = DummyEvent(umo=umo, sender_id="user-1")
+    runner = StoppableRunner(event)
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner)
+
+    foreign_callback = lambda: None  # noqa: E731
+    registry._agent_stop_callbacks[event] = foreign_callback
+    fake_astrbot_modules.internal_module.unregister_active_runner(umo, runner)
+
+    # 身份核对失败时不得误删外部覆盖的 callback。
+    assert registry._agent_stop_callbacks[event] is foreign_callback
+    assert module._stop_callback_records == {}
+
+    run(runtime.terminate())
+
+
+def test_private_chat_still_uses_native_registration(fakes, fake_astrbot_modules):
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+    module = runtime.group_sender_concurrency
+    registry = fake_astrbot_modules.active_event_registry
+    follow_up = fake_astrbot_modules.follow_up
+    umo = "aiocqhttp:FriendMessage:user-1"
+    event = DummyEvent(umo=umo, sender_id="user-1", group_id="", private=True)
+    runner = StoppableRunner(event)
+
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner)
+
+    assert follow_up._ACTIVE_AGENT_RUNNERS[umo] is runner  # 走原生全局表
+    assert module._active_runners == {}
+    assert GroupSenderConcurrencyModule._stop_callback_records == {}
+    # 私聊不经过 AstrNa sender 路径：callback 由原生登记/注销完整管理。
+    assert registry._agent_stop_callbacks.get(event) == runner.request_stop
+
+    fake_astrbot_modules.internal_module.unregister_active_runner(umo, runner)
+    assert follow_up._ACTIVE_AGENT_RUNNERS == {}
+    assert registry._agent_stop_callbacks == {}
+
+    run(runtime.terminate())
+
+
+def test_real_astrbot_stop_callback_and_sender_isolation():
+    source = os.environ.get("ASTRBOT_SOURCE_PATH")
+    if not source:
+        pytest.skip("未设置 ASTRBOT_SOURCE_PATH")
+    script = textwrap.dedent(
+        f"""
+        import asyncio
+        import sys
+        from types import SimpleNamespace
+
+        sys.path.insert(0, {source!r})
+        sys.path.insert(0, {os.getcwd()!r})
+
+        from astrbot.core.agent.runners.tool_loop_agent_runner import (
+            ToolLoopAgentRunner,
+        )
+        from astrbot.core.pipeline.process_stage import follow_up
+        from astrbot.core.pipeline.process_stage.method.agent_sub_stages import internal
+        from astrbot.core.utils.active_event_registry import active_event_registry
+        from astrna.modules.group_sender_concurrency import (
+            GroupSenderConcurrencyModule,
+        )
+
+        class Event:
+            def __init__(self, umo, sender_id):
+                self.unified_msg_origin = umo
+                self._sender_id = sender_id
+                self._extras = {{}}
+                self.message_obj = SimpleNamespace(
+                    group_id="g1",
+                    sender=SimpleNamespace(user_id=sender_id),
+                )
+            def is_private_chat(self): return False
+            def get_group_id(self): return "g1"
+            def get_sender_id(self): return self._sender_id
+            def get_extra(self, key): return self._extras.get(key)
+            def set_extra(self, key, value): self._extras[key] = value
+
+        def build_runner(event):
+            runner = object.__new__(ToolLoopAgentRunner)
+            runner._abort_signal = asyncio.Event()
+            runner.run_context = SimpleNamespace(
+                context=SimpleNamespace(event=event)
+            )
+            return runner
+
+        module = GroupSenderConcurrencyModule(logger=None)
+        assert module._install_follow_up_patch() is True
+        GroupSenderConcurrencyModule._active_module = module
+        try:
+            umo = "aiocqhttp:GroupMessage:g1"
+            event = Event(umo, "user-1")
+            runner = build_runner(event)
+            active_event_registry.register(event)
+            internal.register_active_runner(umo, runner)
+
+            # 群发送者隔离：不写 AstrBot 原生全局 Runner 表。
+            assert umo not in follow_up._ACTIVE_AGENT_RUNNERS
+            assert module._active_runners[(umo, "user-1")] is runner
+
+            has_callback_api = hasattr(
+                active_event_registry, "register_agent_stop_callback"
+            )
+            assert active_event_registry.request_agent_stop_all(umo) == 1
+            assert event.get_extra("agent_stop_requested") is True
+            if has_callback_api:
+                # 4.27.3：/stop 立即置位真实 Runner 的 abort signal。
+                assert runner._abort_signal.is_set() is True
+            else:
+                # 4.27.2：无 callback API，只保留事件停止标记。
+                assert runner._abort_signal.is_set() is False
+
+            # 注销后 callback 不再触发。
+            internal.unregister_active_runner(umo, runner)
+            assert runner._abort_signal.is_set() is has_callback_api
+            assert (
+                getattr(active_event_registry, "_agent_stop_callbacks", {{}})
+                .get(event)
+                is None
+            )
+        finally:
+            module.terminate()
+            GroupSenderConcurrencyModule.restore_patch()
+            GroupSenderConcurrencyModule._stop_callback_records.clear()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-W", "error::RuntimeWarning", "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+def test_failed_install_of_other_instance_preserves_inflight_callback(
+    fakes,
+    fake_astrbot_modules,
+    monkeypatch,
+):
+    """同代第二个实例安装失败，不得误清其他有效实例的在途停止回调。"""
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+    module = runtime.group_sender_concurrency
+    registry = fake_astrbot_modules.active_event_registry
+    umo = "aiocqhttp:GroupMessage:group-1"
+    event = DummyEvent(umo=umo, sender_id="user-1")
+    runner = StoppableRunner(event)
+    registry.register(event)
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner)
+
+    other = GroupSenderConcurrencyModule(logger=DummyLogger())
+    monkeypatch.setattr(other, "_install_process_patch", lambda: False)
+    assert other.install() is False
+
+    record = GroupSenderConcurrencyModule._stop_callback_records.get(
+        (umo, "user-1")
+    )
+    assert record is not None
+    assert record.owner_ref() is module  # 记录归旧实例所有，未被误清
+    assert registry._agent_stop_callbacks.get(event) == runner.request_stop
+    assert module._active_runners[(umo, "user-1")] is runner
+
+    registry.request_agent_stop_all(umo)
+    assert runner.stop_calls == 1  # 在途 Runner 的即时停止仍然有效
+
+    run(runtime.terminate())
+
+
+def test_unregister_with_drifted_event_falls_back_to_identity(
+    fakes,
+    fake_astrbot_modules,
+):
+    """事件仍合法但 sender/UMO 漂移时，注销按 Runner 身份兜底清理。"""
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+    module = runtime.group_sender_concurrency
+    registry = fake_astrbot_modules.active_event_registry
+    follow_up = fake_astrbot_modules.follow_up
+    umo = "aiocqhttp:GroupMessage:group-1"
+
+    # sender 漂移：事件能生成合法但已变化的 key，正常路径未命中也要清理。
+    event = DummyEvent(umo=umo, sender_id="user-1")
+    runner = StoppableRunner(event)
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner)
+    event._sender_id = "user-2"
+    fake_astrbot_modules.internal_module.unregister_active_runner(umo, runner)
+    assert module._active_runners == {}
+    assert GroupSenderConcurrencyModule._stop_callback_records == {}
+    assert registry._agent_stop_callbacks == {}
+    assert follow_up._ACTIVE_AGENT_RUNNERS == {}
+
+    # UMO 漂移：身份扫描不依赖当前 UMO 与旧 key 相等。
+    event2 = DummyEvent(umo=umo, sender_id="user-3")
+    runner2 = StoppableRunner(event2)
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner2)
+    event2.unified_msg_origin = "aiocqhttp:GroupMessage:group-2"
+    fake_astrbot_modules.internal_module.unregister_active_runner(umo, runner2)
+    assert module._active_runners == {}
+    assert GroupSenderConcurrencyModule._stop_callback_records == {}
+    assert registry._agent_stop_callbacks == {}
+
+    run(runtime.terminate())
+
+
+def test_stop_record_released_after_event_end_when_feature_off(
+    fakes,
+    fake_astrbot_modules,
+):
+    """功能关闭后事件结束：scheduler 收尾 + 对象回收自动释放记录。"""
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+    module = runtime.group_sender_concurrency
+    registry = fake_astrbot_modules.active_event_registry
+    umo = "aiocqhttp:GroupMessage:group-1"
+    event = DummyEvent(umo=umo, sender_id="user-1")
+    runner = StoppableRunner(event)
+    registry.register(event)
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner)
+    assert len(GroupSenderConcurrencyModule._stop_callback_records) == 1
+
+    module.terminate()  # 功能关闭：terminate 不再注销在途回调
+    registry.unregister(event)  # AstrBot scheduler 事件收尾
+    assert registry._agent_stop_callbacks == {}
+
+    # 记录只弱引用对象：事件与 Runner 被回收后记录自动失效，无强引用残留。
+    runner_ref = weakref.ref(runner)
+    del event, runner
+    gc.collect()
+    assert runner_ref() is None
+    assert GroupSenderConcurrencyModule._stop_callback_records == {}
+
+    run(runtime.terminate())
+
+
+def test_real_astrbot_cross_generation_stop_callback_survival():
+    """真实模块换代（reload 重新导入）后，在途 Runner 的 /stop 仍然有效。"""
+    source = os.environ.get("ASTRBOT_SOURCE_PATH")
+    if not source:
+        pytest.skip("未设置 ASTRBOT_SOURCE_PATH")
+    script = textwrap.dedent(
+        f"""
+        import asyncio
+        import importlib
+        import sys
+        from importlib.machinery import ModuleSpec
+        from types import ModuleType, SimpleNamespace
+
+        sys.path.insert(0, {source!r})
+        sys.path.insert(0, {os.getcwd()!r})
+
+        from astrbot.core.agent.runners.tool_loop_agent_runner import (
+            ToolLoopAgentRunner,
+        )
+        from astrbot.core.pipeline.process_stage import follow_up
+        from astrbot.core.pipeline.process_stage.method.agent_sub_stages import internal
+        from astrbot.core.utils.active_event_registry import active_event_registry
+
+        import astrna.modules.group_sender_concurrency as gen1
+
+        def load_gen2():
+            for name in list(sys.modules):
+                if name.startswith("data.plugins.gen2"):
+                    del sys.modules[name]
+            packages = {{
+                "data": [], "data.plugins": [],
+                "data.plugins.gen2": [{os.getcwd()!r}],
+            }}
+            for name, paths in packages.items():
+                if name not in sys.modules:
+                    package = ModuleType(name)
+                    package.__path__ = paths
+                    package.__package__ = name
+                    package.__spec__ = ModuleSpec(name, loader=None, is_package=True)
+                    sys.modules[name] = package
+            return importlib.import_module(
+                "data.plugins.gen2.astrna.modules.group_sender_concurrency"
+            )
+
+        gen2 = load_gen2()
+        assert gen1.GroupSenderConcurrencyModule is not gen2.GroupSenderConcurrencyModule
+        assert (
+            gen1.GroupSenderConcurrencyModule._stop_callback_records
+            is not gen2.GroupSenderConcurrencyModule._stop_callback_records
+        )
+
+        class Event:
+            def __init__(self, umo, sender_id):
+                self.unified_msg_origin = umo
+                self._sender_id = sender_id
+                self._extras = {{}}
+                self.message_obj = SimpleNamespace(
+                    group_id="g1",
+                    sender=SimpleNamespace(user_id=sender_id),
+                )
+            def is_private_chat(self): return False
+            def get_group_id(self): return "g1"
+            def get_sender_id(self): return self._sender_id
+            def get_extra(self, key): return self._extras.get(key)
+            def set_extra(self, key, value): self._extras[key] = value
+
+        def build_runner(event):
+            runner = object.__new__(ToolLoopAgentRunner)
+            runner._abort_signal = asyncio.Event()
+            runner.run_context = SimpleNamespace(
+                context=SimpleNamespace(event=event)
+            )
+            return runner
+
+        has_callback_api = hasattr(
+            active_event_registry, "register_agent_stop_callback"
+        )
+        umo = "aiocqhttp:GroupMessage:g1"
+        event = Event(umo, "user-1")
+        runner = build_runner(event)
+        active_event_registry.register(event)
+
+        # 旧代安装并登记 Runner。
+        m1 = gen1.GroupSenderConcurrencyModule(logger=None)
+        assert m1._install_follow_up_patch() is True
+        gen1.GroupSenderConcurrencyModule._active_module = m1
+        internal.register_active_runner(umo, runner)
+        expected_records = 1 if has_callback_api else 0
+        assert (
+            len(gen1.GroupSenderConcurrencyModule._stop_callback_records)
+            == expected_records
+        )
+
+        # AstrBot reload：先 terminate 旧代，再由新代接管。
+        m1.terminate()
+        gen1.GroupSenderConcurrencyModule.restore_patch()
+        m2 = gen2.GroupSenderConcurrencyModule(logger=None)
+        assert m2._install_follow_up_patch() is True
+        gen2.GroupSenderConcurrencyModule._active_module = m2
+        assert len(gen2.GroupSenderConcurrencyModule._stop_callback_records) == 0
+
+        # 跨模块代：registry 单例存活，/stop 仍能即时停止在途 Runner。
+        assert active_event_registry.request_agent_stop_all(umo) == 1
+        assert runner._abort_signal.is_set() is has_callback_api
+
+        # 旧代 Runner 经新代包装器注销：新代无记录，安全回退原生注销。
+        internal.unregister_active_runner(umo, runner)
+        if has_callback_api:
+            assert event not in active_event_registry._agent_stop_callbacks
+
+        m2.terminate()
+        gen2.GroupSenderConcurrencyModule.restore_patch()
+        gen1.GroupSenderConcurrencyModule._stop_callback_records.clear()
+        gen2.GroupSenderConcurrencyModule._stop_callback_records.clear()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-W", "error::RuntimeWarning", "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+def test_hot_enable_native_runner_unregisters_via_native_path(
+    fakes,
+    fake_astrbot_modules,
+):
+    """热开启前由原生登记的群 Runner，开启后注销必须交还原生完整清理。"""
+    registry = fake_astrbot_modules.active_event_registry
+    follow_up = fake_astrbot_modules.follow_up
+    umo = "aiocqhttp:GroupMessage:group-1"
+    event = DummyEvent(umo=umo, sender_id="user-1")
+    runner = StoppableRunner(event)
+
+    # 功能开启前：直接调用未被包装的原生函数登记（写原生表 + 原生 callback）。
+    native_register = follow_up.register_active_runner
+    native_register(umo, runner)
+    assert follow_up._ACTIVE_AGENT_RUNNERS.get(umo) is runner
+    assert registry._agent_stop_callbacks.get(event) == runner.request_stop
+
+    # 热开启：AstrNa 包装接管。
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+    module = runtime.group_sender_concurrency
+
+    # 该 Runner 没有 AstrNa sender 状态：注销必须交还原生路径。
+    fake_astrbot_modules.internal_module.unregister_active_runner(umo, runner)
+    assert follow_up._ACTIVE_AGENT_RUNNERS == {}  # 原生表被原生注销清理
+    assert registry._agent_stop_callbacks == {}  # callback 同样由原生清理
+    assert module._active_runners == {}
+    assert GroupSenderConcurrencyModule._stop_callback_records == {}
+
+    run(runtime.terminate())
+
+
+def test_cross_generation_without_record_uses_direct_cleanup(
+    fakes,
+    fake_astrbot_modules,
+):
+    """跨模块代导致 AstrNa 记录缺失时，注销仍按身份直接清理 registry 回调。"""
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+    module = runtime.group_sender_concurrency
+    registry = fake_astrbot_modules.active_event_registry
+    follow_up = fake_astrbot_modules.follow_up
+    umo = "aiocqhttp:GroupMessage:group-1"
+    event = DummyEvent(umo=umo, sender_id="user-1")
+    runner = StoppableRunner(event)
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner)
+    assert registry._agent_stop_callbacks.get(event) == runner.request_stop
+
+    # 模拟跨模块代：新代拿不到旧代登记的记录。
+    GroupSenderConcurrencyModule._stop_callback_records.clear()
+    module._active_runners.clear()
+
+    fake_astrbot_modules.internal_module.unregister_active_runner(umo, runner)
+    assert registry._agent_stop_callbacks == {}  # direct cleanup 生效
+    assert follow_up._ACTIVE_AGENT_RUNNERS == {}  # 不涉及原生表
+
+    run(runtime.terminate())
+
+
+def test_unregister_does_not_yield_native_when_table_holds_other_runner(
+    fakes,
+    fake_astrbot_modules,
+):
+    """原生表同 UMO 持有其他 Runner 时，AstrNa Runner 的注销不得交还原生。"""
+    registry = fake_astrbot_modules.active_event_registry
+    follow_up = fake_astrbot_modules.follow_up
+    umo = "aiocqhttp:GroupMessage:group-1"
+
+    # 功能开启前：原生表同 UMO 先持有另一个 Runner（热开启前登记的事件）。
+    native_register = follow_up.register_active_runner
+    other_event = DummyEvent(umo=umo, sender_id="user-9")
+    other_runner = StoppableRunner(other_event)
+    native_register(umo, other_runner)
+    assert follow_up._ACTIVE_AGENT_RUNNERS.get(umo) is other_runner
+
+    runtime = fakes.build_runtime({"unlock_group_sender_concurrency": True})
+
+    # AstrNa sender 路径登记自己的 Runner（registry callback 由 AstrNa 登记）。
+    event = DummyEvent(umo=umo, sender_id="user-1")
+    runner = StoppableRunner(event)
+    fake_astrbot_modules.internal_module.register_active_runner(umo, runner)
+    assert registry._agent_stop_callbacks.get(event) == runner.request_stop
+
+    # 模拟 AstrNa 记录缺失（跨模块代/记录被清理）：注销必须走到
+    # _native_table_owns_runner 身份核对；原生表持有的是其他 Runner，
+    # 不得交还原生，只能按 callback 身份直接清理自己的回调。
+    module = runtime.group_sender_concurrency
+    module._active_runners.clear()
+    GroupSenderConcurrencyModule._stop_callback_records.clear()
+
+    fake_astrbot_modules.internal_module.unregister_active_runner(umo, runner)
+
+    # AstrNa 自己的状态清干净；原生表中其他 Runner 的条目不受影响。
+    assert registry._agent_stop_callbacks.get(event) is None
+    assert GroupSenderConcurrencyModule._stop_callback_records.get(
+        (umo, "user-1")
+    ) is None
+    assert follow_up._ACTIVE_AGENT_RUNNERS.get(umo) is other_runner
+    assert (
+        registry._agent_stop_callbacks.get(other_event)
+        == other_runner.request_stop
+    )
+
+    run(runtime.terminate())

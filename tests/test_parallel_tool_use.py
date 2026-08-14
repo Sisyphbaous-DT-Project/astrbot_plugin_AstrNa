@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import os
 import subprocess
 import sys
 import textwrap
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -393,6 +395,239 @@ def test_ambiguous_tool_name_is_rejected_before_execution():
     assert payload["results"][0]["ok"] is False
     assert "多个工具" in payload["results"][0]["result"]
     assert executor.calls == []
+
+
+class AsyncCheckerManager(FakeManager):
+    """模拟 AstrBot 4.27.3 的异步 ``_check_tool_permission``。"""
+
+    def __init__(self, *args, delay=0.0, error=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.delay = delay
+        self.error = error
+        self.entered = asyncio.Event()
+
+    async def _check_tool_permission(self, name, context):
+        self.permission_checks.append((name, context))
+        self.entered.set()
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        return "permission denied" if name in self.denied else None
+
+
+def test_async_permission_checker_allow_deny_and_builtin_bypass():
+    plugin = fake_tool("plugin_tool")
+    denied_tool = fake_tool("denied_tool")
+    builtin = fake_tool("builtin_tool")
+    manager = AsyncCheckerManager(
+        [plugin, denied_tool, builtin],
+        builtin={"builtin_tool"},
+        denied={"denied_tool"},
+    )
+    binding, context, executor, _hooks, manager = build_binding(
+        [plugin, denied_tool, builtin], manager=manager
+    )
+    executor.outputs = {
+        "plugin_tool": [text_result("ok")],
+        "denied_tool": [text_result("must not execute")],
+        "builtin_tool": [text_result("builtin ok")],
+    }
+
+    payload = result_payload(
+        call_bound(
+            binding,
+            context,
+            make_batch(("plugin_tool", {}), ("denied_tool", {}), ("builtin_tool", {})),
+        )
+    )["results"]
+
+    assert payload[0]["ok"] is True
+    assert payload[1]["ok"] is False
+    assert "权限检查未通过" in payload[1]["result"]
+    assert payload[2]["ok"] is True
+    checked = [name for name, _context in manager.permission_checks]
+    # 准入与 Executor 启动前各复核一次；内置工具按对象身份绕过；拒绝止于准入。
+    assert checked.count("plugin_tool") == 2
+    assert checked.count("denied_tool") == 1
+    assert "builtin_tool" not in checked
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+@pytest.mark.parametrize("error", [RuntimeError("boom"), TimeoutError("slow")])
+def test_permission_checker_errors_fail_closed(use_async, error):
+    tool = fake_tool("plugin_tool")
+    if use_async:
+        manager = AsyncCheckerManager([tool], error=error)
+    else:
+        manager = FakeManager([tool])
+
+        def broken_checker(name, context):
+            raise error
+
+        manager._check_tool_permission = broken_checker
+    binding, context, executor, _hooks, _manager = build_binding(
+        [tool], manager=manager
+    )
+    executor.outputs = {"plugin_tool": [text_result("must not execute")]}
+
+    payload = result_payload(
+        call_bound(binding, context, make_batch(("plugin_tool", {})))
+    )["results"]
+
+    assert payload[0]["ok"] is False
+    assert "权限复核失败" in payload[0]["result"]
+    assert "boom" not in payload[0]["result"]
+    assert "slow" not in payload[0]["result"]
+    assert executor.calls == []
+
+
+@pytest.mark.parametrize("result_value", [False, 0, object(), "denied"])
+def test_permission_checker_non_none_results_fail_closed(result_value):
+    tool = fake_tool("plugin_tool")
+    manager = FakeManager([tool])
+    manager._check_tool_permission = lambda name, context: result_value
+    binding, context, executor, _hooks, _manager = build_binding(
+        [tool], manager=manager
+    )
+    executor.outputs = {"plugin_tool": [text_result("must not execute")]}
+
+    payload = result_payload(
+        call_bound(binding, context, make_batch(("plugin_tool", {})))
+    )["results"]
+
+    assert payload[0]["ok"] is False
+    assert "权限检查未通过" in payload[0]["result"]
+    assert executor.calls == []
+
+
+def test_permission_checker_illegal_awaitable_fails_closed():
+    tool = fake_tool("plugin_tool")
+    manager = FakeManager([tool])
+
+    class IllegalAwaitable:
+        def __await__(self):
+            raise TypeError("not really awaitable")
+
+    manager._check_tool_permission = lambda name, context: IllegalAwaitable()
+    binding, context, executor, _hooks, _manager = build_binding(
+        [tool], manager=manager
+    )
+    executor.outputs = {"plugin_tool": [text_result("must not execute")]}
+
+    payload = result_payload(
+        call_bound(binding, context, make_batch(("plugin_tool", {})))
+    )["results"]
+
+    assert payload[0]["ok"] is False
+    assert "权限复核失败" in payload[0]["result"]
+    assert executor.calls == []
+
+
+def test_permission_checker_missing_fails_closed():
+    tool = fake_tool("plugin_tool")
+    manager = FakeManager([tool])
+    manager._check_tool_permission = None
+    binding, context, executor, _hooks, _manager = build_binding(
+        [tool], manager=manager
+    )
+    executor.outputs = {"plugin_tool": [text_result("must not execute")]}
+
+    payload = result_payload(
+        call_bound(binding, context, make_batch(("plugin_tool", {})))
+    )["results"]
+
+    assert payload[0]["ok"] is False
+    assert "无法复核工具权限" in payload[0]["result"]
+    assert executor.calls == []
+
+
+def test_sync_checker_returning_awaitable_is_awaited():
+    tool = fake_tool("plugin_tool")
+    manager = FakeManager([tool])
+    awaited = []
+
+    def checker(name, context):
+        async def resolve():
+            await asyncio.sleep(0)
+            awaited.append(name)
+            return None
+
+        return resolve()
+
+    manager._check_tool_permission = checker
+    binding, context, executor, _hooks, _manager = build_binding(
+        [tool], manager=manager
+    )
+    executor.outputs = {"plugin_tool": [text_result("ok")]}
+
+    payload = result_payload(
+        call_bound(binding, context, make_batch(("plugin_tool", {})))
+    )["results"]
+
+    assert payload[0]["ok"] is True
+    assert awaited == ["plugin_tool", "plugin_tool"]
+
+
+def test_permission_revoked_after_on_tool_start_blocks_executor():
+    tool = fake_tool("plugin_tool")
+    manager = FakeManager([tool])
+    binding, context, executor, hooks, manager = build_binding(
+        [tool], manager=manager
+    )
+    executor.outputs = {"plugin_tool": [text_result("must not execute")]}
+
+    original_start = hooks.on_tool_start
+
+    async def revoke_on_start(run_context, started_tool, args):
+        manager.denied.add("plugin_tool")
+        await original_start(run_context, started_tool, args)
+
+    hooks.on_tool_start = revoke_on_start
+
+    payload = result_payload(
+        call_bound(binding, context, make_batch(("plugin_tool", {})))
+    )["results"]
+
+    assert payload[0]["ok"] is False
+    assert "权限检查未通过" in payload[0]["result"]
+    assert executor.calls == []
+    assert len(hooks.ends) == 1  # 第二次复核失败仍通过 finally 调用一次 end hook
+
+
+def test_async_permission_checker_cancellation_propagates_without_leaks():
+    tool = fake_tool("plugin_tool")
+    manager = AsyncCheckerManager([tool], delay=30)
+    binding, context, executor, hooks, manager = build_binding(
+        [tool], manager=manager, timeout=60
+    )
+
+    async def scenario():
+        token = ptu._CURRENT_EXECUTION.set(binding)
+        try:
+            task = asyncio.create_task(
+                run_parallel_tool_calls(context, make_batch(("plugin_tool", {})))
+            )
+            await manager.entered.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            leaks = [
+                pending
+                for pending in asyncio.all_tasks()
+                if pending is not asyncio.current_task() and not pending.done()
+            ]
+            assert leaks == []
+            return hooks, executor
+        finally:
+            ptu._CURRENT_EXECUTION.reset(token)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        hooks, executor = run(scenario())
+        gc.collect()
+    assert executor.calls == []
+    assert hooks.ends == []  # 取消发生在 on_tool_start 前的准入阶段
 
 
 def test_recursion_direct_send_handoff_background_and_inactive_are_blocked():
@@ -1655,7 +1890,7 @@ def test_real_astrbot_manager_executor_runner_and_permission_contract():
             def clear_result(self): pass
 
         class Manager(FunctionToolManager):
-            def _check_tool_permission(self, name, context):
+            async def _check_tool_permission(self, name, context):
                 if name == "admin_tool" and not context.context.event.is_admin():
                     return "permission denied"
                 return None
@@ -1744,6 +1979,55 @@ def test_real_astrbot_manager_executor_runner_and_permission_contract():
                 )
                 stream_data = json.loads(streamed.content[0].text)
                 assert stream_data["results"][0]["result"] == "first\\n\\nsecond"
+
+                import mcp
+                from astrbot.core.agent.mcp_client import MCPTool
+
+                class FakeMCPClient:
+                    def __init__(self):
+                        self.calls = []
+                    async def call_tool_with_reconnect(
+                        self, tool_name, arguments, read_timeout_seconds
+                    ):
+                        self.calls.append(tool_name)
+                        return mcp.types.CallToolResult(
+                            content=[mcp.types.TextContent(
+                                type="text", text="mcp:" + tool_name
+                            )]
+                        )
+
+                mcp_client = FakeMCPClient()
+                mcp_tool = MCPTool(
+                    mcp_tool=mcp.types.Tool(
+                        name="remote.echo",
+                        description="d",
+                        inputSchema={{"type": "object", "properties": {{}}}},
+                    ),
+                    mcp_client=mcp_client,
+                    mcp_server_name="fake",
+                )
+                manager.func_list.append(mcp_tool)
+                mcp_binding = ptu._ExecutionBinding(
+                    tool_set=manager.get_full_tool_set(),
+                    runner=runner,
+                    run_context=run_context,
+                    executor=FunctionToolExecutor(),
+                    hooks=hooks,
+                    tool_manager=manager,
+                    allowlist=frozenset({{mcp_tool.name}}),
+                )
+                mcp_token = ptu._CURRENT_EXECUTION.set(mcp_binding)
+                try:
+                    mcp_result = await ptu.run_parallel_tool_calls(
+                        run_context,
+                        [{{"recipient_name": mcp_tool.name, "parameters": {{}}}}],
+                    )
+                finally:
+                    ptu._CURRENT_EXECUTION.reset(mcp_token)
+                mcp_data = json.loads(mcp_result.content[0].text)
+                assert mcp_data["results"][0]["ok"] is True
+                assert mcp_data["results"][0]["result"] == "mcp:remote.echo"
+                assert mcp_client.calls == ["remote.echo"]
             finally:
                 ptu._CURRENT_EXECUTION.reset(token)
 
@@ -1751,7 +2035,7 @@ def test_real_astrbot_manager_executor_runner_and_permission_contract():
         """
     )
     completed = subprocess.run(
-        [sys.executable, "-c", script],
+        [sys.executable, "-W", "error::RuntimeWarning", "-c", script],
         check=False,
         capture_output=True,
         text=True,
@@ -1786,6 +2070,14 @@ def test_real_astrbot_generation_reinstall_and_outer_cancellation():
         sp.get = lambda key, default=None, scope=None, scope_id=None: (
             {{"_default": {{}}}} if key == "tool_permissions" else
             [] if key == "inactivated_llm_tools" else default)
+        real_sp_global_get = getattr(sp, "global_get", None)
+
+        async def fake_global_get(key, default=None):
+            if key == "tool_permissions":
+                return {{"_default": {{}}}}
+            return default
+
+        sp.global_get = fake_global_get
 
         import astrna.modules.parallel_tool_use as gen1
 
@@ -1954,12 +2246,14 @@ def test_real_astrbot_generation_reinstall_and_outer_cancellation():
             await scenario_zombie()
             await scenario_cancel()
             sp.get = real_sp_get
+            if real_sp_global_get is not None:
+                sp.global_get = real_sp_global_get
 
         asyncio.run(main())
         """
     )
     completed = subprocess.run(
-        [sys.executable, "-c", script],
+        [sys.executable, "-W", "error::RuntimeWarning", "-c", script],
         check=False,
         capture_output=True,
         text=True,

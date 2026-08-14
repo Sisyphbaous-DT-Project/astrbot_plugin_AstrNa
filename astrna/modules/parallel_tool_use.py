@@ -773,7 +773,7 @@ async def _execute_one_tool(
     tool_name: str,
     parameters: dict[str, Any],
 ) -> _OneToolResult:
-    failure = _validate_target(binding, tool_name)
+    failure = await _validate_target(binding, tool_name)
     if failure is not None:
         return _failure(tool_name, failure)
 
@@ -858,7 +858,38 @@ async def _execute_one_tool(
     )
 
 
-def _validate_target(binding: _ExecutionBinding, tool_name: str) -> str | None:
+async def _check_tool_permission_async(
+    binding: _ExecutionBinding,
+    tool_name: str,
+) -> str | None:
+    """复核 AstrBot 工具权限，兼容同步与异步 checker，任何不确定都拒绝。
+
+    AstrBot 4.27.2 的 ``_check_tool_permission`` 是同步函数，4.27.3 起改为
+    ``async def``。这里每次只调用一次 checker，再按返回值是否为 awaitable
+    决定是否原地等待，因此两个版本以及"同步函数返回 awaitable"的过渡实现
+    都走同一条语义：仅严格 ``None`` 表示允许，其余任意结果一律拒绝；
+    checker 抛出的普通异常（含 TimeoutError 与非法 awaitable）转为不泄露
+    内部细节的拒绝；``CancelledError`` 原样传播。调用与等待都发生在当前
+    任务内，不会留下未等待的 coroutine，也不做版本号分支。
+    """
+    manager = binding.tool_manager
+    checker = getattr(manager, "_check_tool_permission", None)
+    if not callable(checker):
+        return "错误：当前 AstrBot 无法复核工具权限，已拒绝执行。"
+    try:
+        permission_error = checker(tool_name, binding.run_context)
+        if inspect.isawaitable(permission_error):
+            permission_error = await permission_error
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        return "错误：工具权限复核失败，已拒绝执行。"
+    if permission_error is not None:
+        return f"错误：工具 `{tool_name}` 的 AstrBot 权限检查未通过。"
+    return None
+
+
+async def _validate_target(binding: _ExecutionBinding, tool_name: str) -> str | None:
     if tool_name == PARALLEL_TOOL_NAME:
         return f"错误：禁止在 {PARALLEL_TOOL_NAME} 内部再次调用自身。"
     if tool_name not in binding.allowlist:
@@ -883,15 +914,9 @@ def _validate_target(binding: _ExecutionBinding, tool_name: str) -> str | None:
         return f"错误：工具名 `{tool_name}` 同时属于多个工具，无法安全确认执行对象。"
     is_builtin = _is_builtin_tool_instance(manager, tool, tool_name)
     if not is_builtin:
-        checker = getattr(manager, "_check_tool_permission", None)
-        if not callable(checker):
-            return "错误：当前 AstrBot 无法复核工具权限，已拒绝执行。"
-        try:
-            permission_error = checker(tool_name, binding.run_context)
-        except Exception:  # noqa: BLE001
-            return "错误：工具权限复核失败，已拒绝执行。"
+        permission_error = await _check_tool_permission_async(binding, tool_name)
         if permission_error is not None:
-            return f"错误：工具 `{tool_name}` 的 AstrBot 权限检查未通过。"
+            return permission_error
     if binding.executor is None or not callable(getattr(binding.executor, "execute", None)):
         return "错误：当前 AstrBot 环境缺少工具执行器。"
     return None
@@ -958,13 +983,7 @@ async def _execute_tool_results(
     manager = binding.tool_manager
     name = str(getattr(tool, "name", "") or "")
     if not _is_builtin_tool_instance(manager, tool, name):
-        checker = getattr(manager, "_check_tool_permission", None)
-        if not callable(checker):
-            raise _ToolPermissionChanged
-        try:
-            permission_error = checker(name, binding.run_context)
-        except Exception as exc:  # noqa: BLE001
-            raise _ToolPermissionChanged from exc
+        permission_error = await _check_tool_permission_async(binding, name)
         if permission_error is not None:
             raise _ToolPermissionChanged
 

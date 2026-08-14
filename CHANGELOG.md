@@ -1,5 +1,11 @@
 # 更新日志
 
+## 1.5.5
+
+- 修复 AstrBot `4.27.3` 将工具权限检查改为异步接口后，"LLM 并发工具调用"未等待检查协程、把非内置插件/MCP 工具误判为"权限检查未通过"的问题：权限复核现在先调用一次 checker，再按返回值是否为 awaitable 决定是否原地等待，同时兼容 `4.27.2` 的同步返回、`4.27.3` 的协程和同步函数返回 awaitable 的过渡实现；仅严格 `None` 表示允许，任意非 `None` 结果、checker 缺失、普通异常与非法 awaitable 全部保守拒绝，取消信号原样传播，不会留下未等待的协程。
+- 修复 AstrBot `4.27.3` 新增事件级 Agent 停止回调后，"解锁群聊并发回复"按群友隔离 Runner 的包装路径跳过原生注册、导致群聊 `/stop` 只能标记事件、无法即时请求 Runner 停止的问题：群发送者 Runner 现在仍不写入 AstrBot 原生全局 Runner 表（保持"群 + 发送者"隔离），但会镜像登记事件级 `request_stop` 回调；登记/注销按 Runner、事件和 callback 对象身份核对，Runner 替换、重复注册、迟到注销和 scheduler 先行清理在正常 Runner 生命周期下不产生残留或误删；Dashboard 热开启前已由原生路径登记的在途 Runner，注销时仍交还原生路径完整清理；插件重载（包括 AstrBot 先卸载旧版再加载新版的真实换代）期间在途 Runner 的即时停止保持有效，功能关闭时已登记的回调继续存活到 Runner 正常结束，由 AstrBot 事件收尾统一回收；`4.27.2` 无该回调接口时自动保持原语义，sender 隔离不变。
+- 更新兼容性说明：AstrNa `1.5.5` 已通过 AstrBot `4.27.3` 与 `4.27.2` 源码兼容验证；默认环境全量测试结果为 `844 passed, 13 skipped`，绑定 AstrBot `4.27.3` 与 `4.27.2` 源码运行全量测试结果均为 `857 passed`（各仅 1 条第三方弃用警告）。
+
 ## 1.5.4
 
 - 修复功能控制台“LLM 并发工具调用”允许名单把部分第三方插件工具误归为“未知来源”而不可选择的问题：来源识别此前只精确比较 `handler_module_path`，当插件（如弥亚开发工具箱）把工具路径统一改写为插件根路径 `data.plugins.<插件目录>` 时无法命中正式 `module_path`。现在保留正式路径精确匹配优先，同时支持经 `StarMetadata.root_dir_name` / `reserved` 验证的插件根目录匹配，普通插件根为 `data.plugins.<root_dir_name>`、保留插件为 `astrbot.builtin_stars.<root_dir_name>`，缺字段时只从正式路径自身推导根并兼容旧式 `plugins.<name>`。
