@@ -9,9 +9,9 @@ AstrNa 是一款面向 AstrBot 的优化插件，目标是在不修改 AstrBot C
 > 💌 售后：`777879783`
 > 有问题请加，清漪也会蹦出来一起捣鼓。
 
-🎉 AstrNa 当前正式版：`1.5.7`
+🎉 AstrNa 当前正式版：`1.5.8`
 
-当前已测试兼容 AstrBot 版本：`4.27.2 + 4.27.3`
+当前已测试兼容 AstrBot 版本：`4.27.2 + 4.27.3 + 4.27.4`
 
 - 仓库地址：[Sisyphbaous-DT-Project/astrbot_plugin_AstrNa](https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_AstrNa)
 - 作者主页：[Sisyphbaous-DT-Project](https://github.com/Sisyphbaous-DT-Project)
@@ -472,7 +472,7 @@ GitHub Token 是可选的。留空时只能生成草稿，不能自动提交。�
 
 ## 兼容性
 
-AstrNa 主要面向 AstrBot 当前 4.x 版本。当前正式版 `1.5.7` 已在 AstrBot `4.27.2` 与 `4.27.3` 源码环境中完成回归验证。
+AstrNa 主要面向 AstrBot 当前 4.x 版本。当前正式版 `1.5.8` 已在 AstrBot `4.27.2`、`4.27.3` 与 `4.27.4` 源码环境中完成回归验证。
 
 部分能力依赖平台：
 
@@ -481,20 +481,20 @@ AstrNa 主要面向 AstrBot 当前 4.x 版本。当前正式版 `1.5.7` 已在 A
 - 图像转述优化依赖 AstrBot 自带图片转述模型。
 - 图片历史上下文优化只清理 conversation history 中的 `data:image/...;base64` 图片块，不会改动当前请求的 `req.image_urls`。
 - 工具调用历史上下文优化只压缩已闭合工具事务的历史 `tool.content`；保留工具调用配对和最终回答，不处理当前 Agent Loop，也不移除每轮固定工具定义 schema。
-- LLM 并发工具调用依赖 AstrBot `4.27.2` / `4.27.3` 的真实请求 ToolSet、权限包装、Runner 钩子和原生工具执行器，同步（`4.27.2`）与异步（`4.27.3`）权限检查接口均已适配；允许名单不扩大当前会话权限范围，其他版本若更改这些内部入口会自动拒绝安装或拒绝执行。
+- LLM 并发工具调用依赖 AstrBot `4.27.2` / `4.27.3` / `4.27.4` 的真实请求 ToolSet、权限包装、Runner 钩子和原生工具执行器，同步（`4.27.2`）与异步（`4.27.3`、`4.27.4`）权限检查接口均已适配；允许名单不扩大当前会话权限范围，其他版本若更改这些内部入口会自动拒绝安装或拒绝执行。
 - 引用图片视觉输入优化依赖 AstrBot 自带引用图片解析能力；AstrNa 会兼容 NapCat / aiocqhttp 下 `bot.call_action` 的取图方式，并在当前 Reply 本地临时图片路径失效时尝试通过 OneBot 接口重新取图，只补当前 Reply 引用图片，可能增加本轮图片 token。
 - 回复历史标记依赖平台提供可靠的引用消息发送者信息；QQ 官方 Bot 当前引用消息缺少这个字段，无法安全区分被引用消息发送者和当前发言人，因此不支持该平台的引用回复指向优化。
 - 合并转发相关优化依赖 AstrBot 或输出插件使用标准 `Node` / `Nodes` 消息组件；OutputPro 生成的标准合并转发也会进入发送失败自适应拆包重试。
-- 群聊上下文优化依赖 AstrBot 自带群聊上下文感知和已配置的聊天模型供应商。
+- 群聊上下文优化依赖 AstrBot 自带群聊上下文感知和已配置的聊天模型供应商。AstrBot `4.27.4` 支持 JSON 卡片进入群聊上下文；在部分平台上，纯 JSON 卡片没有 `message_str`，主动回复可能被 AstrBot 上游的空 prompt 守卫静默跳过，但卡片仍可记录并注入后续文本请求。
 - 输出字数限制会包装 AstrBot 普通 LLM runner，只限制最终纯文本回复；开启后非白名单会话会关闭本轮流式输出，Live Mode 会保留流式并跳过限制。
-- 群聊并发回复会同时覆盖 AstrBot 内置和第三方 Agent Runner：同会话 LLM 锁按群友拆分粒度，同群实际发送再按整轮串行；历史保存只合并可信新增轮次，保留 AstrBot 已完成的截断、压缩或总结；与消息防抖插件共存时会优先保留防抖语义。AstrBot `4.27.3` 起 `/stop` 可在保持群友隔离的同时即时请求对应 Runner 停止；`4.27.2` 下保持事件停止标记语义，Runner 在下一检查点响应停止。
+- 群聊并发回复会同时覆盖 AstrBot 内置和第三方 Agent Runner：同会话 LLM 锁按群友拆分粒度，同群实际发送再按整轮串行；历史保存只合并可信新增轮次，保留 AstrBot 已完成的截断、压缩或总结；与消息防抖插件共存时会优先保留防抖语义。AstrBot `4.27.3` 及 `4.27.4` 起 `/stop` 可在保持群友隔离的同时即时请求对应 Runner 停止；`4.27.2` 下保持事件停止标记语义，Runner 在下一检查点响应停止。
 - 自动清理 AstrBot 缓存调用 AstrBot 原生 `StorageCleaner.cleanup("cache")`，只清理临时缓存，不清理日志；空闲检测覆盖主要 LLM 和发送链路，但不能感知所有第三方插件自己开的后台任务。
 - 自定义开启 AstrBot 内置指令依赖 AstrBot 核心内置指令仍注册在 `astrbot.builtin_stars.builtin_commands.main`，只细化 Core 内置指令，不管理扩展指令插件。
 - 自动报错分析与 Issue 助手依赖 AstrBot `on_plugin_error` hook、当前可用聊天模型和 GitHub REST API；不要求安装 GitHub CLI。
 
 ## 验证状态
 
-最近版本发布前通过以下验证，当前已测试兼容 AstrBot `4.27.2` 与 `4.27.3`：
+最近版本发布前通过以下验证，当前已测试兼容 AstrBot `4.27.2`、`4.27.3` 与 `4.27.4`：
 
 ```bash
 TMPDIR=/tmp PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q -s
@@ -504,7 +504,7 @@ python -m compileall -q .
 git diff --check
 ```
 
-默认环境全量测试结果为 `844 passed, 13 skipped`；绑定 AstrBot `4.27.3` 与 `4.27.2` 源码运行全量测试结果均为 `857 passed`（各仅 1 条第三方弃用警告）。`v4.27.2` 到 `v4.27.3` 的两处运行时变更（异步工具权限检查、事件级 Agent 停止回调）已由本版适配，其余 AstrNa 依赖的 Agent、发送、唤醒、消息事件和历史保存入口未发现需要调整的运行时补丁。
+默认环境全量测试结果为 `844 passed, 13 skipped`；本次绑定 AstrBot `4.27.4` 源码运行全量测试结果为 `857 passed`（仅 1 条无关第三方弃用警告）。此前 `v4.27.2` 与 `v4.27.3` 的兼容结果已记录在历史发布说明中。`v4.27.3` 到 `v4.27.4` 的变化未触碰 AstrNa 的并发工具权限、事件级 Agent 停止回调、Agent、发送、唤醒、消息事件和历史保存入口，未发现需要调整的运行时补丁。
 
 ## 设计原则
 

@@ -1,5 +1,13 @@
 # 更新日志
 
+## 1.5.8
+
+- 更新 AstrNa 正式版至 `1.5.8`，完成 AstrBot `4.27.4` 源码兼容性复核；本次无需修改 AstrNa 运行时逻辑。
+- 复核 AstrBot `v4.27.3..v4.27.4` 的 21 个提交和 59 个文件变化，确认并发工具权限检查、群发送者 `/stop`、Runner 生命周期、群聊上下文、历史保存和 Provider 请求入口均保持兼容。
+- 默认环境全量测试为 `844 passed, 13 skipped`；绑定 AstrBot `4.27.4` 源码全量测试为 `857 passed`，重点兼容性套件为 `314 passed`；`ruff`、`compileall` 与 `git diff --check` 均通过。
+- 记录 AstrBot `4.27.4` 新增的 JSON 卡片行为：在 aiocqhttp / OneBot 场景中，纯 JSON 卡片可以写入群聊上下文并注入后续文本请求；由于部分卡片没有 `message_str`，主动回复可能被 AstrBot 上游的空 prompt 守卫静默跳过，这不是 AstrNa 引起的问题。
+- 复核 AstrBot `4.27.4` SharedPreferences 按需读取改动；AstrNa 当前依赖的工具权限和停用工具状态仍可正常读取。同步 `sp.get()` 仅保留为低优先级弃用接口兼容路径。
+
 ## 1.5.7
 
 - 插件图标按 AstrBot 官方推荐尺寸规范化为 `256x256`：根目录 `logo.png` 由 `1254x1254` 原图等比缩放生成，仍为 `1:1` RGBA PNG，展示效果不变，文件体积从约 2.1MB 降至约 115KB。
