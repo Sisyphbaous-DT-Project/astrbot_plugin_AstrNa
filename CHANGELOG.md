@@ -1,5 +1,12 @@
 # 更新日志
 
+## 1.5.10
+
+- 适配 AstrBot `4.28.0-beta.1`：上游将上下文轮次配置从 `provider_settings.max_context_length` / `dequeue_context_length` 迁移到 `agent_runner.config.compression.max_turns` / `trim_turns`，迁移完成后旧键被移除。群聊上下文优化的压缩模型主会话历史预裁剪改为优先读取新位置，缺失或非法时回退旧位置，新旧 AstrBot 版本行为一致；不修复时预裁剪在 4.28 下静默失效，压缩提示词随历史增长变胖，极端长历史下压缩调用可能超限并静默退化为最近记录兜底。
+- 复核 AstrBot `v4.27.5..v4.28.0-beta.1` 的 50 个提交和 273 个文件变化，确认 AstrNa 依赖的 Agent 子阶段、唤醒检查、发送与消息事件、历史保存、工具注册与权限检查、群聊上下文和插件页面 API 等入口均保持兼容；4.28 迁移的 20 个旧配置键中 AstrNa 仅上述轮次键受影响。
+- 同步更新群聊上下文优化的 WebUI 说明与 README 措辞，按 AstrBot 版本区分上下文轮次配置键名。
+- 默认环境全量测试为 `849 passed, 13 skipped`；绑定 AstrBot `4.28.0-beta.1` 源码全量测试为 `862 passed`（仅 1 条无关第三方弃用警告）；`ruff`、`compileall` 与 `git diff --check` 均通过。
+
 ## 1.5.9
 
 - 更换 AstrNa 插件图标：根目录 `logo.png` 改为新版透明背景立绘，由 `1254x1254` 原图等比缩放为 AstrBot 官方推荐的 `256x256`，仍为 `1:1` RGBA PNG，文件体积约 115KB。

@@ -9,9 +9,9 @@ AstrNa 是一款面向 AstrBot 的优化插件，目标是在不修改 AstrBot C
 > 💌 售后：`777879783`
 > 有问题请加，清漪也会蹦出来一起捣鼓。
 
-🎉 AstrNa 当前正式版：`1.5.9`
+🎉 AstrNa 当前正式版：`1.5.10`
 
-当前已测试兼容 AstrBot 版本：`4.27.4`
+当前已测试兼容 AstrBot 版本：`4.28.0-beta.1`
 
 - 仓库地址：[Sisyphbaous-DT-Project/astrbot_plugin_AstrNa](https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_AstrNa)
 - 作者主页：[Sisyphbaous-DT-Project](https://github.com/Sisyphbaous-DT-Project)
@@ -242,7 +242,7 @@ AstrBot 原生主流程会把当前消息里的图片和引用图片整理进 `r
 - AstrBot 最近 N 条群聊滚动窗口。
 - 当前触发者昵称、用户 ID、群信息和当前待回复消息。
 
-AstrNa 会先调用你在子项中选择的聊天模型供应商，让它只做“相关上下文筛选 + 简短摘要”，然后把筛选结果作为临时内容注入给主模型。推荐选择 `deepseek-v4-flash` 这类便宜快速的小模型。主会话最近历史只提供给压缩模型用于判断相关性，不会被 AstrNa 额外重复注入给主模型；传给压缩模型的这份历史副本也会沿用 AstrBot 当前 `max_context_length` 和 `dequeue_context_length` 规则预裁剪，不会把截断前完整 conversation history 全量交给小模型。主模型自己的正式上下文截断仍由 AstrBot 原生链路处理。
+AstrNa 会先调用你在子项中选择的聊天模型供应商，让它只做“相关上下文筛选 + 简短摘要”，然后把筛选结果作为临时内容注入给主模型。推荐选择 `deepseek-v4-flash` 这类便宜快速的小模型。主会话最近历史只提供给压缩模型用于判断相关性，不会被 AstrNa 额外重复注入给主模型；传给压缩模型的这份历史副本也会沿用 AstrBot 当前的上下文轮次限制预裁剪（AstrBot 4.28 起读取 `agent_runner.config.compression` 下的 `max_turns` / `trim_turns`，更早版本读取 `provider_settings` 下的 `max_context_length` / `dequeue_context_length`），不会把截断前完整 conversation history 全量交给小模型。主模型自己的正式上下文截断仍由 AstrBot 原生链路处理。
 
 压缩模型和主模型都会看到一段当前触发者身份提示，用来区分“本轮要回复的人”和“历史相关消息的发送者/话题源头”。例如唤然先问了某个话题，笨蛋老哥后来接着这个话题追问，AstrNa 会提醒模型：当前触发者是笨蛋老哥，唤然只是历史话题源头，不要混成同一个人。
 
@@ -362,7 +362,7 @@ AstrBot 默认会让同一个群或私聊里的 LLM 回复排队执行。开启�
 
 同一个群的实际消息发送会按整轮排队。谁先产生第一条需要发送的消息，谁先获得发送权；获得后会连续发完本轮工具状态、工具直出、分段回复、媒体和合并转发，下一轮才能开始发送。因此两轮分段回复不会再出现 `A1、B1、A2、B2` 这样的穿插。普通群聊会自动关闭本轮流式输出，等模型生成出可发送内容后再进入队列；这不会取消后台 LLM 并发。
 
-并发请求保存历史时，AstrNa 会把 AstrBot 本轮完成截断、压缩或总结后的结果当作权威底稿。没有并发写入时会原样保存；确实有其他群友的请求先完成时，只补回那次请求新增的完整轮次，不会把 AstrBot 已经删掉的旧历史重新接回来。这样既保留并发分支，也让后续普通请求继续按 AstrBot 的 `max_context_length` / `dequeue_context_length` 等原生配置收缩，提示词缓存不会因为旧历史每轮滑动复活而持续失效。
+并发请求保存历史时，AstrNa 会把 AstrBot 本轮完成截断、压缩或总结后的结果当作权威底稿。没有并发写入时会原样保存；确实有其他群友的请求先完成时，只补回那次请求新增的完整轮次，不会把 AstrBot 已经删掉的旧历史重新接回来。这样既保留并发分支，也让后续普通请求继续按 AstrBot 的原生上下文轮次配置收缩，提示词缓存不会因为旧历史每轮滑动复活而持续失效。
 
 完整轮次从本轮真实用户消息开始，包含工具调用、工具结果、工具图片、内部续步、最终回复和 checkpoint。两次内容完全相同的真实提问仍会分别保存；如果 AstrNa 无法证明数据库最新版来自自己上一笔成功保存，或无法安全定位当前完整轮次，就直接采用 AstrBot 的本轮结果，宁可少保留极少数并发分支，也不会冒险让历史无界增长。该过程不会向模型提示词或数据库历史加入随机 ID、时间戳等缓存干扰内容。
 
@@ -472,7 +472,7 @@ GitHub Token 是可选的。留空时只能生成草稿，不能自动提交。�
 
 ## 兼容性
 
-AstrNa 主要面向 AstrBot 当前 4.x 版本。当前正式版 `1.5.9` 已在 AstrBot `4.27.4` 源码环境中完成回归验证。
+AstrNa 主要面向 AstrBot 当前 4.x 版本。当前正式版 `1.5.10` 已在 AstrBot `4.28.0-beta.1` 源码环境中完成回归验证。
 
 部分能力依赖平台：
 
@@ -485,7 +485,7 @@ AstrNa 主要面向 AstrBot 当前 4.x 版本。当前正式版 `1.5.9` 已在 A
 - 引用图片视觉输入优化依赖 AstrBot 自带引用图片解析能力；AstrNa 会兼容 NapCat / aiocqhttp 下 `bot.call_action` 的取图方式，并在当前 Reply 本地临时图片路径失效时尝试通过 OneBot 接口重新取图，只补当前 Reply 引用图片，可能增加本轮图片 token。
 - 回复历史标记依赖平台提供可靠的引用消息发送者信息；QQ 官方 Bot 当前引用消息缺少这个字段，无法安全区分被引用消息发送者和当前发言人，因此不支持该平台的引用回复指向优化。
 - 合并转发相关优化依赖 AstrBot 或输出插件使用标准 `Node` / `Nodes` 消息组件；OutputPro 生成的标准合并转发也会进入发送失败自适应拆包重试。
-- 群聊上下文优化依赖 AstrBot 自带群聊上下文感知和已配置的聊天模型供应商。AstrBot `4.27.4` 支持 JSON 卡片进入群聊上下文；在部分平台上，纯 JSON 卡片没有 `message_str`，主动回复可能被 AstrBot 上游的空 prompt 守卫静默跳过，但卡片仍可记录并注入后续文本请求。
+- 群聊上下文优化依赖 AstrBot 自带群聊上下文感知和已配置的聊天模型供应商。AstrBot `4.27.4` 起支持 JSON 卡片进入群聊上下文；在部分平台上，纯 JSON 卡片没有 `message_str`，主动回复可能被 AstrBot 上游的空 prompt 守卫静默跳过，但卡片仍可记录并注入后续文本请求。
 - 输出字数限制会包装 AstrBot 普通 LLM runner，只限制最终纯文本回复；开启后非白名单会话会关闭本轮流式输出，Live Mode 会保留流式并跳过限制。
 - 群聊并发回复会同时覆盖 AstrBot 内置和第三方 Agent Runner：同会话 LLM 锁按群友拆分粒度，同群实际发送再按整轮串行；历史保存只合并可信新增轮次，保留 AstrBot 已完成的截断、压缩或总结；与消息防抖插件共存时会优先保留防抖语义。AstrBot `4.27.3` 起 `/stop` 可在保持群友隔离的同时即时请求对应 Runner 停止；`4.27.2` 下保持事件停止标记语义，Runner 在下一检查点响应停止。
 - 自动清理 AstrBot 缓存调用 AstrBot 原生 `StorageCleaner.cleanup("cache")`，只清理临时缓存，不清理日志；空闲检测覆盖主要 LLM 和发送链路，但不能感知所有第三方插件自己开的后台任务。
@@ -494,7 +494,7 @@ AstrNa 主要面向 AstrBot 当前 4.x 版本。当前正式版 `1.5.9` 已在 A
 
 ## 验证状态
 
-最近版本发布前通过以下验证，当前已测试兼容 AstrBot `4.27.4`：
+最近版本发布前通过以下验证，当前已测试兼容 AstrBot `4.28.0-beta.1`：
 
 ```bash
 TMPDIR=/tmp PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q -s
@@ -504,7 +504,7 @@ python -m compileall -q .
 git diff --check
 ```
 
-默认环境全量测试结果为 `844 passed, 13 skipped`；本次绑定 AstrBot `4.27.4` 源码运行全量测试结果为 `857 passed`（仅 1 条无关第三方弃用警告）。此前 `v4.27.2` 与 `v4.27.3` 的兼容结果已记录在历史发布说明中。`v4.27.3` 到 `v4.27.4` 的变化未触碰 AstrNa 的并发工具权限、事件级 Agent 停止回调、Agent、发送、唤醒、消息事件和历史保存入口，未发现需要调整的运行时补丁。
+默认环境全量测试结果为 `849 passed, 13 skipped`；本次绑定 AstrBot `4.28.0-beta.1` 源码运行全量测试结果为 `862 passed`（仅 1 条无关第三方弃用警告）。此前 `v4.27.2` 到 `v4.27.4` 的兼容结果已记录在历史发布说明中。`v4.27.4` 到 `v4.28.0-beta.1` 的变化中，AstrBot 将上下文轮次配置迁移到 Agent Runner 配置（`agent_runner.config.compression.max_turns` / `trim_turns`）并移除旧键，本次已适配该迁移；其余 Agent、发送、唤醒、消息事件、历史保存和工具链路入口未发现需要调整的运行时补丁。
 
 ## 设计原则
 

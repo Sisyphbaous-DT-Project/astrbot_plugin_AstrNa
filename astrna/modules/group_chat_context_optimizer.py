@@ -813,8 +813,7 @@ class GroupChatContextOptimizerModule:
         if not isinstance(contexts, list):
             return contexts
 
-        settings = self.resolve_provider_settings(group_context, event)
-        truncation = parse_context_truncation_settings(settings)
+        truncation = self.resolve_context_truncation_settings(group_context, event)
         if truncation is None:
             return contexts
 
@@ -833,12 +832,37 @@ class GroupChatContextOptimizerModule:
             )
         return trimmed
 
-    def resolve_provider_settings(self, group_context: Any, event: Any) -> Any:
+    def resolve_context_truncation_settings(
+        self,
+        group_context: Any,
+        event: Any,
+    ) -> tuple[int, int] | None:
         for context in (self.context, getattr(group_context, "context", None)):
             config = get_context_config(context, event)
-            settings = get_config_value(config, "provider_settings", None)
-            if settings is not None:
-                return settings
+            if config is None:
+                continue
+            # AstrBot 4.28 起，上下文轮次配置迁移到 agent_runner.config.compression
+            compression = get_config_value(
+                get_config_value(
+                    get_config_value(config, "agent_runner", None),
+                    "config",
+                    None,
+                ),
+                "compression",
+                None,
+            )
+            truncation = parse_context_truncation_values(
+                get_config_value(compression, "max_turns", None),
+                get_config_value(compression, "trim_turns", 1),
+            )
+            if truncation is not None:
+                return truncation
+            # 旧版 AstrBot 的轮次配置位于 provider_settings
+            truncation = parse_context_truncation_settings(
+                get_config_value(config, "provider_settings", None),
+            )
+            if truncation is not None:
+                return truncation
         return None
 
     async def build_rolling_group_context(
@@ -1246,9 +1270,17 @@ def get_context_tool_calls(item: Any) -> Any:
 
 
 def parse_context_truncation_settings(settings: Any) -> tuple[int, int] | None:
-    max_context_length = parse_int_setting(
+    return parse_context_truncation_values(
         get_config_value(settings, "max_context_length", None),
+        get_config_value(settings, "dequeue_context_length", 1),
     )
+
+
+def parse_context_truncation_values(
+    max_value: Any,
+    dequeue_value: Any,
+) -> tuple[int, int] | None:
+    max_context_length = parse_int_setting(max_value)
     if max_context_length is None:
         return None
     if max_context_length == -1:
@@ -1256,9 +1288,7 @@ def parse_context_truncation_settings(settings: Any) -> tuple[int, int] | None:
     if max_context_length <= 0:
         return None
 
-    dequeue_context_length = parse_int_setting(
-        get_config_value(settings, "dequeue_context_length", 1),
-    )
+    dequeue_context_length = parse_int_setting(dequeue_value)
     if dequeue_context_length is None:
         dequeue_context_length = 1
     dequeue_context_length = min(max(1, dequeue_context_length), max_context_length - 1)
