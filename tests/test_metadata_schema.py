@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.5.10"
+    assert metadata["version"] == "1.6.1"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -54,6 +54,9 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "provide_group_identity_tools",
         "parallel_tool_use_enabled",
         "parallel_tool_use_allowlist",
+        "provider_session_headers_enabled",
+        "provider_session_headers_user_agent",
+        "provider_session_headers_extra_name",
         "optimize_reply_target_history",
         "disable_group_at_bot_wake",
         "disable_group_at_bot_wake_all_groups",
@@ -469,6 +472,7 @@ def test_changelog_contains_release_notes():
     assert "## 1.5.8" in changelog
     assert "## 1.5.9" in changelog
     assert "## 1.5.10" in changelog
+    assert "## 1.6.1" in changelog
     assert "## 1.2.5" in changelog
     assert "## 1.2.4" in changelog
 

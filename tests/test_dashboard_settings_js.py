@@ -24,6 +24,7 @@ EXPECTED_PARENTS_WITH_SETTINGS = {
     "disable_group_reply_to_bot_wake",
     "custom_builtin_commands_enabled",
     "parallel_tool_use_enabled",
+    "provider_session_headers_enabled",
     "issue_assistant_enabled",
 }
 
@@ -44,7 +45,7 @@ def test_setting_animation_ids_match_backend_registry():
       const {{ SETTING_ANIMATION_IDS }} = await import(moduleUrl);
       const backend = {backend};
       assert.deepEqual(SETTING_ANIMATION_IDS, backend);
-      assert.equal(new Set(SETTING_ANIMATION_IDS).size, 20);
+      assert.equal(new Set(SETTING_ANIMATION_IDS).size, 22);
     """
     subprocess.run(
         ["node", "--input-type=module", "--eval", script],
@@ -161,6 +162,15 @@ def test_controls_follow_polled_dependency_and_options():
     assert "select.value = control.dirty ? (control.draft || \"\") : (control.base || \"\");" in text
 
 
+def test_secret_and_text_controls_have_own_base_control():
+    """secret/text 两种控件都必须持有自己的 baseControl，避免相互借用导致构造报错。"""
+    text = _read("settings-window.js")
+    for name in ("makeTextControl", "makeSecretControl"):
+        body = text.split(f"function {name}(setting) {{", 1)[1]
+        body = body.split("\n  function ", 1)[0]
+        assert "const control = baseControl(setting);" in body, name
+
+
 def test_setting_save_warnings_sync_memory_state():
     # 子配置保存产生的 warnings 必须回写 state.warnings，
     # 否则主开关保存失败时会重画旧 warnings。
@@ -168,12 +178,12 @@ def test_setting_save_warnings_sync_memory_state():
     assert "state.warnings = Array.isArray(warnings) ? warnings : [];" in app
 
 
-def test_fallback_catalog_keeps_20_settings_readonly():
+def test_fallback_catalog_keeps_22_settings_readonly():
     text = _read("fallback-catalog.js")
     for parent in EXPECTED_PARENTS_WITH_SETTINGS:
         assert f"{parent}: [" in text, parent
-    # 20 个静态子配置条目
-    assert text.count("    setting(") == 20
+    # 22 个静态子配置条目
+    assert text.count("    setting(") == 22
     # 状态未知时不能伪装成真实值
     assert "value: null" in text
     assert "configured: null" in text
@@ -194,6 +204,7 @@ def test_settings_css_hooks():
         ".command-multi",
         ".tool-multi",
         ".secret-control",
+        ".text-control",
     ):
         assert hook in css, hook
     # 窄屏切换为顶部下拉

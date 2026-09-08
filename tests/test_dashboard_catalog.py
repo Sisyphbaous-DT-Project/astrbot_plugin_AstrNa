@@ -28,6 +28,7 @@ EXPECTED_ORDER = [
     "output_length_limit_enabled",
     "provide_group_identity_tools",
     "parallel_tool_use_enabled",
+    "provider_session_headers_enabled",
     "optimize_reply_target_history",
     "disable_group_at_bot_wake",
     "disable_group_reply_to_bot_wake",
@@ -68,7 +69,7 @@ def _walk_strings(payload):
 
 def test_switch_keys_exact_order_and_count():
     assert list(SWITCH_KEYS) == EXPECTED_ORDER
-    assert len(SWITCH_KEYS) == 21
+    assert len(SWITCH_KEYS) == 22
     assert [feature["key"] for feature in FEATURES] == EXPECTED_ORDER
 
 
@@ -91,7 +92,7 @@ def test_feature_copy_is_complete():
 
 def test_build_state_defaults_all_disabled():
     state = build_state({})
-    assert len(state["features"]) == 21
+    assert len(state["features"]) == 22
     assert all(feature["enabled"] is False for feature in state["features"])
     assert state["warnings"] == []
 

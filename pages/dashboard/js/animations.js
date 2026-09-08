@@ -875,6 +875,45 @@ function buildParallelToolUse(stage, ctx) {
   });
 }
 
+/* ---------- 供应商会话请求头 ---------- */
+function buildProviderSessionHeaders(stage, ctx) {
+  return stateful(stage, {
+    before: "开启前：SDK 默认 UA、无会话头，部分上游直接 400",
+    after: "开启后：真实身份 + 按会话稳定的 sha256 会话章",
+  }, ctx, (svg, beforeG, afterG, { gsap }) => {
+    box(beforeG, 30, 95, 120, 50, "#123f5a");
+    label(beforeG, 42, 116, "User-Agent:", { size: 10, color: COLOR.gray });
+    label(beforeG, 42, 132, "AsyncOpenAI/…", { size: 10, color: COLOR.warn });
+    const beforeFlow = arrow(beforeG, 152, 120, 218, 120, COLOR.warn);
+    box(beforeG, 220, 95, 150, 50, "#3d2020");
+    label(beforeG, 232, 116, "上游网关", { size: 10 });
+    label(beforeG, 232, 132, "400 拒绝", { size: 10, color: COLOR.bad, bold: true });
+    label(beforeG, 30, 190, "身份笼统、无 x-opencode-session", { size: 11, color: COLOR.bad });
+
+    box(afterG, 18, 60, 170, 62, "#0a2b2b", { stroke: COLOR.ok });
+    label(afterG, 28, 80, "UA: AstrBot/… AstrNa/…", { size: 10, color: COLOR.ok });
+    label(afterG, 28, 98, "x-opencode-session:", { size: 10, color: COLOR.gray });
+    label(afterG, 28, 114, "astrna-<sha256 摘要>", { size: 10, color: COLOR.ok });
+    const stamp = box(afterG, 200, 70, 60, 42, "#4a3a1d", { stroke: COLOR.warn });
+    label(afterG, 230, 95, "盖章", { size: 11, anchor: "middle", color: COLOR.warn });
+    const afterFlow = arrow(afterG, 262, 91, 318, 91, COLOR.ok);
+    box(afterG, 320, 66, 70, 50, "#1d4a1d", { stroke: COLOR.ok });
+    label(afterG, 355, 88, "上游", { size: 10, anchor: "middle" });
+    label(afterG, 355, 106, "200 √", { size: 10, anchor: "middle", color: COLOR.ok, bold: true });
+    const cache = chip(afterG, "群 A 标识", 18, 160, COLOR.info);
+    const cache2 = chip(afterG, "群 B 标识", 118, 160, COLOR.purple);
+    label(afterG, 230, 178, "会话标识供上游优化路由/缓存", { size: 10, color: COLOR.ok });
+    label(afterG, 18, 225, "只发送 sha256 摘要，不含原始账号或群号 √", { size: 10, color: COLOR.ok });
+    return {
+      animateBefore: () => gsap.to(beforeFlow, { opacity: 0.25, duration: 0.45, repeat: -1, yoyo: true }),
+      animateAfter: () => gsap.timeline({ repeat: -1 })
+        .fromTo(stamp, { opacity: 0.3 }, { opacity: 1, duration: 0.35 })
+        .to([afterFlow, cache, cache2], { opacity: 0.35, duration: 0.4 })
+        .to([afterFlow, cache, cache2], { opacity: 1, duration: 0.4 }),
+    };
+  });
+}
+
 /* ---------- 21. 自动报错分析与 Issue 助手 ---------- */
 function buildIssueAssistant(stage, ctx) {
   return stateful(stage, {
@@ -936,6 +975,7 @@ const BUILDERS = {
   output_length_limit_enabled: buildOutputLength,
   provide_group_identity_tools: buildGroupIdentityTools,
   parallel_tool_use_enabled: buildParallelToolUse,
+  provider_session_headers_enabled: buildProviderSessionHeaders,
   optimize_reply_target_history: buildReplyTarget,
   disable_group_at_bot_wake: buildWakeSuppression("at"),
   disable_group_reply_to_bot_wake: buildWakeSuppression("reply"),

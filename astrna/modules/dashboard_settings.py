@@ -1,6 +1,6 @@
 """Dashboard 子配置目录、安全状态与单项更新交易。
 
-本模块显式登记 9 个父功能共 20 项允许在 Dashboard 编辑的子配置。
+本模块显式登记 10 个父功能共 22 项允许在 Dashboard 编辑的子配置。
 未登记的配置键不会出现在状态接口里，也无法通过 setting 接口写入；
 不会从 `_conf_schema.json` 自动暴露任何新增配置。
 
@@ -38,6 +38,7 @@ from .forward_nodes import (
     FORWARD_NODE_MAX_LENGTH_DEFAULT,
 )
 from .parallel_tool_use import ambiguous_tool_names, blocked_tool_reason
+from .provider_session_headers import ProviderSessionHeadersModule
 
 # ---------------------------------------------------------------------------
 # 注册表
@@ -51,6 +52,7 @@ CONTROL_COMMAND_MULTI = "command_multi"
 CONTROL_TOOL_MULTI = "tool_multi"
 CONTROL_PROTECTED_LIST = "protected_list"
 CONTROL_SECRET = "secret"
+CONTROL_TEXT = "text"
 
 SENSITIVE_NONE = "none"
 SENSITIVE_LIST = "list"
@@ -255,6 +257,25 @@ SETTINGS: tuple[dict[str, Any], ...] = (
             "只选择互不依赖、主要返回数据、不会直接操纵聊天或共享状态的工具",
             "新安装的工具默认不授权，必须由管理员再次选择",
         ),
+    ),
+    # 供应商会话请求头（2）
+    _setting(
+        "provider_session_headers_user_agent",
+        "provider_session_headers_enabled",
+        CONTROL_BOOL,
+        "替换供应商默认 User-Agent",
+        "仅在请求的 User-Agent 以 SDK 出厂前缀开头时，替换为真实的 AstrBot/AstrNa 标识；普通手填值不会被覆盖。",
+        "session-header-ua",
+        notes=("以 SDK 前缀开头的手填 User-Agent 会被视为默认值替换",),
+    ),
+    _setting(
+        "provider_session_headers_extra_name",
+        "provider_session_headers_enabled",
+        CONTROL_TEXT,
+        "额外会话头名",
+        "除 x-opencode-session 外，再用同一个会话 id 多写一个自定义头名，供其他上游识别。",
+        "session-header-extra",
+        notes=("仅允许字母、数字和连字符，最长 64 字符；不能覆盖鉴权或请求控制头；留空表示不加",),
     ),
     # Issue 助手（3）
     _setting(
@@ -917,6 +938,9 @@ def _build_setting_state(
         entry["state"] = {
             "configured": bool(isinstance(raw, str) and raw.strip()),
         }
+    elif control == CONTROL_TEXT:
+        raw = config.get(key, "")
+        entry["state"] = {"value": raw if isinstance(raw, str) else ""}
     return entry
 
 
@@ -1087,6 +1111,16 @@ def _resolve_new_value(
             return []
         raise ValueError("未知的列表操作")
 
+    if control == CONTROL_TEXT:
+        if action is not None:
+            raise ValueError("未知的操作类型")
+        value = _validate_optional_text(payload.get("value"), "额外会话头名")
+        if len(value) > 64:
+            raise ValueError("额外会话头名最长 64 字符")
+        if value and not ProviderSessionHeadersModule.normalize_extra_header_name(value):
+            raise ValueError("额外会话头名仅允许字母、数字和连字符，且不能覆盖保留头")
+        return value
+
     raise ValueError("未知的子配置类型")
 
 
@@ -1102,6 +1136,8 @@ def _default_for(setting: dict[str, Any]) -> Any:
         return 1
     if control in (CONTROL_COMMAND_MULTI, CONTROL_TOOL_MULTI, CONTROL_PROTECTED_LIST):
         return []
+    if control == CONTROL_TEXT:
+        return ""
     return ""
 
 

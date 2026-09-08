@@ -29,6 +29,7 @@ from .modules.output_length_limiter import (
     normalize_whitelist_umo_items,
 )
 from .modules.parallel_tool_use import ParallelToolUseModule
+from .modules.provider_session_headers import ProviderSessionHeadersModule
 from .modules.quoted_image_input import QuotedImageInputModule
 from .modules.reply_target_history import ReplyTargetHistoryModule
 from .modules.send_message_to_user import SendMessageToUserModule
@@ -61,6 +62,9 @@ DEFAULT_CONFIG = {
     "provide_group_identity_tools": False,
     "parallel_tool_use_enabled": False,
     "parallel_tool_use_allowlist": [],
+    "provider_session_headers_enabled": False,
+    "provider_session_headers_user_agent": True,
+    "provider_session_headers_extra_name": "",
     "optimize_reply_target_history": False,
     "disable_group_at_bot_wake": False,
     "disable_group_at_bot_wake_all_groups": False,
@@ -79,7 +83,7 @@ DEFAULT_CONFIG = {
     "custom_builtin_commands_allowlist": [],
 }
 
-# Dashboard 允许编辑的子配置严格白名单（20 项，注册表见 dashboard_settings）。
+# Dashboard 允许编辑的子配置严格白名单（22 项，注册表见 dashboard_settings）。
 DASHBOARD_SETTING_KEYS = frozenset(_DASHBOARD_SETTING_KEY_TUPLE)
 
 _FORWARD_LENGTH_SETTING_KEYS = frozenset(
@@ -110,6 +114,12 @@ _ISSUE_ASSISTANT_SETTING_KEYS = frozenset(
     }
 )
 _PARALLEL_TOOL_SETTING_KEYS = frozenset({"parallel_tool_use_allowlist"})
+_PROVIDER_SESSION_HEADER_SETTING_KEYS = frozenset(
+    {
+        "provider_session_headers_user_agent",
+        "provider_session_headers_extra_name",
+    }
+)
 
 
 class AstrNaRuntime:
@@ -121,6 +131,7 @@ class AstrNaRuntime:
         config: dict | None,
         logger: Any,
         kv_store: Any | None = None,
+        plugin_version: str = "unknown",
     ):
         self.context = context
         _migrate_output_length_whitelist_config(config)
@@ -169,6 +180,14 @@ class AstrNaRuntime:
             allowlist=self.config.get("parallel_tool_use_allowlist", []),
         )
         self.group_sender_concurrency = GroupSenderConcurrencyModule(logger=logger)
+        self.provider_session_headers = ProviderSessionHeadersModule(
+            logger=logger,
+            plugin_version=plugin_version,
+            extra_header_name=self.config.get("provider_session_headers_extra_name", ""),
+            replace_user_agent=self.config.get(
+                "provider_session_headers_user_agent", True
+            ),
+        )
         self.long_reply_context = LongReplyContextModule(logger=logger)
         self.group_chat_context_optimizer = GroupChatContextOptimizerModule(
             context=context,
@@ -250,6 +269,7 @@ class AstrNaRuntime:
             self.group_chat_context_optimizer.install()
         self._configure_waking_check_chain()
         self._configure_auto_cache_cleanup()
+        self._configure_provider_session_headers()
 
     def update_dashboard_switch(self, key: str, value: bool) -> None:
         """同步功能控制台修改的单个布尔主开关到合并配置副本。
@@ -264,11 +284,13 @@ class AstrNaRuntime:
         self.config[key] = value
         if key == "parallel_tool_use_enabled":
             self._configure_parallel_tool_use()
+        elif key == "provider_session_headers_enabled":
+            self._configure_provider_session_headers()
 
     def update_dashboard_setting(self, key: str, value: Any) -> None:
         """同步功能控制台修改的单个子配置，并按组热同步相关模块。
 
-        严格白名单：只接受 DASHBOARD_SETTING_KEYS 中的 20 个键；列表值写入
+        严格白名单：只接受 DASHBOARD_SETTING_KEYS 中的 22 个键；列表值写入
         副本，前端对象不会继续引用 Runtime 配置。各组同步规则：
         - 身份元数据四项：只写配置，下一次 LLM 请求读取；
         - 合并转发长度：重新配置 ForwardNodesModule，无需重启插件；
@@ -330,6 +352,8 @@ class AstrNaRuntime:
             self._configure_issue_assistant()
         elif key in _PARALLEL_TOOL_SETTING_KEYS:
             self._configure_parallel_tool_use()
+        elif key in _PROVIDER_SESSION_HEADER_SETTING_KEYS:
+            self._configure_provider_session_headers()
         # 身份元数据四项只写配置，下一次 LLM 请求由 sanitize_request 读取。
 
     async def sanitize_request(self, event: Any, req: Any) -> None:
@@ -464,6 +488,10 @@ class AstrNaRuntime:
             self.deepseek_v4_400.sanitize(event, req)
         else:
             self.deepseek_v4_400.terminate()
+
+        # 供应商会话请求头：每个请求复核一次，热添加的供应商与 Gemini
+        # set_key 重建的客户端在进门时由包装器懒挂钩。
+        self._configure_provider_session_headers()
 
         if (
             self.config.get("parallel_tool_use_enabled", False)
@@ -632,6 +660,22 @@ class AstrNaRuntime:
         else:
             self.parallel_tool_use.terminate()
 
+    def _configure_provider_session_headers(self) -> None:
+        """按主开关热安装或卸载供应商会话请求头，并同步两个子配置。"""
+        if getattr(self, "_closed", False):
+            # 插件已终止：被 shield 保护的旧 Dashboard 保存任务不得重新激活。
+            return
+        self.provider_session_headers.configure(
+            extra_header_name=self.config.get("provider_session_headers_extra_name", ""),
+            replace_user_agent=self.config.get(
+                "provider_session_headers_user_agent", True
+            ),
+        )
+        if self.config.get("provider_session_headers_enabled", False):
+            self.provider_session_headers.install(self.context)
+        else:
+            self.provider_session_headers.terminate()
+
     def _configure_group_context_persist_callback(self) -> None:
         if self.config.get("optimize_group_chat_context", False):
             self.long_reply_context.group_context_persist_callback = (
@@ -742,6 +786,8 @@ class AstrNaRuntime:
         # 全部插件加载完成后复核并发工具注册：后加载插件的同名 @llm_tool 会
         # 经 AstrBot add_func 按名删除我们的注册对象，需要在此让名或自愈。
         self._configure_parallel_tool_use()
+        # 同样复核供应商会话请求头：其他插件加载可能新建 provider 实例。
+        self._configure_provider_session_headers()
 
     def record_activity(self) -> None:
         self.auto_cache_cleanup.mark_activity()
@@ -812,6 +858,8 @@ class AstrNaRuntime:
         self.group_wake_suppression.terminate()
         self.builtin_command_allowlist.terminate()
         self.parallel_tool_use.terminate()
+        # 会话请求头必须在第一个 await 前拆除，避免中途异常把钩子残留在 httpx 客户端里。
+        self.provider_session_headers.terminate()
         await self.issue_assistant.terminate()
         self.group_sender_concurrency.terminate()
         self.group_chat_context_optimizer.terminate()

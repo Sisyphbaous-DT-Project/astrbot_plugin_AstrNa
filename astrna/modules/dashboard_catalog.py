@@ -2,7 +2,7 @@
 
 本模块只负责两件事：
 
-1. 生成 21 个主开关的静态文案与安全状态摘要（绝不包含 Token、UMO、
+1. 生成 22 个主开关的静态文案与安全状态摘要（绝不包含 Token、UMO、
    群号等敏感原文）。
 2. 校验并应用单个主开关的修改，写回共享配置对象、持久化，并同步
    Runtime 的合并配置副本。
@@ -33,6 +33,7 @@ SWITCH_KEYS: tuple[str, ...] = (
     "output_length_limit_enabled",
     "provide_group_identity_tools",
     "parallel_tool_use_enabled",
+    "provider_session_headers_enabled",
     "optimize_reply_target_history",
     "disable_group_at_bot_wake",
     "disable_group_reply_to_bot_wake",
@@ -209,6 +210,23 @@ FEATURES: tuple[dict[str, Any], ...] = (
         ),
         experimental=True,
         confirm_before_enable=True,
+    ),
+    _feature(
+        "provider_session_headers_enabled",
+        "供应商会话请求头",
+        "给所有 LLM 供应商请求盖上按会话稳定的身份章与真实 User-Agent。",
+        "每个发往模型上游的请求都会附加 x-opencode-session 会话头：群聊、私聊各有"
+        "稳定的会话标识，支持它的上游可据此优化路由和提示词缓存；是否独占缓存、"
+        "是否每次命中仍由上游决定。会话标识经过 sha256 摘要，不包含原始账号或群号。"
+        "opencode go 等上游要求请求明确标识自身并携带该头，否则直接拒绝；开启后"
+        "同时把 SDK 出厂的笼统 User-Agent 替换为真实的 AstrBot/AstrNa 标识。",
+        ("使用 opencode go 等要求会话头的上游时", "希望上游按会话优化路由和缓存时"),
+        (
+            "默认关闭；对所有 LLM 供应商生效",
+            "新增的会话头只发送 sha256 摘要，不发送原始账号、群号或会话标识",
+            "不传会话 id 的辅助调用（如上下文压缩）使用固定标识，仅用于携带合规会话头",
+            "普通手填 User-Agent 不会被覆盖；以 SDK 默认前缀开头的手填 UA 会视为默认值替换",
+        ),
     ),
     _feature(
         "optimize_reply_target_history",

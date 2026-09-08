@@ -62,16 +62,17 @@ class AstrNa(Star):
 
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
+        self._plugin_version = _read_plugin_version()
         self.runtime = AstrNaRuntime(
             context=context,
             config=config,
             logger=logger,
             kv_store=self,
+            plugin_version=self._plugin_version,
         )
         # 共享配置对象（生产环境为 AstrBotConfig），供功能控制台读写同一个
         # 配置实例，与 AstrBot 原插件配置页双向同步。
         self._shared_config = config if config is not None else {}
-        self._plugin_version = _read_plugin_version()
         self._register_dashboard_apis()
 
     def _register_dashboard_apis(self) -> None:

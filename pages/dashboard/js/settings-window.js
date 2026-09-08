@@ -37,6 +37,7 @@ function semanticValue(setting) {
     case "protected_list":
       return { count: state.count, overridden: Boolean(setting.overridden) };
     case "secret": return state.configured;
+    case "text": return typeof state.value === "string" ? state.value : null;
     default: return null;
   }
 }
@@ -65,6 +66,10 @@ function statusSummary(setting) {
     case "secret":
       return typeof state.configured === "boolean"
         ? (state.configured ? "已配置" : "未配置")
+        : "状态未知";
+    case "text":
+      return typeof state.value === "string"
+        ? (state.value ? state.value : "未设置")
         : "状态未知";
     default: return "";
   }
@@ -777,6 +782,52 @@ export function openSettings({
     return control;
   }
 
+  function makeTextControl(setting) {
+    const control = baseControl(setting);
+    const wrap = document.createElement("div");
+    wrap.className = "text-control";
+    wrap.innerHTML = `
+      <input class="setting-input" type="text" autocomplete="off" spellcheck="false">
+      <button class="btn small apply-btn" type="button">应用</button>`;
+    control.el = wrap;
+    const input = wrap.querySelector("input");
+    const applyBtn = wrap.querySelector(".apply-btn");
+    if (setting.key === "provider_session_headers_extra_name") {
+      input.placeholder = "例如 x-session-id；留空表示不加";
+    }
+    control.draft = control.base;
+    control.displayValue = () => (control.dirty ? control.draft : control.base);
+    const syncDraft = (value) => {
+      control.draft = value.trim();
+      control.dirty = !sameValue(control.draft, control.base);
+      control.conflict = false;
+      if (animation) animation.setValue(control.draft);
+      control.render();
+    };
+    input.addEventListener("input", () => syncDraft(input.value));
+    applyBtn.addEventListener("click", () => {
+      if (control.conflict || !control.dirty) return;
+      save(setting, { key: setting.key, value: control.draft }, control);
+    });
+    control.render = () => {
+      if (!control.dirty) input.value = typeof control.base === "string" ? control.base : "";
+      applyBtn.disabled = control.busy || readOnly() || !control.dirty || control.conflict;
+      input.disabled = control.busy || readOnly();
+      wrap.classList.toggle("conflict", control.conflict);
+    };
+    control.rollback = () => {
+      const latest = getSetting(setting.key) || setting;
+      control.dirty = false;
+      control.conflict = false;
+      control.base = semanticValue(latest);
+      control.draft = typeof control.base === "string" ? control.base : "";
+      if (animation) animation.setValue(control.base);
+      control.render();
+    };
+    control.render();
+    return control;
+  }
+
   function makeSecretControl(setting) {
     const control = baseControl(setting);
     const wrap = document.createElement("div");
@@ -928,6 +979,7 @@ export function openSettings({
     tool_multi: makeToolMultiControl,
     secret: makeSecretControl,
     protected_list: makeProtectedListControl,
+    text: makeTextControl,
   };
 
   /* ---------- 面板渲染 ---------- */

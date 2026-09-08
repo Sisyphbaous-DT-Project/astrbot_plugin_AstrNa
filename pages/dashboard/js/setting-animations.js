@@ -1,5 +1,5 @@
 /**
- * 20 项子配置的专属原理动画。
+ * 22 项子配置的专属原理动画。
  * 与主功能动画共用同一套 SVG 视觉语言；每个标签驱动真实的数据流与解释，
  * 布尔值立即切换，数字/选择项以草稿值预览；减少动态模式下不启动循环时间轴，
  * 布尔场景始终以双路径静态呈现“关闭路径 / 开启路径”的前后状态。
@@ -615,6 +615,66 @@ function buildIssueNotify(stage, ctx) {
   });
 }
 
+/* ---------- 供应商会话请求头 ---------- */
+
+function buildSessionHeaderUa(stage, ctx) {
+  return scene(stage, ctx, (g, value) => {
+    const on = Boolean(value);
+    const { onParts } = binaryPaths(g, {
+      offLabel: "关闭：保留 SDK 出厂 User-Agent",
+      onLabel: "开启：替换为真实 AstrBot/AstrNa 标识",
+      value: on,
+      drawOff: (off) => {
+        box(off, 120, 45, 240, 44, "#233034");
+        label(off, 132, 64, "User-Agent:", { size: 10, color: COLOR.gray });
+        label(off, 132, 82, "AsyncOpenAI/Python 2.x", { size: 11, color: COLOR.warn });
+      },
+      drawOn: (onG) => {
+        box(onG, 120, 145, 240, 44, "#0a2b2b", { stroke: COLOR.ok });
+        label(onG, 132, 164, "User-Agent:", { size: 10, color: COLOR.gray });
+        const ua = label(onG, 132, 182, "AstrBot/4.x AstrNa/1.6.x", { size: 11, color: COLOR.ok, bold: true });
+        return { ua };
+      },
+    });
+    label(g, 20, 222, "手填的 User-Agent 不会被覆盖 √", { size: 10, color: COLOR.ok });
+    return {
+      caption: on
+        ? "开启：SDK 默认 UA 替换为真实标识，满足要求明确身份的上游"
+        : "关闭：请求保留 SDK 出厂的笼统 User-Agent",
+      animate: on && onParts.ua
+        ? () => ctx.gsap.to(onParts.ua, { opacity: 0.4, duration: 0.6, repeat: -1, yoyo: true })
+        : null,
+    };
+  });
+}
+
+function buildSessionHeaderExtra(stage, ctx) {
+  return scene(stage, ctx, (g, value) => {
+    const name = typeof value === "string" ? value.trim() : "";
+    box(g, 60, 40, 280, name ? 118 : 96, "#123f5a");
+    label(g, 72, 62, "请求头", { size: 10, color: COLOR.info });
+    label(g, 72, 84, "User-Agent: AstrBot/… AstrNa/…", { size: 10 });
+    label(g, 72, 106, "x-opencode-session: astrna-<sha256>", { size: 10 });
+    let flow = null;
+    if (name) {
+      const extra = label(g, 72, 128, `${name}: astrna-<sha256>`, { size: 10, color: COLOR.ok, bold: true });
+      flow = extra;
+      label(g, 60, 186, "同一个会话 id 再盖一个自定义头", { size: 10, color: COLOR.ok });
+    } else {
+      label(g, 60, 186, "留空：只发送 x-opencode-session", { size: 10, color: COLOR.gray });
+    }
+    label(g, 60, 214, "仅字母、数字和连字符；不能覆盖保留头", { size: 9, color: COLOR.gray });
+    return {
+      caption: name
+        ? `已设置额外头 ${name}：与 x-opencode-session 同值，供其他上游识别`
+        : "未设置额外头：每个请求只携带 x-opencode-session",
+      animate: flow
+        ? () => ctx.gsap.to(flow, { opacity: 0.35, duration: 0.6, repeat: -1, yoyo: true })
+        : null,
+    };
+  });
+}
+
 function buildIssueToken(stage, ctx) {
   return scene(stage, ctx, (g, value) => {
     const configured = Boolean(value);
@@ -663,6 +723,8 @@ const BUILDERS = {
   "wake-reply-groups": buildWakeGroups("reply"),
   "builtin-allowlist": buildBuiltinAllowlist,
   "parallel-tool-allowlist": buildParallelToolAllowlist,
+  "session-header-ua": buildSessionHeaderUa,
+  "session-header-extra": buildSessionHeaderExtra,
   "issue-devkit": buildIssueDevkit,
   "issue-notify-umo": buildIssueNotify,
   "issue-github-token": buildIssueToken,

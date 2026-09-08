@@ -133,6 +133,14 @@ const FEATURES = [
     true,
   ),
   feature(
+    "provider_session_headers_enabled",
+    "供应商会话请求头",
+    "给所有 LLM 供应商请求盖上按会话稳定的身份章与真实 User-Agent。",
+    "每个请求附加 x-opencode-session 会话头；会话标识是 sha256 摘要，供支持它的上游优化路由和缓存，不保证独占缓存或每次命中。",
+    ["使用 opencode go 等要求会话头的上游时", "希望上游按会话优化路由和缓存时"],
+    ["默认关闭", "以 SDK 默认前缀开头的手填 UA 会被视为默认值替换"],
+  ),
+  feature(
     "optimize_reply_target_history",
     "优化回复历史标记",
     "明确当前发言人、引用发送者和 Bot 原回复对象。",
@@ -301,6 +309,16 @@ const FALLBACK_SETTINGS = {
       "parallel-tool-allowlist",
       { notes: ["只选择互不依赖、主要返回数据且不会直接操纵聊天或共享状态的工具",
         "新安装的工具默认不授权，必须由管理员再次选择"], groups: [], state: { value: null } }),
+  ],
+  provider_session_headers_enabled: [
+    setting("provider_session_headers_user_agent", "bool", "替换供应商默认 User-Agent",
+      "仅在请求的 User-Agent 以 SDK 出厂前缀开头时，替换为真实的 AstrBot/AstrNa 标识；普通手填值不会被覆盖。",
+      "session-header-ua",
+      { notes: ["以 SDK 前缀开头的手填 User-Agent 会被视为默认值替换"], state: { value: null } }),
+    setting("provider_session_headers_extra_name", "text", "额外会话头名",
+      "除 x-opencode-session 外，再用同一个会话 id 多写一个自定义头名，供其他上游识别。",
+      "session-header-extra",
+      { notes: ["仅允许字母、数字和连字符，最长 64 字符；不能覆盖鉴权或请求控制头；留空表示不加"], state: { value: null } }),
   ],
   issue_assistant_enabled: [
     setting("issue_assistant_devkit_enabled", "bool", "开发工具箱",

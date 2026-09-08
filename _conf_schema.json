@@ -210,6 +210,30 @@
     "default": [],
     "invisible": true
   },
+  "provider_session_headers_enabled": {
+    "type": "bool",
+    "description": "供应商会话请求头",
+    "hint": "开启后，AstrNa 会给所有 LLM 供应商（OpenAI/Anthropic/Gemini 及其兼容源）的请求附加 x-opencode-session 会话头与真实的 AstrBot/AstrNa User-Agent。opencode go 等上游要求请求明确标识自身并携带 x-opencode-session，否则直接 400；按会话稳定的 id 供支持它的上游优化路由和提示词缓存，是否独占缓存或每次命中由上游决定。会话 id 是会话标识（UMO）的 sha256 摘要，不包含原始账号或群号；不传会话 id 的辅助调用（如上下文压缩）使用固定 aux 标识，只用于携带合规会话头。默认关闭。",
+    "default": false
+  },
+  "provider_session_headers_user_agent": {
+    "type": "bool",
+    "description": "替换供应商默认 User-Agent",
+    "hint": "开启后，仅在请求的 User-Agent 以 SDK 出厂前缀开头（如 AsyncOpenAI/Python）时替换为真实的 AstrBot/AstrNa 标识；普通手填 User-Agent 不会被覆盖，但以 SDK 前缀开头的手填值会被视为默认值替换。默认开启。",
+    "default": true,
+    "condition": {
+      "provider_session_headers_enabled": true
+    }
+  },
+  "provider_session_headers_extra_name": {
+    "type": "string",
+    "description": "额外会话头名",
+    "hint": "除 x-opencode-session 外，再用同一个会话 id 多写一个自定义头名（如 x-session-id），供其他上游识别。仅允许字母、数字和连字符，最长 64 字符；留空表示不加。默认留空。",
+    "default": "",
+    "condition": {
+      "provider_session_headers_enabled": true
+    }
+  },
   "optimize_reply_target_history": {
     "type": "bool",
     "description": "优化回复历史标记",

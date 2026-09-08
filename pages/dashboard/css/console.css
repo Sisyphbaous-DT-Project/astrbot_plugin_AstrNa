@@ -681,6 +681,9 @@ em { font-family: var(--serif); font-style: italic; }
   color: var(--text);
 }
 .secret-control .setting-input { width: 240px; }
+.text-control { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.text-control.conflict { opacity: 0.85; }
+.text-control .setting-input { width: 260px; }
 .setting-select {
   font-size: 12.5px;
   padding: 3px 6px;

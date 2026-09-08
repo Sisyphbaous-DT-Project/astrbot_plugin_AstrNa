@@ -63,6 +63,7 @@ function createMockBridge() {
           })),
         };
       } else if (def.control === "secret") out.state = { configured: Boolean(value) };
+      else if (def.control === "text") out.state = { value: typeof value === "string" ? value : "" };
 
       if (def.key === "account_nickname_only") {
         const blocked = !values.get("account_nickname_display");
@@ -136,6 +137,26 @@ function createMockBridge() {
         } else if (body.action === "clear") values.set(def.key, "");
         else throw new Error("敏感配置只支持替换或清除操作");
         break;
+      case "text": {
+        const v = typeof body.value === "string" ? body.value.trim() : "";
+        if (v.length > 64) throw new Error("额外会话头名最长 64 字符");
+        const lower = v.toLowerCase();
+        const reserved = [
+          "x-opencode-session", "user-agent", "authorization", "proxy-authorization",
+          "x-api-key", "api-key", "x-goog-api-key", "anthropic-api-key",
+          "openai-api-key", "x-stainless-api-key", "host", "content-type",
+          "content-length", "transfer-encoding", "connection", "cookie",
+        ];
+        if (v && (!/^[A-Za-z0-9-]+$/.test(v)
+          || reserved.includes(lower)
+          || lower.includes("api-key") || lower.startsWith("x-api-")
+          || lower.includes("api_key") || lower.includes("authorization")
+          || lower.includes("token") || lower.includes("secret"))) {
+          throw new Error("额外会话头名仅允许字母、数字和连字符，且不能覆盖鉴权或请求控制头");
+        }
+        values.set(def.key, v);
+        break;
+      }
       case "protected_list": {
         const list = values.get(def.key);
         if (body.action === "add") {

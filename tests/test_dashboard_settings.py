@@ -42,6 +42,8 @@ EXPECTED_SETTING_ORDER = [
     "disable_group_reply_to_bot_wake_group_ids",
     "custom_builtin_commands_allowlist",
     "parallel_tool_use_allowlist",
+    "provider_session_headers_user_agent",
+    "provider_session_headers_extra_name",
     "issue_assistant_devkit_enabled",
     "issue_assistant_target_umo",
     "issue_assistant_github_token",
@@ -56,6 +58,7 @@ EXPECTED_PARENTS = {
     "disable_group_reply_to_bot_wake": 2,
     "custom_builtin_commands_enabled": 1,
     "parallel_tool_use_enabled": 1,
+    "provider_session_headers_enabled": 2,
     "issue_assistant_enabled": 3,
 }
 
@@ -77,6 +80,8 @@ EXPECTED_ANIMATIONS = {
     "disable_group_reply_to_bot_wake_group_ids": "wake-reply-groups",
     "custom_builtin_commands_allowlist": "builtin-allowlist",
     "parallel_tool_use_allowlist": "parallel-tool-allowlist",
+    "provider_session_headers_user_agent": "session-header-ua",
+    "provider_session_headers_extra_name": "session-header-extra",
     "issue_assistant_devkit_enabled": "issue-devkit",
     "issue_assistant_target_umo": "issue-notify-umo",
     "issue_assistant_github_token": "issue-github-token",
@@ -208,12 +213,12 @@ def _run(coro):
 
 def test_settings_registry_exact_order_count_and_parents():
     assert list(SETTING_KEYS) == EXPECTED_SETTING_ORDER
-    assert len(SETTINGS) == 20
+    assert len(SETTINGS) == 22
     parents = {}
     for item in SETTINGS:
         parents[item["parent"]] = parents.get(item["parent"], 0) + 1
     assert parents == EXPECTED_PARENTS
-    assert len(EXPECTED_PARENTS) == 9
+    assert len(EXPECTED_PARENTS) == 10
 
 
 def test_settings_registry_copy_complete():
@@ -230,8 +235,9 @@ def test_settings_registry_copy_complete():
             "tool_multi",
             "protected_list",
             "secret",
+            "text",
         }
-    assert len({item["animation"] for item in SETTINGS}) == 20
+    assert len({item["animation"] for item in SETTINGS}) == 22
 
 
 def test_settings_animation_ids_match_frontend_registry():
