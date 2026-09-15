@@ -46,6 +46,8 @@ class ReplyTargetHistoryModule:
     _response_wrapper: Any = None
     _response_stream_wrapper: Any = None
     _quote_message_wrapper: Any = None
+    _quote_internal_module: Any = None
+    _original_internal_quote: Any = None
     _active_module: ReplyTargetHistoryModule | None = None
 
     def __init__(
@@ -128,6 +130,14 @@ class ReplyTargetHistoryModule:
                 cls._astr_main_agent._process_quote_message = (
                     unwrap_inactive_wrapper(cls._original_process_quote_message)
                 )
+        if cls._quote_internal_module is not None:
+            current = getattr(cls._quote_internal_module, "_process_quote_message", None)
+            if same_callable(current, cls._quote_message_wrapper):
+                cls._quote_internal_module._process_quote_message = (
+                    unwrap_inactive_wrapper(cls._original_internal_quote)
+                )
+        cls._quote_internal_module = None
+        cls._original_internal_quote = None
         cls._internal_stage_cls = None
         cls._original_save_to_history = None
         cls._runner_cls = None
@@ -435,6 +445,12 @@ class ReplyTargetHistoryModule:
             module_cls.restore_patch()
 
         if module_cls._original_process_quote_message is None:
+            try:
+                from astrbot.core.pipeline.process_stage.method.agent_sub_stages import (
+                    internal,
+                )
+            except Exception:
+                internal = None
             module_cls._astr_main_agent = astr_main_agent
             module_cls._original_process_quote_message = original
             original_process_quote_message = original
@@ -455,6 +471,13 @@ class ReplyTargetHistoryModule:
             mark_wrapper_active(astrna_process_quote_message, original_process_quote_message)
             module_cls._quote_message_wrapper = astrna_process_quote_message
             astr_main_agent._process_quote_message = astrna_process_quote_message
+            # 两个入口保持相同的自身包装链，外层图像转述才能按身份接管。
+            if internal is not None and same_callable(
+                getattr(internal, "_process_quote_message", None), original
+            ):
+                module_cls._quote_internal_module = internal
+                module_cls._original_internal_quote = original
+                internal._process_quote_message = astrna_process_quote_message
 
         return True
 

@@ -252,8 +252,8 @@ class AstrNaRuntime:
             self.tool_history_context.install()
         if self.config.get("fix_deepseek_v4_400", False):
             self.deepseek_v4_400.install()
-        if self.config.get("optimize_image_caption", False):
-            self.image_caption.install()
+        self._configure_image_caption()
+        self._configure_quoted_image_input()
         if self.config.get("optimize_send_message_to_user", False):
             self.send_message_to_user.install()
         if self.config.get("output_length_limit_enabled", False):
@@ -274,8 +274,8 @@ class AstrNaRuntime:
     def update_dashboard_switch(self, key: str, value: bool) -> None:
         """同步功能控制台修改的单个布尔主开关到合并配置副本。
 
-        只接受 DEFAULT_CONFIG 中的布尔键；其余键一律拒绝。运行时各模块在
-        下一次相关事件中按现有规则读取 self.config 并重建包装链。
+        只接受 DEFAULT_CONFIG 中的布尔键；其余键一律拒绝。图片准备与转述等
+        请求前置包装立即同步，其余模块在下一次相关事件中读取配置。
         """
         if key not in DEFAULT_CONFIG:
             raise ValueError(f"未知的配置开关: {key}")
@@ -286,6 +286,26 @@ class AstrNaRuntime:
             self._configure_parallel_tool_use()
         elif key == "provider_session_headers_enabled":
             self._configure_provider_session_headers()
+        elif key == "optimize_quoted_image_input":
+            self._configure_quoted_image_input()
+        elif key == "optimize_image_caption":
+            self._configure_image_caption()
+
+    def _configure_image_caption(self) -> None:
+        if self._closed:
+            return
+        if self.config.get("optimize_image_caption", False):
+            self.image_caption.install()
+        else:
+            self.image_caption.terminate()
+
+    def _configure_quoted_image_input(self) -> None:
+        if self._closed:
+            return
+        if self.config.get("optimize_quoted_image_input", False):
+            self.quoted_image_input.install()
+        else:
+            self.quoted_image_input.terminate()
 
     def update_dashboard_setting(self, key: str, value: Any) -> None:
         """同步功能控制台修改的单个子配置，并按组热同步相关模块。
@@ -410,6 +430,7 @@ class AstrNaRuntime:
         if tool_history_enabled:
             self.tool_history_context.sanitize_request(req)
 
+        self._configure_quoted_image_input()
         if self.config.get("optimize_quoted_image_input", False):
             await self.quoted_image_input.optimize(event, req)
             if not self._is_lifecycle_current(lifecycle_token):
@@ -860,6 +881,7 @@ class AstrNaRuntime:
         self.parallel_tool_use.terminate()
         # 会话请求头必须在第一个 await 前拆除，避免中途异常把钩子残留在 httpx 客户端里。
         self.provider_session_headers.terminate()
+        self.quoted_image_input.terminate()
         await self.issue_assistant.terminate()
         self.group_sender_concurrency.terminate()
         self.group_chat_context_optimizer.terminate()

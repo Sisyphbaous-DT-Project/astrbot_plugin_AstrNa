@@ -375,6 +375,143 @@ def test_quote_image_caption_safely_degrades_for_unknown_future_kwargs(
     assert provider.prompts == ["Please describe the image content."]
 
 
+def test_quote_image_caption_supports_image_ref_signature(astr_main_agent):
+    """AstrBot 4.28.1 签名（删 config、新增 image_ref）下优化仍生效且 image_ref 原样透传。"""
+    provider = DummyProvider()
+    original_calls = []
+
+    async def new_process_quote_message(
+        event,
+        req,
+        img_cap_prov_id,
+        plugin_context,
+        quoted_message_settings=None,
+        main_provider_supports_image=False,
+        skip_quote_image_caption=False,
+        image_ref=None,
+    ):
+        original_calls.append(image_ref)
+        if skip_quote_image_caption or main_provider_supports_image or not img_cap_prov_id:
+            return None
+        provider = plugin_context.get_provider_by_id(img_cap_prov_id)
+        await provider.text_chat(
+            prompt="Please describe the image content.",
+            image_urls=[image_ref],
+        )
+        return None
+
+    astr_main_agent._process_quote_message = new_process_quote_message
+    module = ImageCaptionModule(logger=DummyLogger())
+    module.install()
+
+    run(
+        astr_main_agent._process_quote_message(
+            DummyEvent([Reply(message_str="新版引用文本")]),
+            DummyRequest(prompt="新版用户问题"),
+            "caption-provider",
+            DummyContext(provider),
+            image_ref="/tmp/quoted-image.jpg",
+        )
+    )
+
+    assert original_calls == ["/tmp/quoted-image.jpg"]
+    prompt = provider.prompts[0]
+    assert prompt.startswith("Please describe the image content.")
+    assert "新版用户问题" in prompt
+    assert "新版引用文本" in prompt
+
+
+@pytest.fixture
+def internal_stage(astr_main_agent, monkeypatch):
+    """模拟 4.28.1 的 internal stage：from-import 提前绑定原函数引用。"""
+    pipeline = ModuleType("astrbot.core.pipeline")
+    process_stage = ModuleType("astrbot.core.pipeline.process_stage")
+    method = ModuleType("astrbot.core.pipeline.process_stage.method")
+    agent_sub_stages = ModuleType(
+        "astrbot.core.pipeline.process_stage.method.agent_sub_stages"
+    )
+    internal = ModuleType(
+        "astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal"
+    )
+    internal._process_quote_message = astr_main_agent._process_quote_message
+    agent_sub_stages.internal = internal
+    method.agent_sub_stages = agent_sub_stages
+    process_stage.method = method
+    pipeline.process_stage = process_stage
+    for name, mod in (
+        ("astrbot.core.pipeline", pipeline),
+        ("astrbot.core.pipeline.process_stage", process_stage),
+        ("astrbot.core.pipeline.process_stage.method", method),
+        (
+            "astrbot.core.pipeline.process_stage.method.agent_sub_stages",
+            agent_sub_stages,
+        ),
+        (
+            "astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal",
+            internal,
+        ),
+    ):
+        monkeypatch.setitem(sys.modules, name, mod)
+    return internal
+
+
+def test_internal_stage_reference_is_wrapped_and_restored(
+    astr_main_agent, internal_stage
+):
+    """4.28.1 主流程经 internal 的 from-import 引用调用，包装必须覆盖该入口。"""
+    provider = DummyProvider()
+    original = astr_main_agent._process_quote_message
+    module = ImageCaptionModule(logger=DummyLogger())
+    module.install()
+
+    assert internal_stage._process_quote_message is not original
+
+    run(
+        internal_stage._process_quote_message(
+            DummyEvent([Reply(message_str="internal 引用文本")]),
+            DummyRequest(prompt="internal 用户问题"),
+            "caption-provider",
+            DummyContext(provider),
+        )
+    )
+
+    prompt = provider.prompts[0]
+    assert "internal 用户问题" in prompt
+    assert "internal 引用文本" in prompt
+
+    module.install()
+    assert internal_stage._process_quote_message is (
+        astr_main_agent._process_quote_message
+    )
+
+    ImageCaptionModule.restore_patch()
+    assert internal_stage._process_quote_message is original
+    assert astr_main_agent._process_quote_message is original
+
+
+def test_internal_stage_foreign_wrapper_not_overwritten(
+    astr_main_agent, internal_stage
+):
+    """internal 入口已被第三方替换时不覆盖，astr_main_agent 入口仍正常包装。"""
+
+    async def foreign_wrapper(*args, **kwargs):
+        return None
+
+    internal_stage._process_quote_message = foreign_wrapper
+    logger = DummyLogger()
+    module = ImageCaptionModule(logger=logger)
+    assert module.install() is True
+
+    assert internal_stage._process_quote_message is foreign_wrapper
+    assert astr_main_agent._process_quote_message is not foreign_wrapper
+    assert any(
+        "已被第三方替换" in str(args) for args in logger.warnings
+    )
+
+    ImageCaptionModule.restore_patch()
+    assert internal_stage._process_quote_message is foreign_wrapper
+
+
 def test_quote_image_caption_falls_back_to_astrbot_prompt_without_custom_config(
     astr_main_agent,
 ):

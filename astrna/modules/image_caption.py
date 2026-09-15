@@ -57,6 +57,11 @@ class ImageCaptionModule:
     _process_quote_message_wrapper: Any = None
     _active_module: ImageCaptionModule | None = None
     _provider_patches: dict[int, ProviderPatch] = {}
+    # AstrBot 4.28.1 起 internal stage 以 from-import 提前绑定
+    # _process_quote_message 原函数，仅替换 astr_main_agent 模块属性会让主流程
+    # 绕过包装；需同步替换 internal 命名空间中的引用，旧版无此引用时跳过。
+    _internal_stage_module: Any = None
+    _original_internal_process_quote_message: Any = None
 
     def __init__(self, logger: Any):
         self.logger = logger
@@ -83,6 +88,7 @@ class ImageCaptionModule:
             module_cls.restore_patch()
 
         if module_cls._original_ensure_img_caption is None:
+            internal_stage = self._load_internal_stage_module()
             module_cls._astr_main_agent = astr_main_agent
             module_cls._original_ensure_img_caption = astr_main_agent._ensure_img_caption
             module_cls._original_process_quote_message = (
@@ -148,6 +154,26 @@ class ImageCaptionModule:
             astr_main_agent._ensure_img_caption = astrna_ensure_img_caption
             astr_main_agent._process_quote_message = astrna_process_quote_message
 
+            module_cls._internal_stage_module = internal_stage
+            if internal_stage is not None:
+                internal_current = getattr(
+                    internal_stage, "_process_quote_message", None
+                )
+                if same_callable(internal_current, original_process_quote_message):
+                    module_cls._original_internal_process_quote_message = (
+                        internal_current
+                    )
+                    internal_stage._process_quote_message = (
+                        astrna_process_quote_message
+                    )
+                elif internal_current is not None and not same_callable(
+                    internal_current, astrna_process_quote_message
+                ):
+                    self._log(
+                        "warning",
+                        "AstrNa 检测到 internal 阶段的引用消息处理入口已被第三方替换，跳过该入口包装。",
+                    )
+
         module_cls._active_module = self
         self._installed = True
         self._log("info", "AstrNa 已启用更好的图像转述。")
@@ -184,11 +210,26 @@ class ImageCaptionModule:
                 cls._astr_main_agent._process_quote_message = (
                     unwrap_inactive_wrapper(cls._original_process_quote_message)
                 )
+        if cls._internal_stage_module is not None:
+            current_internal = getattr(
+                cls._internal_stage_module,
+                "_process_quote_message",
+                None,
+            )
+            if (
+                cls._original_internal_process_quote_message is not None
+                and same_callable(current_internal, cls._process_quote_message_wrapper)
+            ):
+                cls._internal_stage_module._process_quote_message = (
+                    unwrap_inactive_wrapper(cls._original_internal_process_quote_message)
+                )
         for provider_id in list(cls._provider_patches):
             cls._restore_provider_patch(provider_id, force=True)
         cls._astr_main_agent = None
+        cls._internal_stage_module = None
         cls._original_ensure_img_caption = None
         cls._original_process_quote_message = None
+        cls._original_internal_process_quote_message = None
         cls._ensure_img_caption_wrapper = None
         cls._process_quote_message_wrapper = None
         cls._active_module = None
@@ -373,6 +414,16 @@ class ImageCaptionModule:
             return None
         return astr_main_agent
 
+    def _load_internal_stage_module(self) -> Any | None:
+        """加载 internal stage 模块；旧版无该模块或极简环境下返回 None。"""
+        try:
+            from astrbot.core.pipeline.process_stage.method.agent_sub_stages import (
+                internal,
+            )
+        except Exception:
+            return None
+        return internal
+
     def _log(self, level: str, message: str, *args: Any) -> None:
         logger_method = getattr(self.logger, level, None)
         if callable(logger_method):
@@ -479,6 +530,10 @@ QUOTE_MESSAGE_PARAM_NAMES = (
 )
 QUOTE_MESSAGE_REQUIRED_PARAMS = QUOTE_MESSAGE_PARAM_NAMES[:4]
 
+# 上游新增但本模块不消费的参数：解析时容忍，透传时随原始 args/kwargs 保留。
+# AstrBot 4.28.1 起 _process_quote_message 删除 config 参数并新增 image_ref。
+_QUOTE_MESSAGE_PASSTHROUGH_PARAMS = frozenset({"image_ref"})
+
 
 def parse_quote_message_call(
     args: tuple[Any, ...],
@@ -487,7 +542,9 @@ def parse_quote_message_call(
     if len(args) > len(QUOTE_MESSAGE_PARAM_NAMES):
         return None
 
-    unknown_kwargs = set(kwargs) - set(QUOTE_MESSAGE_PARAM_NAMES)
+    unknown_kwargs = (
+        set(kwargs) - set(QUOTE_MESSAGE_PARAM_NAMES) - _QUOTE_MESSAGE_PASSTHROUGH_PARAMS
+    )
     if unknown_kwargs:
         return None
 

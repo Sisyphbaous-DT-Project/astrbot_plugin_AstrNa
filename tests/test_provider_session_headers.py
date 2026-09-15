@@ -214,6 +214,59 @@ def test_text_chat_stamps_session_header_and_user_agent(module):
     assert "AstrNa/9.9.9-test" in captured["user-agent"]
 
 
+def test_astrbot_default_user_agent_replaced(module, monkeypatch):
+    """AstrBot 4.28.1 起官方默认 UA（精确的 astrbot/<当前版本>）会被替换。"""
+    from astrna.modules import provider_session_headers
+
+    monkeypatch.setattr(provider_session_headers, "_astrbot_default_ua", "astrbot/4.28.1")
+    monkeypatch.setattr(provider_session_headers, "_astrbot_default_ua_loaded", True)
+    captured = {}
+    provider = FakeProvider(
+        _capture_client(captured, headers={"user-agent": "astrbot/4.28.1"})
+    )
+    module.install()
+    module.ensure_provider_hooked(provider)
+
+    _run(provider.text_chat(prompt="hi", session_id="umo-a"))
+
+    assert captured["user-agent"].startswith("AstrBot/")
+    assert "AstrNa/9.9.9-test" in captured["user-agent"]
+
+
+def test_astrbot_user_agent_with_custom_suffix_preserved(module, monkeypatch):
+    """以官方默认值为基础追加过自定义内容的 UA 视为手填，不覆盖。"""
+    from astrna.modules import provider_session_headers
+
+    monkeypatch.setattr(provider_session_headers, "_astrbot_default_ua", "astrbot/4.28.1")
+    monkeypatch.setattr(provider_session_headers, "_astrbot_default_ua_loaded", True)
+    for custom_ua in ("astrbot/4.28.1 MyGateway/1.0", "astrbot/9.9.9-other"):
+        captured = {}
+        provider = FakeProvider(
+            _capture_client(captured, headers={"user-agent": custom_ua})
+        )
+        module.install()
+        module.ensure_provider_hooked(provider)
+
+        _run(provider.text_chat(prompt="hi", session_id="umo-a"))
+
+        assert captured["user-agent"] == custom_ua
+        module.terminate()
+
+
+def test_missing_astrbot_version_is_not_cached(monkeypatch):
+    from types import ModuleType
+    from astrna.modules import provider_session_headers as headers
+
+    host = ModuleType("astrbot")
+    monkeypatch.setitem(sys.modules, "astrbot", host)
+    monkeypatch.setattr(headers, "_astrbot_default_ua", None)
+    monkeypatch.setattr(headers, "_astrbot_default_ua_loaded", False)
+    assert headers._get_astrbot_default_user_agent() is None
+    assert headers._astrbot_default_ua_loaded is False
+    host.__version__ = "4.28.1"
+    assert headers._get_astrbot_default_user_agent() == "astrbot/4.28.1"
+
+
 def test_text_chat_stream_stamps_headers(module):
     captured = {}
     provider = FakeProvider(_capture_client(captured))

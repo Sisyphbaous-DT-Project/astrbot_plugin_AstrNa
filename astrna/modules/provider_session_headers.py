@@ -48,6 +48,27 @@ _SDK_DEFAULT_UA_PREFIXES = (
     "google-genai-sdk/",
 )
 
+# AstrBot 4.28.1 起官方默认 UA 为精确的 astrbot/<当前版本>（build_provider_headers，
+# 用户手填 UA 会在上游覆盖默认值）。只替换与当前宿主版本完全一致的值；以默认值
+# 为基础追加过自定义内容的 UA（如 "astrbot/<ver> MyGateway/1.0"）视为手填，不覆盖。
+_astrbot_default_ua: str | None = None
+_astrbot_default_ua_loaded = False
+
+
+def _get_astrbot_default_user_agent() -> str | None:
+    global _astrbot_default_ua, _astrbot_default_ua_loaded
+    if not _astrbot_default_ua_loaded:
+        try:
+            import astrbot
+
+            version = getattr(astrbot, "__version__", "")
+        except Exception:  # noqa: BLE001 - 极简环境无 astrbot 包
+            version = ""
+        if isinstance(version, str) and version.strip():
+            _astrbot_default_ua = f"astrbot/{version.strip()}"
+            _astrbot_default_ua_loaded = True
+    return _astrbot_default_ua
+
 _HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 # 额外头名不得覆盖这些头，避免破坏鉴权、请求格式或主功能头。
 _RESERVED_HEADER_NAMES = frozenset(
@@ -174,7 +195,10 @@ class ProviderSessionHeadersModule:
                     headers[self._extra_header_name] = sid
                 if self._replace_user_agent:
                     ua = headers.get("user-agent", "")
-                    if ua.startswith(_SDK_DEFAULT_UA_PREFIXES):
+                    astrbot_default_ua = _get_astrbot_default_user_agent()
+                    if ua.startswith(_SDK_DEFAULT_UA_PREFIXES) or (
+                        astrbot_default_ua is not None and ua == astrbot_default_ua
+                    ):
                         headers["user-agent"] = self._user_agent
             except Exception as exc:  # noqa: BLE001 - 绝不让加头失败影响请求
                 self._log(
