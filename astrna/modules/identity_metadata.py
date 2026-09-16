@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,6 +30,8 @@ BIRTHDAY_MONTH_MAX_DAYS = {
     11: 30,
     12: 31,
 }
+GROUP_MANAGEMENT_CACHE_TTL_SECONDS = 24 * 60 * 60
+GROUP_MANAGEMENT_CACHE_MAX_ENTRIES = 256
 
 
 class IdentityMetadataModule:
@@ -36,6 +39,10 @@ class IdentityMetadataModule:
 
     def __init__(self, logger: Any):
         self.logger = logger
+        # (self_id, group_id) -> (monotonic 时间戳, 群主/管理员名单负载)
+        self._group_management_cache: dict[
+            tuple[str, str], tuple[float, dict[str, Any]]
+        ] = {}
 
     async def optimize(
         self,
@@ -52,11 +59,13 @@ class IdentityMetadataModule:
             return
 
         group_member_identity = None
+        group_management = None
         if group_member_identity_display:
             group_member_identity = await fetch_group_member_identity(
                 event,
                 logger=self.logger,
             )
+            group_management = await self._get_group_management_identity(event)
 
         birthday = None
         if birthday_info_display:
@@ -68,6 +77,7 @@ class IdentityMetadataModule:
             account_nickname_only=account_nickname_only,
             group_name_display=removal.removed_group_name,
             group_member_identity=group_member_identity,
+            group_management=group_management,
             birthday=birthday,
         )
         if not metadata:
@@ -104,6 +114,33 @@ class IdentityMetadataModule:
             using_account_nickname_only,
         )
 
+    async def _get_group_management_identity(
+        self,
+        event: Any,
+    ) -> dict[str, Any] | None:
+        """按 24 小时缓存获取本群群主与管理员名单；拉取失败不写缓存。"""
+        message_obj = getattr(event, "message_obj", None)
+        cache_key = (
+            str(getattr(message_obj, "self_id", None) or ""),
+            str(getattr(message_obj, "group_id", None) or ""),
+        )
+        now = time.monotonic()
+        cached = self._group_management_cache.get(cache_key)
+        if cached is not None and now - cached[0] < GROUP_MANAGEMENT_CACHE_TTL_SECONDS:
+            return cached[1]
+
+        management = await fetch_group_management_identity(event, logger=self.logger)
+        if management is None:
+            return None
+        if len(self._group_management_cache) >= GROUP_MANAGEMENT_CACHE_MAX_ENTRIES:
+            oldest_key = min(
+                self._group_management_cache,
+                key=lambda key: self._group_management_cache[key][0],
+            )
+            del self._group_management_cache[oldest_key]
+        self._group_management_cache[cache_key] = (now, management)
+        return management
+
 
 def build_identity_metadata(
     event: Any,
@@ -112,6 +149,7 @@ def build_identity_metadata(
     account_nickname_only: bool = False,
     group_name_display: bool = False,
     group_member_identity: dict[str, str] | None = None,
+    group_management: dict[str, Any] | None = None,
     birthday: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     message_obj = getattr(event, "message_obj", None)
@@ -141,7 +179,7 @@ def build_identity_metadata(
     if user_metadata:
         metadata["user"] = user_metadata
 
-    if group_name_display or group_member_identity:
+    if group_name_display or group_member_identity or group_management:
         group_metadata: dict[str, Any] = {}
         group_id = getattr(message_obj, "group_id", None)
         if group_id:
@@ -153,6 +191,13 @@ def build_identity_metadata(
             put_optional(group_metadata, "name", group_name)
         if group_member_identity:
             group_metadata["member"] = group_member_identity
+        if group_management:
+            owner = group_management.get("owner")
+            if owner:
+                group_metadata["owner"] = owner
+            admins = group_management.get("admins")
+            if admins:
+                group_metadata["admins"] = admins
         if group_metadata:
             metadata["group"] = group_metadata
 
@@ -243,6 +288,94 @@ def normalize_group_member_identity(member_info: Any) -> dict[str, str] | None:
     put_optional(identity, "level", member_info.get("level"))
     put_optional(identity, "title", member_info.get("title"))
     return identity
+
+
+async def fetch_group_management_identity(
+    event: Any,
+    *,
+    logger: Any | None = None,
+) -> dict[str, Any] | None:
+    """查询当前平台可提供的群主与管理员名单，供身份元数据注入。"""
+    platform_name = get_event_platform_name(event)
+    if platform_name != "aiocqhttp":
+        return None
+
+    message_obj = getattr(event, "message_obj", None)
+    group_id = getattr(message_obj, "group_id", None)
+    if not group_id:
+        return None
+
+    bot = getattr(event, "bot", None)
+    call_action = getattr(bot, "call_action", None)
+    if not callable(call_action):
+        return None
+
+    params: dict[str, Any] = {
+        "group_id": group_id,
+        "no_cache": False,
+    }
+    self_id = getattr(message_obj, "self_id", None)
+    if self_id:
+        params["self_id"] = self_id
+
+    try:
+        member_list = await call_action("get_group_member_list", **params)
+    except Exception as exc:
+        if logger is not None:
+            logger.debug(
+                "AstrNa 查询群主与管理员名单失败: group_id=%s, error=%s",
+                group_id,
+                exc,
+            )
+        return None
+
+    return normalize_group_management_identity(member_list)
+
+
+def normalize_group_management_identity(member_list: Any) -> dict[str, Any] | None:
+    if not isinstance(member_list, list):
+        return None
+
+    owner: dict[str, str] | None = None
+    admins: list[dict[str, str]] = []
+    for member in member_list:
+        if not isinstance(member, dict):
+            continue
+        role = sanitize_optional_metadata_value(member.get("role"))
+        if role == "owner" and owner is None:
+            owner = build_group_management_user_payload(member)
+        elif role == "admin":
+            admin = build_group_management_user_payload(member)
+            if admin is not None:
+                admins.append(admin)
+
+    if owner is None and not admins:
+        return None
+    management: dict[str, Any] = {}
+    if owner is not None:
+        management["owner"] = owner
+    if admins:
+        management["admins"] = admins
+    return management
+
+
+def build_group_management_user_payload(
+    member: dict[str, Any],
+) -> dict[str, str] | None:
+    """清洗群主/管理员昵称信息，口径与群身份查询工具的成员结果一致。"""
+    user_id = sanitize_optional_metadata_value(member.get("user_id"))
+    if user_id is None:
+        return None
+
+    user: dict[str, str] = {"user_id": user_id}
+    display_nickname = sanitize_optional_metadata_value(
+        member.get("card"),
+    ) or sanitize_metadata_value(member.get("nickname"))
+    user["nickname"] = display_nickname
+    account_nickname = sanitize_optional_metadata_value(member.get("nickname"))
+    if account_nickname and account_nickname != display_nickname:
+        user["account_nickname"] = account_nickname
+    return user
 
 
 async def fetch_user_birthday(

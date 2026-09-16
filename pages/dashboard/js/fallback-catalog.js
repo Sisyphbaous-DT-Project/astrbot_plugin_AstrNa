@@ -234,7 +234,7 @@ const FALLBACK_SETTINGS = {
       "identity-nickname-replace",
       { notes: ["依赖 AstrBot 自带身份识别已开启"], state: { value: null } }),
     setting("group_member_identity_display", "bool", "补充群成员身份",
-      "通过 NapCat/aiocqhttp 补充发言人的群身份、群等级和专属头衔；查不到自动跳过，不写入历史。",
+      "通过 NapCat/aiocqhttp 补充发言人的群身份、群等级和专属头衔，并注入群主与管理员的昵称和 QQ 号（名单缓存 24 小时）；查不到自动跳过，不写入历史。",
       "identity-group-role",
       { notes: ["只支持群聊和可查询成员信息的平台"], state: { value: null } }),
     setting("birthday_info_display", "bool", "注入生日信息",
