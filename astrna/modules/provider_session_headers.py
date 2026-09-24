@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import hashlib
 import importlib
-import logging
 import re
 import weakref
 from contextvars import ContextVar
@@ -166,7 +165,7 @@ class ProviderSessionHeadersModule:
         extra_header_name: str = "",
         replace_user_agent: bool = True,
     ):
-        self.logger = logger or logging.getLogger(__name__)
+        self.logger = logger
         self._plugin_version = plugin_version or "unknown"
         self._extra_header_name = ""
         self._replace_user_agent = True
