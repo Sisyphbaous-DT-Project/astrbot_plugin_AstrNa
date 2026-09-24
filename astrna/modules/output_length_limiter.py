@@ -38,6 +38,8 @@ class OutputLengthLimiterModule:
     _original_internal_process: Any = None
     _response_wrapper: Any = None
     _stage_wrapper: Any = None
+    _original_resolve_tool_exec: Any = None
+    _resolve_tool_exec_wrapper: Any = None
     _active_module: OutputLengthLimiterModule | None = None
 
     def __init__(
@@ -107,6 +109,10 @@ class OutputLengthLimiterModule:
         if not response_installed and not stage_installed:
             return False
 
+        # skills_like 二次询问入口仅存在于部分 AstrBot 版本，
+        # 该补充包装成功与否不影响主路径的安装结果。
+        self._install_resolve_tool_exec_patch()
+
         type(self)._active_module = self
         self._installed = True
         self._log("info", "AstrNa 已启用输出字数限制。")
@@ -124,6 +130,7 @@ class OutputLengthLimiterModule:
     def restore_patch(cls) -> None:
         mark_wrapper_inactive(cls._response_wrapper)
         mark_wrapper_inactive(cls._stage_wrapper)
+        mark_wrapper_inactive(cls._resolve_tool_exec_wrapper)
         if (
             cls._runner_cls is not None
             and cls._original_iter_llm_responses_with_fallback is not None
@@ -155,12 +162,25 @@ class OutputLengthLimiterModule:
                     cls._original_internal_process,
                 )
 
+        if cls._runner_cls is not None and cls._original_resolve_tool_exec is not None:
+            current_resolve = getattr(cls._runner_cls, "_resolve_tool_exec", None)
+            if same_callable(current_resolve, cls._resolve_tool_exec_wrapper):
+                cls._runner_cls._resolve_tool_exec = unwrap_inactive_wrapper(
+                    cls._original_resolve_tool_exec,
+                )
+            elif not is_wrapper_active(cls._original_resolve_tool_exec):
+                cls._original_resolve_tool_exec = unwrap_inactive_wrapper(
+                    cls._original_resolve_tool_exec,
+                )
+
         cls._runner_cls = None
         cls._original_iter_llm_responses_with_fallback = None
         cls._internal_stage_cls = None
         cls._original_internal_process = None
         cls._response_wrapper = None
         cls._stage_wrapper = None
+        cls._original_resolve_tool_exec = None
+        cls._resolve_tool_exec_wrapper = None
         cls._active_module = None
 
     def _install_response_patch(self) -> bool:
@@ -254,6 +274,63 @@ class OutputLengthLimiterModule:
             stage_cls.process = astrna_internal_process
 
         return True
+
+    def _install_resolve_tool_exec_patch(self) -> None:
+        module_cls = type(self)
+        runner_cls = module_cls._runner_cls
+        if runner_cls is None:
+            return
+
+        original = getattr(runner_cls, "_resolve_tool_exec", None)
+        if not callable(original) or not inspect.iscoroutinefunction(original):
+            self._log(
+                "debug",
+                "AstrNa 未找到 skills_like 二次询问入口，跳过该补充包装。",
+            )
+            return
+
+        if module_cls._original_resolve_tool_exec is not None:
+            return
+        module_cls._original_resolve_tool_exec = original
+        original_method = original
+
+        async def astrna_resolve_tool_exec(runner_self: Any, llm_resp: Any):
+            active_module = module_cls._active_module
+            if not is_wrapper_active(astrna_resolve_tool_exec):
+                active_module = None
+            lifecycle_token = (
+                active_module.capture_lifecycle_token()
+                if active_module is not None
+                else None
+            )
+            resolved_resp, tool_set = await original_method(runner_self, llm_resp)
+            if active_module is None or lifecycle_token is None:
+                return resolved_resp, tool_set
+            if not active_module.is_lifecycle_token_current(lifecycle_token):
+                # 模块关闭或卸载后，迟到的二次询问结果不再启动清洗。
+                return resolved_resp, tool_set
+            if resolved_resp is llm_resp or getattr(
+                resolved_resp,
+                "tools_call_name",
+                None,
+            ):
+                # 原样早退的响应已经过响应入口，工具调用继续原样执行，
+                # 只有二次询问新产生的无工具普通回答需要补齐清洗。
+                return resolved_resp, tool_set
+            optimized = await active_module.optimize_response(
+                runner_self,
+                resolved_resp,
+                lifecycle_token=lifecycle_token,
+            )
+            if not active_module.is_lifecycle_token_current(lifecycle_token):
+                # 清洗期间模块被关闭，不应用过期的清洗结果。
+                return resolved_resp, tool_set
+            return optimized, tool_set
+
+        astrna_resolve_tool_exec._astrna_output_length_limiter_resolve_patch = True
+        mark_wrapper_active(astrna_resolve_tool_exec, original)
+        module_cls._resolve_tool_exec_wrapper = astrna_resolve_tool_exec
+        runner_cls._resolve_tool_exec = astrna_resolve_tool_exec
 
     def prepare_event_for_process(self, event: Any) -> None:
         if event is None or self.is_event_whitelisted(event) or is_live_event(event):

@@ -17,6 +17,7 @@ from astrna.modules.send_message_to_user import (
     SendMessageToUserModule,
 )
 from astrna.runtime import AstrNaRuntime
+from astrna.utils.patching import mark_wrapper_inactive
 
 
 class Plain:
@@ -1039,3 +1040,446 @@ async def collect_runner_responses(runner):
 async def collect_internal_process(astrbot_runner_modules, event):
     stage = astrbot_runner_modules.internal_stage_cls()
     return [item async for item in stage.process(event, "")]
+
+
+def build_limiter(*, providers=None, logger=None, whitelist_umos=None, max_chars=4):
+    return OutputLengthLimiterModule(
+        context=DummyContext(providers=providers or {}),
+        logger=logger or DummyLogger(),
+        whitelist_umos=whitelist_umos,
+        max_chars=max_chars,
+        provider_id="clean",
+    )
+
+
+async def fake_resolve_tool_exec(self, llm_resp):
+    return self.resolve_response, self.resolve_tool_set
+
+
+def build_resolve_runner(input_response, resolved_response, *, event=None, tool_set=None):
+    runner = build_runner(input_response, event=event)
+    runner.resolve_response = resolved_response
+    runner.resolve_tool_set = tool_set if tool_set is not None else object()
+    return runner
+
+
+class BlockingCleanProvider:
+    def __init__(self, text="清洗后"):
+        self.text = text
+        self.calls = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def text_chat(self, **kwargs):
+        self.calls.append(kwargs)
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        return SimpleNamespace(role="assistant", completion_text=self.text)
+
+
+def test_skills_like_requery_fallback_answer_is_limited(
+    astrbot_runner_modules,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        DummyRunner,
+        "_resolve_tool_exec",
+        fake_resolve_tool_exec,
+        raising=False,
+    )
+    logger = DummyLogger()
+    provider = DummyProvider("清洗后")
+    module = build_limiter(logger=logger, providers={"clean": provider})
+    input_response = long_response(
+        text="先调用工具",
+        tools_call_name=["some_tool"],
+        tools_call_args=[{"q": 1}],
+        tools_call_ids=["call-1"],
+    )
+    resolved = long_response(text="二次询问退回的超长普通回答")
+    tool_set = object()
+    runner = build_resolve_runner(input_response, resolved, tool_set=tool_set)
+    try:
+        assert module.install() is True
+        actual_resp, actual_tool_set = asyncio.run(
+            runner._resolve_tool_exec(input_response),
+        )
+        assert actual_tool_set is tool_set
+        assert actual_resp is not resolved
+        assert actual_resp.completion_text == "清洗后"
+        assert len(provider.calls) == 1
+        assert any("已限制超长输出" in str(call[0]) for call in logger.infos)
+    finally:
+        module.terminate()
+
+
+def test_skills_like_requery_with_tool_calls_is_not_limited(
+    astrbot_runner_modules,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        DummyRunner,
+        "_resolve_tool_exec",
+        fake_resolve_tool_exec,
+        raising=False,
+    )
+    provider = DummyProvider("清洗后")
+    module = build_limiter(providers={"clean": provider})
+    resolved = long_response(
+        text="二次询问正常返回工具调用",
+        tools_call_name=["some_tool"],
+        tools_call_args=[{"q": 1}],
+        tools_call_ids=["call-2"],
+    )
+    runner = build_resolve_runner(long_response(), resolved)
+    try:
+        assert module.install() is True
+        actual_resp, _ = asyncio.run(runner._resolve_tool_exec(runner.response))
+        assert actual_resp is resolved
+        assert actual_resp.tools_call_name == ["some_tool"]
+        assert actual_resp.tools_call_args == [{"q": 1}]
+        assert provider.calls == []
+    finally:
+        module.terminate()
+
+
+def test_skills_like_resolve_returning_same_object_is_not_limited(
+    astrbot_runner_modules,
+    monkeypatch,
+):
+    async def passthrough_resolve(self, llm_resp):
+        return llm_resp, self.resolve_tool_set
+
+    monkeypatch.setattr(
+        DummyRunner,
+        "_resolve_tool_exec",
+        passthrough_resolve,
+        raising=False,
+    )
+    provider = DummyProvider("清洗后")
+    module = build_limiter(providers={"clean": provider})
+    input_response = long_response(text="已经过响应入口的普通回答")
+    runner = build_resolve_runner(input_response, input_response)
+    try:
+        assert module.install() is True
+        actual_resp, _ = asyncio.run(runner._resolve_tool_exec(input_response))
+        assert actual_resp is input_response
+        assert provider.calls == []
+    finally:
+        module.terminate()
+
+
+def test_skills_like_fallback_skip_rules_stay_effective(
+    astrbot_runner_modules,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        DummyRunner,
+        "_resolve_tool_exec",
+        fake_resolve_tool_exec,
+        raising=False,
+    )
+    provider = DummyProvider("清洗后")
+
+    module = build_limiter(providers={"clean": provider})
+    short = long_response(text="短")
+    runner = build_resolve_runner(long_response(), short)
+    try:
+        assert module.install() is True
+        actual_resp, _ = asyncio.run(runner._resolve_tool_exec(runner.response))
+        assert actual_resp is short
+    finally:
+        module.terminate()
+
+    whitelisted_event = DummyEvent()
+    module = build_limiter(
+        providers={"clean": provider},
+        whitelist_umos=[whitelisted_event.unified_msg_origin],
+    )
+    resolved = long_response(text="白名单会话里的超长回答")
+    runner = build_resolve_runner(long_response(), resolved, event=whitelisted_event)
+    try:
+        assert module.install() is True
+        actual_resp, _ = asyncio.run(runner._resolve_tool_exec(runner.response))
+        assert actual_resp is resolved
+    finally:
+        module.terminate()
+
+    live_event = DummyEvent(action_type="live")
+    module = build_limiter(providers={"clean": provider})
+    resolved = long_response(text="Live 会话里的超长回答")
+    runner = build_resolve_runner(long_response(), resolved, event=live_event)
+    try:
+        assert module.install() is True
+        actual_resp, _ = asyncio.run(runner._resolve_tool_exec(runner.response))
+        assert actual_resp is resolved
+    finally:
+        module.terminate()
+
+    assert provider.calls == []
+
+
+def test_skills_like_fallback_stop_during_cleaning_returns_original(
+    astrbot_runner_modules,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        DummyRunner,
+        "_resolve_tool_exec",
+        fake_resolve_tool_exec,
+        raising=False,
+    )
+
+    async def exercise():
+        provider = BlockingCleanProvider()
+        module = build_limiter(providers={"clean": provider})
+        event = DummyEvent()
+        resolved = long_response(text="二次询问退回的超长普通回答")
+        runner = build_resolve_runner(long_response(), resolved, event=event)
+        runner.stop_requested = False
+        runner.request_stop = lambda: setattr(runner, "stop_requested", True)
+        try:
+            assert module.install() is True
+            task = asyncio.create_task(runner._resolve_tool_exec(runner.response))
+            await provider.started.wait()
+            event.set_extra("agent_stop_requested", True)
+            actual_resp, _ = await asyncio.wait_for(task, 0.5)
+            assert actual_resp is resolved
+            assert runner.stop_requested is True
+            assert provider.cancelled.is_set()
+        finally:
+            provider.release.set()
+            module.terminate()
+            await module.drain_pending_operations(timeout=0.2)
+
+    asyncio.run(exercise())
+
+
+def test_terminate_during_resolve_wait_returns_late_result_uncleaned(
+    astrbot_runner_modules,
+    monkeypatch,
+):
+    async def blocking_resolve(self, llm_resp):
+        self.resolve_started.set()
+        try:
+            await self.resolve_release.wait()
+        except asyncio.CancelledError:
+            self.resolve_cancelled.set()
+            raise
+        return self.resolve_response, self.resolve_tool_set
+
+    monkeypatch.setattr(
+        DummyRunner,
+        "_resolve_tool_exec",
+        blocking_resolve,
+        raising=False,
+    )
+
+    async def exercise():
+        provider = DummyProvider("清洗后")
+        module = build_limiter(providers={"clean": provider})
+        resolved = long_response(text="二次询问退回的超长普通回答")
+        runner = build_resolve_runner(long_response(), resolved)
+        runner.resolve_started = asyncio.Event()
+        runner.resolve_release = asyncio.Event()
+        runner.resolve_cancelled = asyncio.Event()
+        try:
+            assert module.install() is True
+            task = asyncio.create_task(runner._resolve_tool_exec(runner.response))
+            await runner.resolve_started.wait()
+            module.terminate()
+            runner.resolve_release.set()
+            actual_resp, _ = await asyncio.wait_for(task, 0.5)
+            assert actual_resp is resolved
+            assert provider.calls == []
+            assert runner.resolve_cancelled.is_set() is False
+        finally:
+            runner.resolve_release.set()
+            module.terminate()
+            await module.drain_pending_operations(timeout=0.2)
+
+    asyncio.run(exercise())
+
+
+def test_terminate_during_cleaning_does_not_apply_stale_result(
+    astrbot_runner_modules,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        DummyRunner,
+        "_resolve_tool_exec",
+        fake_resolve_tool_exec,
+        raising=False,
+    )
+
+    async def exercise():
+        provider = BlockingCleanProvider()
+        module = build_limiter(providers={"clean": provider})
+        resolved = long_response(text="二次询问退回的超长普通回答")
+        runner = build_resolve_runner(long_response(), resolved)
+        try:
+            assert module.install() is True
+            task = asyncio.create_task(runner._resolve_tool_exec(runner.response))
+            await provider.started.wait()
+            module.terminate()
+            actual_resp, _ = await asyncio.wait_for(task, 0.5)
+            assert actual_resp is resolved
+            assert provider.cancelled.is_set()
+        finally:
+            provider.release.set()
+            module.terminate()
+            await module.drain_pending_operations(timeout=0.2)
+
+    asyncio.run(exercise())
+
+
+def test_resolve_patch_install_restore_and_double_install(
+    astrbot_runner_modules,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        DummyRunner,
+        "_resolve_tool_exec",
+        fake_resolve_tool_exec,
+        raising=False,
+    )
+    module = build_limiter()
+    try:
+        assert module.install() is True
+        wrapper = DummyRunner._resolve_tool_exec
+        assert wrapper is not fake_resolve_tool_exec
+        assert getattr(
+            wrapper,
+            "_astrna_output_length_limiter_resolve_patch",
+            False,
+        ) is True
+        assert module.install() is True
+        assert DummyRunner._resolve_tool_exec is wrapper
+        module.terminate()
+        assert DummyRunner._resolve_tool_exec is fake_resolve_tool_exec
+    finally:
+        module.terminate()
+        OutputLengthLimiterModule.restore_patch()
+
+
+def test_resolve_patch_missing_entry_keeps_install_working(astrbot_runner_modules):
+    assert getattr(DummyRunner, "_resolve_tool_exec", None) is None
+    provider = DummyProvider("清洗后")
+    module = build_limiter(providers={"clean": provider})
+    response = long_response()
+    runner = build_runner(response)
+    try:
+        assert module.install() is True
+        [actual] = asyncio.run(collect_runner_responses(runner))
+        assert actual is not response
+        assert actual.completion_text == "清洗后"
+        assert len(provider.calls) == 1
+    finally:
+        module.terminate()
+
+
+def test_inactive_resolve_wrapper_transparently_delegates(
+    astrbot_runner_modules,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        DummyRunner,
+        "_resolve_tool_exec",
+        fake_resolve_tool_exec,
+        raising=False,
+    )
+    provider = DummyProvider("清洗后")
+    module = build_limiter(providers={"clean": provider})
+    resolved = long_response(text="二次询问退回的超长普通回答")
+    runner = build_resolve_runner(long_response(), resolved)
+    try:
+        assert module.install() is True
+        mark_wrapper_inactive(DummyRunner._resolve_tool_exec)
+        actual_resp, _ = asyncio.run(runner._resolve_tool_exec(runner.response))
+        assert actual_resp is resolved
+        assert provider.calls == []
+    finally:
+        module.terminate()
+
+
+def test_rebuild_during_resolve_wait_keeps_inflight_cleaning_enabled(
+    astrbot_runner_modules,
+    monkeypatch,
+):
+    async def blocking_resolve(self, llm_resp):
+        self.resolve_started.set()
+        await self.resolve_release.wait()
+        return self.resolve_response, self.resolve_tool_set
+
+    monkeypatch.setattr(
+        DummyRunner,
+        "_resolve_tool_exec",
+        blocking_resolve,
+        raising=False,
+    )
+
+    async def exercise():
+        provider = DummyProvider("清洗后")
+        module = build_limiter(providers={"clean": provider})
+        resolved = long_response(text="二次询问退回的超长普通回答")
+        runner = build_resolve_runner(long_response(), resolved)
+        runner.resolve_started = asyncio.Event()
+        runner.resolve_release = asyncio.Event()
+        try:
+            assert module.install() is True
+            task = asyncio.create_task(runner._resolve_tool_exec(runner.response))
+            await runner.resolve_started.wait()
+            module.terminate(cancel_pending=False)
+            assert module.install() is True
+            runner.resolve_release.set()
+            actual_resp, _ = await asyncio.wait_for(task, 0.5)
+            assert actual_resp is not resolved
+            assert actual_resp.completion_text == "清洗后"
+            assert len(provider.calls) == 1
+        finally:
+            runner.resolve_release.set()
+            module.terminate()
+            await module.drain_pending_operations(timeout=0.2)
+
+    asyncio.run(exercise())
+
+
+def test_rebuild_during_cleaning_keeps_inflight_cleaning_enabled(
+    astrbot_runner_modules,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        DummyRunner,
+        "_resolve_tool_exec",
+        fake_resolve_tool_exec,
+        raising=False,
+    )
+
+    async def exercise():
+        provider = BlockingCleanProvider()
+        module = build_limiter(providers={"clean": provider})
+        resolved = long_response(text="二次询问退回的超长普通回答")
+        runner = build_resolve_runner(long_response(), resolved)
+        try:
+            assert module.install() is True
+            task = asyncio.create_task(runner._resolve_tool_exec(runner.response))
+            await provider.started.wait()
+            module.terminate(cancel_pending=False)
+            assert module.install() is True
+            provider.release.set()
+            actual_resp, _ = await asyncio.wait_for(task, 0.5)
+            assert actual_resp is not resolved
+            assert actual_resp.completion_text == "清洗后"
+            assert len(provider.calls) == 1
+            assert provider.cancelled.is_set() is False
+        finally:
+            provider.release.set()
+            module.terminate()
+            await module.drain_pending_operations(timeout=0.2)
+
+    asyncio.run(exercise())
