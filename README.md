@@ -9,9 +9,9 @@ AstrNa 是一款面向 AstrBot 的优化插件，目标是在不修改 AstrBot C
 > 💌 售后：`777879783`
 > 有问题请加，清漪也会蹦出来一起捣鼓。
 
-🎉 AstrNa 当前正式版：`1.6.5`
+🎉 AstrNa 当前正式版：`1.6.6`
 
-当前已测试兼容 AstrBot 版本：`4.28.1`
+当前已测试兼容 AstrBot 版本：`4.28.2`
 
 - 仓库地址：[Sisyphbaous-DT-Project/astrbot_plugin_AstrNa](https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_AstrNa)
 - 作者主页：[Sisyphbaous-DT-Project](https://github.com/Sisyphbaous-DT-Project)
@@ -501,7 +501,7 @@ GitHub Token 是可选的。留空时只能生成草稿，不能自动提交。�
 
 ## 兼容性
 
-AstrNa 主要面向 AstrBot 当前 4.x 版本。当前正式版 `1.6.5` 已在 AstrBot `4.28.1` 源码环境中完成回归验证。
+AstrNa 主要面向 AstrBot 当前 4.x 版本。当前正式版 `1.6.6` 已在 AstrBot `4.28.2` 源码环境中完成回归验证。
 
 部分能力依赖平台：
 
@@ -524,7 +524,7 @@ AstrNa 主要面向 AstrBot 当前 4.x 版本。当前正式版 `1.6.5` 已在 A
 
 ## 验证状态
 
-最近版本发布前通过以下验证，当前已测试兼容 AstrBot `4.28.1`：
+最近版本发布前通过以下验证，当前已测试兼容 AstrBot `4.28.2`：
 
 ```bash
 TMPDIR=/tmp PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q -s
@@ -534,7 +534,7 @@ python -m compileall -q .
 git diff --check
 ```
 
-本轮（`1.6.5`）为插件市场审核合规修复，验证：默认环境 `27 passed, 1 skipped`；绑定 AstrBot `4.28.1` `28 passed`；`ruff check .` 与 `git diff --check` 通过。`1.6.4` 为针对性修复，验证以相关套件为主：默认环境限制器与关联回归 `99 passed, 2 skipped`；绑定 AstrBot `4.28.1` 的联合套件 `256 passed`（同进程覆盖输出字数限制、Runtime 生命周期、群聊并发与工具相关模块）；真实发送链 `/stop`、第三方包装共存、卸载重装、旧请求隔离、清洗失败兜底等独立复现全部通过。两轮均未跑全量套件；最近一次全量口径（`1.6.3`）为默认环境 `906 passed, 15 skipped`、绑定 `4.28.1` `938 passed`。
+本轮（`1.6.6`）逐项复核 AstrBot `v4.28.1..v4.28.2` 的 3 个提交和 8 个变动文件：上游修复 SQLite 时间字段存储及平台消息历史清理的 UTC 截止时间，未改变 AstrNa 依赖的 Agent、图片、供应商或插件页面接口，也未新增覆盖 AstrNa 功能的能力。AstrNa 无需修改运行逻辑；默认环境全量 `918 passed, 16 skipped`，绑定 AstrBot `4.28.2` 源码全量 `954 passed`（51 条既有弃用告警），上游新增的时间存储测试 `17 passed`。`1.6.5` 的插件市场审核合规修复和 `1.6.4` 的 skills_like 输出限制修复保持不变。
 
 `1.6.4` 修复输出字数限制在 skills_like 模式下的漏检：工具参数二次询问退回的普通最终回答此前直接发送并写入历史、不经过清洗，现在会在首次发送前经过现有限制流程，发送与历史一致采用清洗结果；工具调用、白名单、Live Mode、`/stop` 与清洗失败兜底行为不变。回归覆盖 completion_text / 纯文本 result_chain 两种形态、工具调用直通、空二次询问后修复重询再退回、共享链重排的在途清洗和停止/卸载迟到隔离。`1.6.5` 在此基础上完成插件市场审核合规修改（移除对内置 `logging` 模块的引用），功能行为不变。此前版本的兼容结果见历史发布说明。
 
