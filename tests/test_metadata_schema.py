@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.6.6"
+    assert metadata["version"] == "1.6.7"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -179,7 +179,7 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
     assert "不会把截断前完整 conversation history 全量交给压缩模型" in schema[
         "optimize_group_chat_context"
     ]["hint"]
-    assert "不会把原始群聊流水账交给主模型" in schema["optimize_group_chat_context"]["hint"]
+    assert "不会回灌完整初始窗口" in schema["optimize_group_chat_context"]["hint"]
     assert schema["group_chat_context_compress_provider_id"]["type"] == "string"
     assert (
         schema["group_chat_context_compress_provider_id"]["description"]
@@ -478,6 +478,7 @@ def test_changelog_contains_release_notes():
     assert "## 1.6.4" in changelog
     assert "## 1.6.5" in changelog
     assert "## 1.6.6" in changelog
+    assert "## 1.6.7" in changelog
     assert "## 1.2.5" in changelog
     assert "## 1.2.4" in changelog
 

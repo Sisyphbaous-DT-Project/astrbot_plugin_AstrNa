@@ -987,7 +987,7 @@ def test_invalid_output_does_not_inject_original_group_context(
     assert list(group_context.raw_records[event.unified_msg_origin]) == raw_before
 
 
-def test_fallback_context_only_injects_latest_15_candidate_records(
+def test_fallback_context_only_injects_latest_20_candidate_records(
     astrbot_group_context_modules,
 ):
     provider = DummyProvider("")
@@ -1005,8 +1005,8 @@ def test_fallback_context_only_injects_latest_15_candidate_records(
     fallback_text = req.extra_user_content_parts[0].text
     assert f"最近的 {GROUP_CONTEXT_FALLBACK_RECENT_RECORDS} 条消息" in fallback_text
     assert "测试记录00" not in fallback_text
-    assert "测试记录09" not in fallback_text
-    assert "测试记录10" in fallback_text
+    assert "测试记录04" not in fallback_text
+    assert "测试记录05" in fallback_text
     assert "测试记录24" in fallback_text
     assert getattr(req.extra_user_content_parts[0], "_no_save", False) is True
 
@@ -1725,7 +1725,8 @@ def test_terminate_invalidates_handler_waiting_before_provider_scope(
         req = DummyReq()
         existing = TextPart("已有临时内容")
         req.extra_user_content_parts.append(existing)
-        lock = group_context._get_lock(event.unified_msg_origin)
+        # 固定快照不再等待群缓存读取；阻塞实际的恢复操作锁验证卸载前等待。
+        lock = module.get_session_persistence_lock(event.unified_msg_origin)
         await lock.acquire()
         task = None
         try:

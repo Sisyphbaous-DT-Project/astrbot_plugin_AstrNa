@@ -24,13 +24,14 @@ from ..utils.patching import (
     same_callable,
     unwrap_inactive_wrapper,
 )
+from .group_chat_context_handoff import GroupChatContextHandoffModule, select_initial_records
 
 
 GROUP_CONTEXT_COMPRESS_TIMEOUT_SECONDS = 300
 GROUP_CONTEXT_PERSISTENCE_KEY = "group_chat_context_optimizer_state_v1"
 GROUP_CONTEXT_PERSISTENCE_VERSION = 1
 GROUP_CONTEXT_MAX_PERSISTED_SESSIONS = 128
-GROUP_CONTEXT_FALLBACK_RECENT_RECORDS = 15
+GROUP_CONTEXT_FALLBACK_RECENT_RECORDS = 20
 GROUP_CONTEXT_HEADER_MARKER = "--- BEGIN CONTEXT---"
 GROUP_CONTEXT_FOOTER_MARKER = "--- END CONTEXT ---"
 GROUP_CONTEXT_BLOCK_HEADER = (
@@ -110,6 +111,24 @@ class GroupChatContextOptimizerModule:
             str,
             asyncio.Lock,
         ] = weakref.WeakValueDictionary()
+        self._handoff = GroupChatContextHandoffModule(
+            logger=logger,
+            persisted_snapshot=self._read_initial_persisted_records,
+            snapshot_limit=self.resolve_group_message_max_cnt,
+        )
+
+    def _read_initial_persisted_records(
+        self, group_context: Any, event: Any, umo: str,
+    ) -> list[str] | None:
+        """仅复制边界时已经加载的 KV 来源；首次加载稍后统一通知协调器。"""
+        if not self._persisted_state_loaded:
+            return None
+        sessions = self._persisted_state.get("sessions", {})
+        session = sessions.get(umo, {})
+        values = sanitize_string_list(get_config_value(session, "records", []))
+        ids = sanitize_string_list(get_config_value(session, "record_ids", []))
+        values = select_initial_records(values, ids, event)
+        return values[-self.resolve_group_message_max_cnt(group_context, event):]
 
     def configure(self, *, provider_id: str = "") -> None:
         self.provider_id = normalize_provider_id(provider_id)
@@ -144,6 +163,7 @@ class GroupChatContextOptimizerModule:
     def install(self) -> bool:
         module_cls = type(self)
         if self._installed and module_cls._active_module is self:
+            self._handoff.install()
             return True
 
         group_chat_context_cls = load_group_chat_context_cls()
@@ -230,12 +250,21 @@ class GroupChatContextOptimizerModule:
                     )
                 if event_requests_stop(event):
                     return None
+                if active_module is not None and not active_module._handoff.event_is_current(event):
+                    return None
                 ret = await original_handle_message(group_context_self, event)
                 if (
                     active_module is not None
                     and lifecycle_token is not None
                     and active_module.is_lifecycle_token_current(lifecycle_token)
+                ):
+                    active_module.publish_native_record(group_context_self, event)
+                if (
+                    active_module is not None
+                    and lifecycle_token is not None
+                    and active_module.is_lifecycle_token_current(lifecycle_token)
                     and not event_requests_stop(event)
+                    and active_module._handoff.event_is_current(event)
                 ):
                     await active_module.persist_group_context(
                         group_context_self,
@@ -267,6 +296,7 @@ class GroupChatContextOptimizerModule:
                 umo = getattr(event, "unified_msg_origin", "")
                 if not umo:
                     return await original_remove_session(group_context_self, event)
+                active_module.invalidate_group_session(group_context_self, umo)
                 async with active_module.get_session_persistence_lock(umo):
                     ret = await original_remove_session(group_context_self, event)
                     await active_module.delete_persisted_group_context(
@@ -285,6 +315,7 @@ class GroupChatContextOptimizerModule:
 
         module_cls._active_module = self
         self._installed = True
+        self._handoff.install()
         if self.provider_id:
             self._log("info", "AstrNa 已启用群聊上下文优化。")
         elif not self._empty_provider_logged:
@@ -296,6 +327,7 @@ class GroupChatContextOptimizerModule:
         return True
 
     def terminate(self) -> None:
+        self._handoff.terminate()
         self.cancel_pending_operations()
         module_cls = type(self)
         if self._installed and module_cls._active_module is self:
@@ -349,21 +381,99 @@ class GroupChatContextOptimizerModule:
         if not self.is_lifecycle_token_current(lifecycle_token):
             return None
 
-        group_selection = await self.build_rolling_group_context_selection(
+        current_identity = build_current_message_identity(event, req)
+        req_state = self._register_pending_request(
+            group_context,
+            event,
+            req,
+            current_identity=current_identity,
+            lifecycle_token=lifecycle_token,
+        )
+        keep_subscription = False
+        try:
+            if not self._handoff.request_is_current(req_state):
+                return None
+            records = await self._build_initial_records(
+                group_context,
+                event,
+                req,
+                req_state,
+                lifecycle_token=lifecycle_token,
+            )
+            if event_requests_stop(event):
+                self._release_request_activity_if_stopped(event)
+                return None
+            if not self.is_lifecycle_token_current(lifecycle_token):
+                return None
+            if not self._handoff.request_is_current(req_state):
+                return None
+            if not records:
+                # 初始窗口为空：不调用压缩模型，但保留触发后新增收集订阅。
+                keep_subscription = True
+                return None
+            keep_subscription = await self._optimize_with_initial_records(
+                group_context,
+                event,
+                req,
+                records,
+                current_identity,
+                lifecycle_token=lifecycle_token,
+                req_state=req_state,
+            )
+        finally:
+            if not keep_subscription:
+                self._discard_pending_request(req_state)
+        return None
+
+    async def _build_initial_records(
+        self,
+        group_context: Any,
+        event: Any,
+        req: Any,
+        req_state: Any,
+        *,
+        lifecycle_token: StopAwareScopeToken,
+    ) -> list[str]:
+        """优先使用入站边界固定的初始快照，无边界时走既有读取。"""
+        if req_state is not None:
+            if not self._handoff.request_is_current(req_state):
+                return []
+            await self.restore_group_context(
+                group_context,
+                event,
+                lifecycle_token=lifecycle_token,
+            )
+            if event_requests_stop(event) or not self.is_lifecycle_token_current(
+                lifecycle_token,
+            ) or not self._handoff.request_is_current(req_state):
+                return []
+            snapshot = self._handoff.build_initial_snapshot(
+                group_context,
+                event,
+                req_state,
+            )
+            if snapshot is not None:
+                return snapshot
+        selection = await self.build_rolling_group_context_selection(
             group_context,
             event,
             lifecycle_token=lifecycle_token,
         )
-        if event_requests_stop(event):
-            self._release_request_activity_if_stopped(event)
-            return None
-        if not self.is_lifecycle_token_current(lifecycle_token):
-            return None
-        if not group_selection.records:
-            return None
+        return selection.records
 
-        current_identity = build_current_message_identity(event, req)
-        fallback_records = group_selection.records[-GROUP_CONTEXT_FALLBACK_RECENT_RECORDS:]
+    async def _optimize_with_initial_records(
+        self,
+        group_context: Any,
+        event: Any,
+        req: Any,
+        records: list[str],
+        current_identity: CurrentMessageIdentity,
+        *,
+        lifecycle_token: StopAwareScopeToken,
+        req_state: Any = None,
+    ) -> bool:
+        """按固定初始窗口注入兜底和可选摘要；返回值表示是否保留新增收集订阅。"""
+        fallback_records = records[-GROUP_CONTEXT_FALLBACK_RECENT_RECORDS:]
         fallback_part = create_temp_text_part(
             build_fallback_context_text(
                 fallback_records,
@@ -372,32 +482,38 @@ class GroupChatContextOptimizerModule:
         )
         if event_requests_stop(event):
             self._release_request_activity_if_stopped(event)
-            return None
+            return False
         if not self.is_lifecycle_token_current(lifecycle_token):
-            return None
+            return False
+        if not self._handoff.request_is_current(req_state):
+            return False
 
         provider = self.resolve_compress_provider(group_context)
         if provider is None:
             if event_requests_stop(event):
                 self._release_request_activity_if_stopped(event)
-                return None
+                return False
             if not self.is_lifecycle_token_current(lifecycle_token):
-                return None
+                return False
+            if not self._handoff.request_is_current(req_state):
+                return False
             ensure_extra_user_content_parts(req).append(fallback_part)
-            return None
+            return True
 
         prompt = build_compression_prompt(
             current_message_info=format_current_message_identity(current_identity),
             main_history=format_contexts(
                 self.prepare_main_history_contexts(group_context, event, req),
             ),
-            group_context=format_group_history_block(group_selection.records),
+            group_context=format_group_history_block(records),
         )
         if event_requests_stop(event):
             self._release_request_activity_if_stopped(event)
-            return None
+            return False
         if not self.is_lifecycle_token_current(lifecycle_token):
-            return None
+            return False
+        if not self._handoff.request_is_current(req_state):
+            return False
 
         compression_result = await self.compress_with_provider(
             provider,
@@ -408,7 +524,7 @@ class GroupChatContextOptimizerModule:
         if compression_result.status != STOP_AWARE_COMPLETED:
             if compression_result.status == STOP_AWARE_EVENT_STOPPED:
                 self._release_request_activity_if_stopped(event)
-            return None
+            return False
 
         compressed = str(compression_result.value or "")
         parts = [fallback_part]
@@ -423,20 +539,69 @@ class GroupChatContextOptimizerModule:
             )
         if event_requests_stop(event):
             self._release_request_activity_if_stopped(event)
-            return None
+            return False
         if not self.is_lifecycle_token_current(lifecycle_token):
-            return None
+            return False
+        if not self._handoff.request_is_current(req_state):
+            return False
 
         # 最后一次检查和提交之间不允许 await，避免 stop 后写入半成品。
         ensure_extra_user_content_parts(req).extend(parts)
         if len(parts) == 1:
-            return None
+            return True
         self._log(
             "debug",
             "AstrNa 已压缩群聊上下文: session=%s",
             getattr(event, "unified_msg_origin", ""),
         )
-        return None
+        return True
+
+    def _register_pending_request(
+        self,
+        group_context: Any,
+        event: Any,
+        req: Any,
+        *,
+        current_identity: CurrentMessageIdentity,
+        lifecycle_token: StopAwareScopeToken,
+    ) -> Any:
+        """为本次请求登记触发后新增收集；失败时退化为仅保留既有压缩。"""
+        if not self.is_lifecycle_token_current(lifecycle_token):
+            return None
+        if not self._handoff.supports_handoff:
+            return None
+        try:
+            return self._handoff.register_request(
+                group_context,
+                event,
+                req,
+                identity_text=format_current_message_identity(current_identity),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log("debug", "AstrNa 登记群聊新增消息收集失败: %s", exc)
+            return None
+
+    def _discard_pending_request(self, req_state: Any) -> None:
+        if req_state is None:
+            return
+        try:
+            self._handoff.discard_request(req_state)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def publish_native_record(self, group_context: Any, event: Any) -> None:
+        """原生记录完成后立即发布新增记录，调用方保证此后没有 await。"""
+        try:
+            self._handoff.publish_native_record(group_context, event)
+        except Exception as exc:  # noqa: BLE001
+            self._log("debug", "AstrNa 发布群聊新增记录失败: %s", exc)
+
+    def invalidate_group_session(self, group_context: Any, umo: str) -> None:
+        """会话移除时同步作废本会话的观察与订阅。"""
+        try:
+            self._handoff.invalidate_session(group_context, umo)
+        except Exception:  # noqa: BLE001
+            pass
 
     async def persist_group_context(
         self,
@@ -449,6 +614,8 @@ class GroupChatContextOptimizerModule:
         if event_requests_stop(event):
             return
         if not self.is_lifecycle_token_current(lifecycle_token):
+            return
+        if not self._handoff.event_is_current(event):
             return
         umo = getattr(event, "unified_msg_origin", "")
         if not umo:
@@ -493,6 +660,8 @@ class GroupChatContextOptimizerModule:
             return
         if not self.is_lifecycle_token_current(lifecycle_token):
             return
+        if not self._handoff.event_is_current(event):
+            return
         umo = getattr(event, "unified_msg_origin", "")
         if not umo:
             return
@@ -506,7 +675,7 @@ class GroupChatContextOptimizerModule:
                 )
                 if event_requests_stop(event) or not self.is_lifecycle_token_current(
                     lifecycle_token,
-                ):
+                ) or not self._handoff.event_is_current(event):
                     return
                 records = sanitize_string_list(
                     get_config_value(session, "records", []),
@@ -529,7 +698,7 @@ class GroupChatContextOptimizerModule:
                 def restore_locked() -> bool:
                     if event_requests_stop(event) or not self.is_lifecycle_token_current(
                         lifecycle_token,
-                    ):
+                    ) or not self._handoff.event_is_current(event):
                         return False
                     raw_map = getattr(group_context, "raw_records", None)
                     ids_map = getattr(group_context, "_record_ids", None)
@@ -638,6 +807,8 @@ class GroupChatContextOptimizerModule:
         lifecycle_token: StopAwareScopeToken | None = None,
     ) -> bool:
         if event is not None and event_requests_stop(event):
+            return False
+        if event is not None and not self._handoff.event_is_current(event):
             return False
         if lifecycle_token is not None and not self.is_lifecycle_token_current(
             lifecycle_token,
@@ -755,6 +926,7 @@ class GroupChatContextOptimizerModule:
         getter = getattr(self.kv_store, "get_kv_data", None)
         if not callable(getter):
             self._persisted_state_loaded = True
+            self._handoff.resolve_persisted_history(self._persisted_state["sessions"])
             return self._persisted_state
 
         try:
@@ -771,6 +943,7 @@ class GroupChatContextOptimizerModule:
 
         self._persisted_state = normalize_persisted_state(state)
         self._persisted_state_loaded = True
+        self._handoff.resolve_persisted_history(self._persisted_state["sessions"])
         return self._persisted_state
 
     async def save_persisted_state(self, state: dict[str, Any]) -> None:
@@ -1034,14 +1207,14 @@ class GroupChatContextOptimizerModule:
         except asyncio.TimeoutError as exc:
             self._log(
                 "debug",
-                "AstrNa 群聊上下文压缩失败，本轮不注入原始群聊流水账: %s",
+                "AstrNa 群聊上下文压缩失败，保留最多 20 条初始兜底及可确认新增: %s",
                 exc,
             )
             return StopAwareResult(STOP_AWARE_COMPLETED, "")
         except Exception as exc:  # noqa: BLE001
             self._log(
                 "debug",
-                "AstrNa 群聊上下文压缩失败，本轮不注入原始群聊流水账: %s",
+                "AstrNa 群聊上下文压缩失败，保留最多 20 条初始兜底及可确认新增: %s",
                 exc,
             )
             return StopAwareResult(STOP_AWARE_COMPLETED, "")

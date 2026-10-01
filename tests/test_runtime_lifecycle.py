@@ -81,7 +81,32 @@ def test_terminated_runtime_does_not_resume_waking_chain_configuration(
     asyncio.run(run_case())
 
 
+def test_dashboard_switch_syncs_group_chat_context_optimizer_immediately():
+    runtime = AstrNaRuntime(
+        context=None,
+        config={"optimize_group_chat_context": True},
+        logger=FakeLogger(),
+    )
+    calls: list[str] = []
+    original_install = runtime.group_chat_context_optimizer.install
+    original_terminate = runtime.group_chat_context_optimizer.terminate
+    runtime.group_chat_context_optimizer.install = lambda: calls.append("install") or True
+    runtime.group_chat_context_optimizer.terminate = lambda: calls.append(
+        "terminate",
+    )
+    try:
+        runtime.update_dashboard_switch("optimize_group_chat_context", False)
+        assert calls == ["terminate"]
+        runtime.update_dashboard_switch("optimize_group_chat_context", True)
+        assert calls == ["terminate", "install"]
+    finally:
+        runtime.group_chat_context_optimizer.install = original_install
+        runtime.group_chat_context_optimizer.terminate = original_terminate
+        asyncio.run(runtime.terminate())
+
+
 def test_terminate_invalidates_runtime_before_async_cleanup():
+
     async def run_case() -> None:
         runtime = AstrNaRuntime(context=None, config={}, logger=FakeLogger())
         entered = asyncio.Event()

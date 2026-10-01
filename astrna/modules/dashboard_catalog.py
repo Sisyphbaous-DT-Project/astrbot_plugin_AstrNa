@@ -148,13 +148,15 @@ FEATURES: tuple[dict[str, Any], ...] = (
     _feature(
         "optimize_group_chat_context",
         "群聊上下文优化",
-        "在 AstrBot 群聊上下文感知启用时，用小模型筛选相关群聊原文并生成简短摘要。",
+        "在 AstrBot 群聊上下文感知启用时，用小模型筛选相关群聊原文并生成简短摘要，并补充触发后的新增群消息。",
         "群聊消息量大，全量注入既贵又噪声大。AstrNa 复用 AstrBot 的群聊滚动窗口，"
-        "让小模型做相关性筛选，产出原文摘录和简短摘要，并明确区分当前发言人与历史话题源头。",
+        "保留最多 20 条初始原文，让小模型筛选相关内容并生成简短摘要；"
+        "压缩及后续准备期间已记录的新消息，会在本地主模型首次请求定稿前补充。",
         ("群聊活跃、希望 Bot 接得上话题又不至于上下文爆炸时",),
         (
             "依赖 AstrBot 自带群聊上下文感知已启用",
-            "未配置压缩模型时回退为少量原文摘录，不做相关性筛选",
+            "未配置压缩模型时保留最多 20 条初始原文，支持本地交接时补充可确认新增",
+            "首次发送前新增补入依赖本地 Runner 与观察入口；旧宿主和外部 Agent 保留原请求钩子",
             "压缩模型每轮读取变化内容，建议选择便宜快速的小模型",
         ),
     ),
@@ -436,7 +438,7 @@ def _build_warnings(config: Mapping[str, Any]) -> list[str]:
         config, "group_chat_context_compress_provider_id"
     ):
         warnings.append(
-            "群聊上下文优化已开启但未配置压缩模型：将回退为少量原文摘录，不做相关性筛选。"
+            "群聊上下文优化已开启但未配置压缩模型：不做相关性筛选，保留最多 20 条初始原文；支持本地 Runner 交接时补充可确认新增。"
         )
     if _truthy_flag(config, "output_length_limit_enabled") and not _nonempty_text(
         config, "output_length_limit_provider_id"

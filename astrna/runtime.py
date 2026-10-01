@@ -265,8 +265,7 @@ class AstrNaRuntime:
             self.long_reply_context.install()
         if self.config.get("unlock_group_sender_concurrency", False):
             self.group_sender_concurrency.install()
-        if self.config.get("optimize_group_chat_context", False):
-            self.group_chat_context_optimizer.install()
+        self._configure_group_chat_context_optimizer()
         self._configure_waking_check_chain()
         self._configure_auto_cache_cleanup()
         self._configure_provider_session_headers()
@@ -290,6 +289,8 @@ class AstrNaRuntime:
             self._configure_quoted_image_input()
         elif key == "optimize_image_caption":
             self._configure_image_caption()
+        elif key == "optimize_group_chat_context":
+            self._configure_group_chat_context_optimizer()
 
     def _configure_image_caption(self) -> None:
         if self._closed:
@@ -351,11 +352,7 @@ class AstrNaRuntime:
                 ),
             )
         elif key == "group_chat_context_compress_provider_id":
-            self.group_chat_context_optimizer.configure(
-                provider_id=self.config.get(
-                    "group_chat_context_compress_provider_id", ""
-                ),
-            )
+            self._configure_group_chat_context_optimizer()
         elif key in _OUTPUT_LENGTH_SETTING_KEYS:
             self.output_length_limiter.configure(
                 whitelist_umos=self.config.get("output_length_limit_whitelist_umos", []),
@@ -558,14 +555,7 @@ class AstrNaRuntime:
         else:
             self.group_identity_tools.terminate()
 
-        self.group_chat_context_optimizer.configure(
-            provider_id=self.config.get("group_chat_context_compress_provider_id", ""),
-        )
-        self._configure_group_context_persist_callback()
-        if self.config.get("optimize_group_chat_context", False):
-            self.group_chat_context_optimizer.install()
-        else:
-            self.group_chat_context_optimizer.terminate()
+        self._configure_group_chat_context_optimizer()
 
         self._configure_waking_check_chain(lifecycle_token=lifecycle_token)
         self._configure_auto_cache_cleanup()
@@ -696,6 +686,22 @@ class AstrNaRuntime:
             self.provider_session_headers.install(self.context)
         else:
             self.provider_session_headers.terminate()
+
+    def _configure_group_chat_context_optimizer(self) -> None:
+        """统一同步群聊上下文优化：压缩模型、持久化回调与包装安装状态。"""
+        if getattr(self, "_closed", False):
+            # 插件已终止：被 shield 保护的旧 Dashboard 保存任务不得重新安装。
+            return
+        self.group_chat_context_optimizer.configure(
+            provider_id=self.config.get(
+                "group_chat_context_compress_provider_id", ""
+            ),
+        )
+        self._configure_group_context_persist_callback()
+        if self.config.get("optimize_group_chat_context", False):
+            self.group_chat_context_optimizer.install()
+        else:
+            self.group_chat_context_optimizer.terminate()
 
     def _configure_group_context_persist_callback(self) -> None:
         if self.config.get("optimize_group_chat_context", False):
@@ -882,9 +888,10 @@ class AstrNaRuntime:
         # 会话请求头必须在第一个 await 前拆除，避免中途异常把钩子残留在 httpx 客户端里。
         self.provider_session_headers.terminate()
         self.quoted_image_input.terminate()
+        # 群聊优化必须在首个 await 前停用，避免卸载期间继续收集新增消息。
+        self.group_chat_context_optimizer.terminate()
         await self.issue_assistant.terminate()
         self.group_sender_concurrency.terminate()
-        self.group_chat_context_optimizer.terminate()
         self.long_reply_context.terminate()
         self.forward_nodes.terminate()
         self.dynamic_system_prompt.terminate()

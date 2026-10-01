@@ -89,10 +89,10 @@ const FEATURES = [
   feature(
     "optimize_group_chat_context",
     "群聊上下文优化",
-    "用小模型筛选相关群聊原文并生成简短摘要。",
-    "大量群消息会先经过相关性筛选，再把必要原文和摘要交给主模型。",
+    "用小模型筛选相关群聊原文并生成简短摘要，并补充触发后的新增群消息。",
+    "保留最多 20 条初始原文和筛选摘要，支持本地交接时在首次请求定稿前补充已记录的新消息。",
     ["活跃群聊需要控制上下文噪声和 token 时"],
-    ["依赖 AstrBot 群聊上下文感知"],
+    ["依赖 AstrBot 群聊上下文感知", "首次发送前新增补入依赖本地 Runner；外部 Agent 不保证消费新增背景"],
   ),
   feature(
     "optimize_image_caption",
@@ -254,9 +254,9 @@ const FALLBACK_SETTINGS = {
   ],
   optimize_group_chat_context: [
     setting("group_chat_context_compress_provider_id", "provider", "群聊上下文压缩模型",
-      "筛选群聊相关上下文并生成简短摘要的小模型，不是主对话模型；建议选择便宜快速的小模型。",
+      "筛选初始群聊窗口的小模型，不是主对话模型；触发后新增消息不再压缩，发送前截止保证依赖本地 Runner。",
       "groupctx-model",
-      { notes: ["未配置时回退为少量原文摘录，不做相关性筛选"], options: [], state: { value: "", stale: false } }),
+      { notes: ["未配置时保留最多 20 条初始原文，支持本地交接时补充可确认新增"], options: [], state: { value: "", stale: false } }),
   ],
   output_length_limit_enabled: [
     setting("output_length_limit_whitelist_umos", "protected_list", "输出限制白名单 UMO",
