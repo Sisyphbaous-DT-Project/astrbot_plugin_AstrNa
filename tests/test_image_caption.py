@@ -85,6 +85,9 @@ class DummyContext:
     def get_using_provider(self, unified_msg_origin):
         return self.provider
 
+    async def get_using_provider_async(self, unified_msg_origin):
+        return self.provider
+
 
 @pytest.fixture(autouse=True)
 def reset_image_caption_patch():
@@ -207,6 +210,80 @@ def test_plain_image_caption_prompt_includes_base_prompt_and_user_question(
     assert prompt.startswith("请描述图片。")
     assert "图里的人手上拿着什么？" in prompt
     assert "用户当前问题" in prompt
+
+
+@pytest.mark.parametrize("montage_as_keyword", [True, False])
+def test_plain_image_caption_forwards_montage_refs_and_result(
+    astr_main_agent, montage_as_keyword
+):
+    calls = []
+    expected = {"prepared-image"}
+
+    async def new_ensure_img_caption(
+        event, req, cfg, plugin_context, image_caption_provider, montage_refs=None
+    ):
+        calls.append((cfg, montage_refs))
+        return expected
+
+    astr_main_agent._ensure_img_caption = new_ensure_img_caption
+    module = ImageCaptionModule(logger=DummyLogger())
+    module.install()
+    montage_refs = {"/tmp/animation.jpg"}
+    args = [
+        DummyEvent(),
+        DummyRequest(prompt="看看动画"),
+        {"image_caption_prompt": "base"},
+        DummyContext(DummyProvider()),
+        "caption-provider",
+    ]
+    if montage_as_keyword:
+        result = run(
+            astr_main_agent._ensure_img_caption(*args, montage_refs=montage_refs)
+        )
+    else:
+        result = run(astr_main_agent._ensure_img_caption(*args, montage_refs))
+
+    assert result is expected
+    assert calls[0][1] is montage_refs
+    assert "看看动画" in calls[0][0]["image_caption_prompt"]
+
+
+def test_stale_plain_caption_wrapper_keeps_new_parameters_and_original_config(
+    astr_main_agent,
+):
+    calls = []
+    result = {"success"}
+
+    async def native(event, req, cfg, plugin_context, image_caption_provider, montage_refs=None):
+        calls.append((cfg, montage_refs))
+        return result
+
+    astr_main_agent._ensure_img_caption = native
+    module = ImageCaptionModule(DummyLogger())
+    assert module.install()
+    stale = astr_main_agent._ensure_img_caption
+    module.terminate()
+    assert module.install()
+    cfg = {"image_caption_prompt": "native"}
+    montage = {"animation"}
+    actual = run(stale(DummyEvent(), DummyRequest("question"), cfg, None, "caption", montage_refs=montage))
+    assert actual is result
+    assert calls == [(cfg, montage)]
+    assert calls[0][0] is cfg
+
+
+def test_plain_caption_preserves_native_type_error(astr_main_agent):
+    error = TypeError("native failure")
+
+    async def native(event, req, cfg, plugin_context, image_caption_provider):
+        raise error
+
+    astr_main_agent._ensure_img_caption = native
+    module = ImageCaptionModule(DummyLogger())
+    assert module.install()
+    with pytest.raises(TypeError) as failure:
+        run(astr_main_agent._ensure_img_caption(DummyEvent(), DummyRequest(), {}, None, "caption"))
+    assert failure.value is error
 
 
 def test_plain_image_caption_keeps_prompt_when_no_text_context(astr_main_agent):
@@ -419,6 +496,100 @@ def test_quote_image_caption_supports_image_ref_signature(astr_main_agent):
     assert prompt.startswith("Please describe the image content.")
     assert "新版用户问题" in prompt
     assert "新版引用文本" in prompt
+
+
+@pytest.mark.parametrize("image_is_montage", [False, True])
+def test_quote_image_caption_supports_montage_signature_and_animation_notice(
+    astr_main_agent, image_is_montage
+):
+    provider = DummyProvider()
+    original_calls = []
+    animation_notice = (
+        "\n<system_notice>\n"
+        "Input images at positions 1 (1-based) are animations (e.g. GIFs), "
+        "each converted to a single image of frames in reading order. "
+        "Describe them as animations, including motion or changes; "
+        "do not mention the conversion or frame layout.\n"
+        "</system_notice>"
+    )
+    astr_main_agent.ANIMATION_CAPTION_NOTICE = animation_notice.replace(
+        "positions 1", "positions {indices}"
+    )
+
+    async def new_process_quote_message(
+        event,
+        req,
+        img_cap_prov_id,
+        plugin_context,
+        quoted_message_settings=None,
+        main_provider_supports_image=False,
+        skip_quote_image_caption=False,
+        image_ref=None,
+        image_is_montage=False,
+    ):
+        original_calls.append((image_ref, image_is_montage))
+        provider = plugin_context.get_provider_by_id(img_cap_prov_id)
+        prompt = "Please describe the image content."
+        if image_is_montage:
+            prompt += animation_notice
+        await provider.text_chat(prompt=prompt, image_urls=[image_ref])
+        return image_ref
+
+    astr_main_agent._process_quote_message = new_process_quote_message
+    module = ImageCaptionModule(logger=DummyLogger())
+    module.install()
+
+    result = run(
+        astr_main_agent._process_quote_message(
+            DummyEvent([Reply(message_str="动画引用文本")]),
+            DummyRequest(prompt="看看这段动画"),
+            "caption-provider",
+            DummyContext(provider),
+            None,
+            False,
+            False,
+            "/tmp/quote-animation.jpg",
+            image_is_montage,
+        )
+    )
+
+    assert result == "/tmp/quote-animation.jpg"
+    assert original_calls == [("/tmp/quote-animation.jpg", image_is_montage)]
+    prompt = provider.prompts[0]
+    assert ("Input images at positions 1" in prompt) is image_is_montage
+    assert "看看这段动画" in prompt
+    assert "动画引用文本" in prompt
+
+
+def test_quote_caption_async_provider_fallback_receives_context(astr_main_agent):
+    async def native(
+        event, req, img_cap_prov_id, plugin_context, quoted_message_settings=None,
+        main_provider_supports_image=False, skip_quote_image_caption=False,
+        image_ref=None,
+    ):
+        provider = plugin_context.get_provider_by_id(img_cap_prov_id)
+        if provider is None:
+            provider = await plugin_context.get_using_provider_async(event.unified_msg_origin)
+        await provider.text_chat(
+            prompt="Please describe the image content.", image_urls=[image_ref]
+        )
+        return image_ref
+
+    astr_main_agent._process_quote_message = native
+    module = ImageCaptionModule(DummyLogger())
+    assert module.install()
+    provider = DummyProvider()
+    actual = run(
+        astr_main_agent._process_quote_message(
+            DummyEvent([Reply(message_str="quoted")]), DummyRequest("question"),
+            "unavailable-provider", DummyContext(provider, id_provider=None),
+            image_ref="/tmp/quote.jpg",
+        )
+    )
+    assert actual == "/tmp/quote.jpg"
+    assert "question" in provider.prompts[0]
+    assert "quoted" in provider.prompts[0]
+    assert "text_chat" not in provider.__dict__
 
 
 @pytest.fixture
@@ -782,6 +953,28 @@ def test_quote_provider_restore_keeps_wraps_outer_and_deactivates_old_layer(
 def test_build_image_caption_prompt_keeps_base_without_context():
     assert build_image_caption_prompt("base") == "base"
     assert build_image_caption_prompt(None) is None
+
+
+def test_old_quote_context_cleanup_cannot_remove_reinstalled_provider_wrapper(
+    astr_main_agent,
+):
+    from astrna.modules.image_caption import _ImageCaptionContextProxy
+
+    provider = DummyProvider()
+    module = ImageCaptionModule(DummyLogger())
+    assert module.install()
+    old_context = _ImageCaptionContextProxy(DummyContext(provider), module)
+    old_context.get_provider_by_id("caption")
+    module.terminate()
+    assert module.install()
+    new_context = _ImageCaptionContextProxy(DummyContext(provider), module)
+    new_context.get_provider_by_id("caption")
+    current_wrapper = provider.text_chat
+    old_context.restore()
+    assert provider.text_chat is current_wrapper
+    assert is_wrapper_active(current_wrapper)
+    new_context.restore()
+    assert "text_chat" not in provider.__dict__
 
 
 def test_sanitize_caption_context_text_handles_risky_text():

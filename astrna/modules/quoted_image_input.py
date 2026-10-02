@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import inspect
 import os
 import weakref
+from copy import copy
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -76,6 +78,9 @@ class _RequestImages:
     event_ref: Any
     sources: list[_QuotedImageSource]
     prepared: bool = False
+    native_quote_handling: bool = False
+    quote_ref: str | None = None
+    collected_refs: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -85,27 +90,39 @@ class _CollectionCapture:
     sources: dict[int, _QuotedImageSource]
 
 
+@dataclass
+class _PatchTarget:
+    owner: Any
+    attribute: str
+    original: Any
+    wrapper: Any
+
+
+@dataclass
+class _RecoveredQuotedImage:
+    source: _QuotedImageSource
+    ref: str
+
+
 _collection_capture: ContextVar[_CollectionCapture | None] = ContextVar(
     "astrna_quoted_image_collection", default=None
 )
 _REQUEST_IMAGES_ATTR = "_astrna_quoted_input_images"
+_NO_PREPARED_RESULT = object()
 
 
 class QuotedImageInputModule:
     """为第三方自建 ProviderRequest 补齐当前 Reply 引用图片。
 
     AstrBot 主流程已内置引用图片收集；本模块在其上提供两层兜底：
-    1. 新版 AstrBot（prepare_request_images 存在时）包装 internal stage 的
-       图片准备入口，首次准备后按 prepared 表确认准备失败的引用图片并经
-       OneBot 回取恢复，重新准备后再交给原生转述；
+    1. 提供 prepare_request_images 的 AstrBot，包装主 Agent / internal stage
+       实际持有的图片准备入口，首次准备后按 prepared 表确认失败的引用图片，
+       经 OneBot 回取并重新准备后再交给原生转述；
     2. 对上游不收集引用图的第三方自建请求，在 OnLLMRequestEvent 里补图。
     """
 
-    _internal_stage_module: Any = None
-    _original_prepare_request_images: Any = None
-    _prepare_wrapper: Any = None
-    _collect_original: Any = None
-    _collect_wrapper: Any = None
+    _prepare_targets: list[_PatchTarget] = []
+    _collect_targets: list[_PatchTarget] = []
     _image_cls: Any = None
     _image_original: Any = None
     _image_wrapper: Any = None
@@ -118,112 +135,220 @@ class QuotedImageInputModule:
         self._generation = object()
 
     def install(self) -> bool:
+        main_agent = _load_astr_main_agent()
         internal_stage = _load_internal_stage_module()
-        if internal_stage is None:
-            return False
-        original = getattr(internal_stage, "prepare_request_images", None)
-        if not callable(original):
+        prepare_targets: list[_PatchTarget] = []
+        collect_targets: list[_PatchTarget] = []
+        for owner in (main_agent, internal_stage):
+            if owner is None:
+                continue
+            for attribute, targets in (
+                ("prepare_request_images", prepare_targets),
+                ("collect_initial_request", collect_targets),
+            ):
+                original = getattr(owner, attribute, None)
+                if not callable(original):
+                    continue
+                targets.append(_PatchTarget(owner, attribute, original, None))
+
+        if not prepare_targets:
             # 旧版 AstrBot 无图片准备入口，optimize() 路径继续兜底。
             return False
 
         module_cls = type(self)
-        if module_cls._prepare_wrapper is not None and (
-            module_cls._internal_stage_module is not internal_stage
-            or not same_callable(original, module_cls._prepare_wrapper)
-        ):
+        if module_cls._prepare_targets:
+            installed = all(
+                same_callable(getattr(target.owner, target.attribute, None), target.wrapper)
+                for target in module_cls._prepare_targets + module_cls._collect_targets
+            )
+            if installed and module_cls._active_module is not None:
+                module_cls._active_module = self
+                self._installed = True
+                return True
             module_cls.restore_patch()
-            original = internal_stage.prepare_request_images
-
-        if module_cls._prepare_wrapper is None:
-            original_prepare_request_images = original
-
-            async def astrna_prepare_request_images(
-                req: Any, event: Any, *args: Any, **kwargs: Any
-            ) -> Any:
-                active_module = module_cls._active_module
-                token = active_module._generation if active_module else None
-                result = await original_prepare_request_images(
-                    req, event, *args, **kwargs
+            # 恢复后重新读取真实入口，避免把刚失效的自身包装再次装回链中。
+            for target in prepare_targets + collect_targets:
+                target.original = unwrap_inactive_wrapper(
+                    getattr(target.owner, target.attribute)
                 )
-                # 仅在引用转述之前的首次准备调用做恢复：internal stage 首次
-                # 调用携带 quote_image_ref 关键字，请求钩子后的第二次不传。
-                if (
-                    active_module is not None
-                    and is_wrapper_active(astrna_prepare_request_images)
-                    and active_module._is_current(token)
-                    and "quote_image_ref" in kwargs
-                    and not event_requests_stop(event)
-                ):
-                    state = request_image_state(req, event)
-                    if state is None:
-                        state = _RequestImages(
-                            weakref.ref(event), quoted_image_sources(event)
-                        )
-                        setattr(req, _REQUEST_IMAGES_ATTR, state)
-                    recovered = await active_module.recover_failed_quoted_images(
-                        event, req, kwargs.get("prepared"), state, token
-                    )
-                    if not active_module._is_current(token) or event_requests_stop(
-                        event
-                    ):
-                        return result
-                    if recovered:
-                        # 必须在转述前处理恢复图；调用原函数，避免再次进入恢复。
-                        await original_prepare_request_images(
-                            req, event, *args, **kwargs
-                        )
-                    if active_module._is_current(token):
-                        state.prepared = True
-                return result
 
-            astrna_prepare_request_images._astrna_quoted_image_input_patch = True
-            mark_wrapper_active(
-                astrna_prepare_request_images, original_prepare_request_images
+        prepare_wrappers: list[tuple[Any, Any]] = []
+        for target in prepare_targets:
+            wrapper = next(
+                (
+                    existing_wrapper
+                    for original, existing_wrapper in prepare_wrappers
+                    if same_callable(original, target.original)
+                ),
+                None,
             )
-            module_cls._internal_stage_module = internal_stage
-            module_cls._original_prepare_request_images = (
-                original_prepare_request_images
-            )
-            module_cls._prepare_wrapper = astrna_prepare_request_images
-            internal_stage.prepare_request_images = astrna_prepare_request_images
-            self._install_collection_capture(internal_stage)
+            if wrapper is None:
+                wrapper = self._build_prepare_wrapper(target.original)
+                prepare_wrappers.append((target.original, wrapper))
+            target.wrapper = wrapper
+            setattr(target.owner, target.attribute, wrapper)
 
+        module_cls._prepare_targets = prepare_targets
+        if collect_targets:
+            self._install_collection_capture(collect_targets)
         module_cls._active_module = self
         self._installed = True
         return True
 
-    def _install_collection_capture(self, internal_stage: Any) -> None:
-        original_collect = getattr(internal_stage, "collect_initial_request", None)
+    def _build_prepare_wrapper(self, original_prepare_request_images: Any) -> Any:
+        module_cls = type(self)
+
+        async def astrna_prepare_request_images(
+            req: Any, event: Any, *args: Any, **kwargs: Any
+        ) -> Any:
+            active_module = module_cls._active_module
+            token = active_module._generation if active_module else None
+            first_prepare = kwargs.get("finalize") is False or (
+                "finalize" not in kwargs and "quote_image_ref" in kwargs
+            )
+            if (
+                active_module is None
+                or not is_wrapper_active(astrna_prepare_request_images)
+                or not first_prepare
+                or event_requests_stop(event)
+            ):
+                return await original_prepare_request_images(req, event, *args, **kwargs)
+            state = request_image_state(req, event)
+            if state is None and has_upstream_quoted_image_attachment(req):
+                state = _RequestImages(
+                    weakref.ref(event),
+                    quoted_image_sources(event),
+                    native_quote_handling=True,
+                    collected_refs=set(
+                        normalize_and_dedupe_strings(
+                            getattr(req, "image_urls", [])
+                        )
+                    ),
+                )
+                setattr(req, _REQUEST_IMAGES_ATTR, state)
+            result = await original_prepare_request_images(req, event, *args, **kwargs)
+            if (
+                state is None
+                or state.prepared
+                or not is_wrapper_active(astrna_prepare_request_images)
+                or not active_module._is_current(token)
+                or not first_prepare
+                or event_requests_stop(event)
+            ):
+                return result
+
+            quote_ref = kwargs.get("quote_image_ref")
+            if isinstance(quote_ref, str) and quote_ref:
+                state.quote_ref = quote_ref
+                # 第三方请求也可能交给原生专用转述；以实际准备参数为准。
+                state.native_quote_handling = True
+            recovered = await active_module.recover_failed_quoted_images(
+                event, req, kwargs.get("prepared"), state, token
+            )
+            if not active_module._is_current(token) or event_requests_stop(event):
+                return result
+            if recovered:
+                await active_module._prepare_recovered_images(
+                    original_prepare_request_images,
+                    req,
+                    event,
+                    args,
+                    kwargs,
+                    state,
+                    recovered,
+                    token,
+                )
+            if active_module._is_current(token) and not event_requests_stop(event):
+                state.prepared = True
+            return result
+
+        astrna_prepare_request_images._astrna_quoted_image_input_patch = True
+        mark_wrapper_active(
+            astrna_prepare_request_images, original_prepare_request_images
+        )
+        return astrna_prepare_request_images
+
+    def _install_collection_capture(self, targets: list[_PatchTarget]) -> None:
         try:
             from astrbot.core.message.components import Image
         except ImportError:
             return
-        if not callable(original_collect):
-            return
         original_image = Image.convert_to_file_path
         module_cls = type(self)
 
-        async def collect(event: Any, *args: Any, **kwargs: Any) -> Any:
-            active = module_cls._active_module
-            if active is None or not is_wrapper_active(collect):
-                return await original_collect(event, *args, **kwargs)
-            generation = active._generation
-            sources = quoted_image_sources(event)
-            capture = _CollectionCapture(
-                active, generation, {id(source.image): source for source in sources}
-            )
-            token = _collection_capture.set(capture)
+        def build_collect_wrapper(original_collect: Any) -> Any:
             try:
-                result = await original_collect(event, *args, **kwargs)
-            finally:
-                _collection_capture.reset(token)
-            if active._is_current(generation) and result[0] is not None:
-                setattr(
-                    result[0],
-                    _REQUEST_IMAGES_ATTR,
-                    _RequestImages(weakref.ref(event), sources),
+                collect_signature = inspect.signature(original_collect)
+            except (TypeError, ValueError):
+                collect_signature = None
+
+            async def collect(event: Any, *args: Any, **kwargs: Any) -> Any:
+                active = module_cls._active_module
+                if active is None or not is_wrapper_active(collect):
+                    return await original_collect(event, *args, **kwargs)
+                generation = active._generation
+                parent_capture = _collection_capture.get()
+                if (
+                    parent_capture is not None
+                    and parent_capture.module is active
+                    and parent_capture.token is generation
+                ):
+                    return await original_collect(event, *args, **kwargs)
+                supplied_req = kwargs.get(
+                    "req", args[2] if len(args) > 2 else None
                 )
-            return result
+                if collect_signature is not None:
+                    try:
+                        supplied_req = collect_signature.bind_partial(
+                            event, *args, **kwargs
+                        ).arguments.get("req", supplied_req)
+                    except TypeError:
+                        return await original_collect(event, *args, **kwargs)
+                get_extra = getattr(event, "get_extra", None)
+                adopted_req = (
+                    get_extra("provider_request", None)
+                    if callable(get_extra)
+                    else None
+                )
+                # 原生收集会把新建请求写入 event；来源必须在调用之前固定。
+                native_quote_handling = supplied_req is None and adopted_req is None
+                sources = quoted_image_sources(event)
+                capture = _CollectionCapture(
+                    active,
+                    generation,
+                    {id(source.image): source for source in sources},
+                )
+                token = _collection_capture.set(capture)
+                try:
+                    result = await original_collect(event, *args, **kwargs)
+                finally:
+                    _collection_capture.reset(token)
+                if not active._is_current(generation):
+                    return result
+                if not isinstance(result, tuple) or not result or result[0] is None:
+                    return result
+                req = result[0]
+                quote_ref = result[1] if len(result) > 1 else None
+                setattr(
+                    req,
+                    _REQUEST_IMAGES_ATTR,
+                    _RequestImages(
+                        weakref.ref(event),
+                        sources,
+                        native_quote_handling=native_quote_handling,
+                        quote_ref=quote_ref if isinstance(quote_ref, str) else None,
+                        collected_refs=set(
+                            normalize_and_dedupe_strings(
+                                getattr(req, "image_urls", [])
+                            )
+                        ),
+                    ),
+                )
+                return result
+
+            mark_wrapper_active(collect, original_collect)
+            collect._astrna_quoted_image_input_patch = True
+            return collect
 
         async def convert(image: Any, *args: Any, **kwargs: Any) -> Any:
             capture = _collection_capture.get()
@@ -243,14 +368,26 @@ class QuotedImageInputModule:
                         source.collection_failed = result is None
 
         # 只记录当前收集任务里的引用组件，不改组件、不额外下载图片。
-        mark_wrapper_active(collect, original_collect)
+        collect_wrappers: list[tuple[Any, Any]] = []
+        for target in targets:
+            wrapper = next(
+                (
+                    existing_wrapper
+                    for original, existing_wrapper in collect_wrappers
+                    if same_callable(original, target.original)
+                ),
+                None,
+            )
+            if wrapper is None:
+                wrapper = build_collect_wrapper(target.original)
+                collect_wrappers.append((target.original, wrapper))
+            target.wrapper = wrapper
+            setattr(target.owner, target.attribute, wrapper)
         mark_wrapper_active(convert, original_image)
-        module_cls._collect_original = original_collect
-        module_cls._collect_wrapper = collect
+        module_cls._collect_targets = targets
         module_cls._image_cls = Image
         module_cls._image_original = original_image
         module_cls._image_wrapper = convert
-        internal_stage.collect_initial_request = collect
         Image.convert_to_file_path = convert
 
     def _is_current(self, token: object) -> bool:
@@ -271,37 +408,25 @@ class QuotedImageInputModule:
         if cls._active_module is not None:
             cls._active_module._generation = object()
             cls._active_module._installed = False
-        mark_wrapper_inactive(cls._prepare_wrapper)
-        mark_wrapper_inactive(cls._collect_wrapper)
+        for target in cls._prepare_targets + cls._collect_targets:
+            mark_wrapper_inactive(target.wrapper)
+            if same_callable(
+                getattr(target.owner, target.attribute, None), target.wrapper
+            ):
+                setattr(
+                    target.owner,
+                    target.attribute,
+                    unwrap_inactive_wrapper(target.original),
+                )
         mark_wrapper_inactive(cls._image_wrapper)
-        if cls._internal_stage_module is not None:
-            current = getattr(
-                cls._internal_stage_module, "prepare_request_images", None
-            )
-            if cls._original_prepare_request_images is not None and same_callable(
-                current, cls._prepare_wrapper
-            ):
-                cls._internal_stage_module.prepare_request_images = (
-                    unwrap_inactive_wrapper(cls._original_prepare_request_images)
-                )
-            if cls._collect_wrapper is not None and same_callable(
-                getattr(cls._internal_stage_module, "collect_initial_request", None),
-                cls._collect_wrapper,
-            ):
-                cls._internal_stage_module.collect_initial_request = (
-                    unwrap_inactive_wrapper(cls._collect_original)
-                )
         if cls._image_cls is not None and same_callable(
             cls._image_cls.convert_to_file_path, cls._image_wrapper
         ):
             cls._image_cls.convert_to_file_path = unwrap_inactive_wrapper(
                 cls._image_original
             )
-        cls._internal_stage_module = None
-        cls._original_prepare_request_images = None
-        cls._prepare_wrapper = None
-        cls._collect_original = None
-        cls._collect_wrapper = None
+        cls._prepare_targets = []
+        cls._collect_targets = []
         cls._image_cls = None
         cls._image_original = None
         cls._image_wrapper = None
@@ -314,53 +439,62 @@ class QuotedImageInputModule:
         prepared: Any,
         state: _RequestImages,
         token: object,
-    ) -> bool:
-        """恢复上游已收集但图片准备失败的引用图片。
-
-        上游收集时把 Reply 嵌入图片转为本地路径加入 req.image_urls 并留下
-        标记文本；准备失败的路径会被静默移除（标记保留），只能靠 prepared
-        表中的 None 值确认。来源由收集任务记录；按稳定标识或相同图片数量下
-        的原消息顺序定位回取结果，只恢复失败图片，不追加整条消息的所有图片。
-        """
+    ) -> list[_RecoveredQuotedImage]:
+        """回取确认失败的引用图片；本阶段不改请求或共享 prepared 缓存。"""
         if not isinstance(prepared, dict):
-            return False
-        failed_paths = collect_failed_quoted_image_paths(req, prepared)
-        if not failed_paths and not any(
-            source.collection_failed for source in state.sources
-        ):
-            return False
+            return []
 
-        image_urls = ensure_image_urls(req)
+        failed_sources: list[_QuotedImageSource] = []
         existing_refs = {
-            image_ref_key(ref) for ref in normalize_and_dedupe_strings(image_urls)
+            image_ref_key(ref)
+            for ref in normalize_and_dedupe_strings(getattr(req, "image_urls", []))
         }
+        for key, value in prepared.items():
+            if not _prepared_result_is_success(value):
+                continue
+            existing_refs.add(image_ref_key(key))
+            path = _prepared_result_path(value)
+            if path:
+                existing_refs.add(image_ref_key(path))
+
         for source in state.sources:
-            if source.path in prepared and prepared[source.path] is not None:
-                existing_refs.update(source.aliases)
+            result = find_source_prepared_result(source, prepared, state.quote_ref)
+            if _prepared_result_is_success(result):
+                continue
+            if _prepared_result_is_unavailable(result) or (
+                result is _NO_PREPARED_RESULT and source.collection_failed
+            ):
+                failed_sources.append(source)
+        if not failed_sources:
+            return []
+
         extractor_event = build_extractor_event(event)
         call_action = get_call_action(extractor_event)
         if not callable(call_action):
-            return False
-        recovered_refs: list[str] = []
+            return []
+        recovered: list[_RecoveredQuotedImage] = []
 
         for reply in find_reply_components(event):
-            sources = [source for source in state.sources if source.reply is reply]
-            failed = [
+            sources = [
                 source
-                for source in sources
-                if source.collection_failed
-                or (source.path and image_ref_key(source.path) in failed_paths)
+                for source in failed_sources
+                if source.reply is reply
             ]
-            if not failed:
+            if not sources:
                 continue
             try:
                 segments = await fetch_onebot_image_segments(
                     call_action, str(getattr(reply, "id", "") or "")
                 )
                 if not self._is_current(token) or event_requests_stop(event):
-                    return False
-                for source in failed:
-                    segment = match_onebot_image(source, sources, segments)
+                    return []
+                reply_sources = [
+                    source
+                    for source in state.sources
+                    if source.reply is reply
+                ]
+                for source in sources:
+                    segment = match_onebot_image(source, reply_sources, segments)
                     if segment is None:
                         continue
                     refs = collect_onebot_image_refs([segment])
@@ -372,12 +506,12 @@ class QuotedImageInputModule:
                             )
                         )
                         if not self._is_current(token) or event_requests_stop(event):
-                            return False
+                            return []
                     for ref in normalize_and_dedupe_strings(resolved):
                         key = image_ref_key(ref)
                         if key in existing_refs:
                             continue
-                        recovered_refs.append(ref)
+                        recovered.append(_RecoveredQuotedImage(source, ref))
                         existing_refs.add(key)
                         break
             except Exception as exc:  # noqa: BLE001
@@ -389,19 +523,94 @@ class QuotedImageInputModule:
                 continue
 
         if not self._is_current(token) or event_requests_stop(event):
+            return []
+        return recovered
+
+    async def _prepare_recovered_images(
+        self,
+        original_prepare: Any,
+        req: Any,
+        event: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        state: _RequestImages,
+        recovered: list[_RecoveredQuotedImage],
+        token: object,
+    ) -> bool:
+        """重新准备恢复图，并把旧失败引用映射到对应的成功结果。"""
+        prepared = kwargs.get("prepared")
+        if not isinstance(prepared, dict):
             return False
-        # 回取期间不改请求；全部完成后一次提交，避免停止时留下半份原图。
-        for ref in recovered_refs:
-            if ref in prepared and prepared[ref] is None:
-                prepared.pop(ref)
-        image_urls.extend(recovered_refs)
-        if recovered_refs:
+        base_image_urls = list(getattr(req, "image_urls", []) or [])
+        recovered_refs = [item.ref for item in recovered]
+        working_req = copy(req)
+        working_req.image_urls = [*base_image_urls, *recovered_refs]
+        working_req.extra_user_content_parts = list(
+            getattr(req, "extra_user_content_parts", []) or []
+        )
+        prepare_kwargs = dict(kwargs)
+        original_quoted_refs = kwargs.get("quoted_refs")
+        if "quoted_refs" in prepare_kwargs:
+            prepare_kwargs["quoted_refs"] = set(original_quoted_refs or ()) | set(
+                recovered_refs
+            )
+        # 按结果对象身份复制，保留原引用和准备路径共享同一结果的约定。
+        cloned_results: dict[int, dict] = {}
+        working_prepared: dict[str, Any] = {}
+        for ref, result in prepared.items():
+            if isinstance(result, dict):
+                if id(result) not in cloned_results:
+                    cloned_results[id(result)] = {
+                        **result,
+                        "notices": list(result.get("notices", [])),
+                    }
+                working_prepared[ref] = cloned_results[id(result)]
+            else:
+                working_prepared[ref] = result
+        prepare_kwargs["prepared"] = working_prepared
+        for item in recovered:
+            clear_source_prepared_result(
+                working_prepared, item.source, state.quote_ref, item.ref
+            )
+
+        try:
+            await original_prepare(working_req, event, *args, **prepare_kwargs)
+        except Exception as exc:  # noqa: BLE001
+            self._log(
+                "warning", "AstrNa 重新准备恢复的引用图片失败: %s", exc
+            )
+            return False
+        if not self._is_current(token) or event_requests_stop(event):
+            return False
+
+        final_urls = list(base_image_urls)
+        recovered_count = 0
+        for item in recovered:
+            result = working_prepared.get(item.ref)
+            path = _prepared_result_path(result)
+            if not _prepared_result_is_success(result):
+                continue
+            if isinstance(result, dict):
+                result["quoted"] = True
+            prepared[item.ref] = result
+            if path:
+                prepared[path] = result
+            replace_source_prepared_result(
+                prepared, item.source, state.quote_ref, result
+            )
+            if isinstance(original_quoted_refs, set):
+                original_quoted_refs.add(item.ref)
+            recovered_count += 1
+            if _source_was_collected_input(item.source, state) and path:
+                final_urls.append(path)
+        req.image_urls = normalize_and_dedupe_strings(final_urls)
+        if recovered_count:
             self._log(
                 "debug",
                 "AstrNa 已恢复图片准备失败的引用图片 %d 张。",
-                len(recovered_refs),
+                recovered_count,
             )
-        return bool(recovered_refs)
+        return bool(recovered_count)
 
     async def optimize(self, event: Any, req: Any) -> None:
         if event is None or req is None:
@@ -413,12 +622,7 @@ class QuotedImageInputModule:
 
         state = request_image_state(req, event)
         prepared_upstream = (
-            state is not None
-            and state.prepared
-            and (
-                has_upstream_quoted_image_attachment(req)
-                or any(source.collection_failed for source in state.sources)
-            )
+            state is not None and state.prepared and state.native_quote_handling
         )
         if prepared_upstream or has_upstream_image_caption(req):
             # 只信本请求的处理记录；成功或失败的原生转述均不得重新注入原图。
@@ -563,9 +767,140 @@ def _load_internal_stage_module() -> Any | None:
     return internal
 
 
+def _load_astr_main_agent() -> Any | None:
+    """加载主 Agent 构建模块；极简测试环境缺失时返回 None。"""
+    try:
+        from astrbot.core import astr_main_agent
+    except Exception:
+        return None
+    return astr_main_agent
+
+
 def image_ref_key(ref: str) -> str:
     local = image_ref_to_local_path(ref)
     return os.path.abspath(local) if local else ref.strip()
+
+
+def _prepared_result_path(value: Any) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, dict):
+        path = value.get("path")
+        return path if isinstance(path, str) and path else None
+    return None
+
+
+def _prepared_result_is_success(value: Any) -> bool:
+    return _prepared_result_path(value) is not None
+
+
+def _prepared_result_is_unavailable(value: Any) -> bool:
+    if value is None:
+        return True
+    return (
+        isinstance(value, dict)
+        and value.get("path") is None
+        and value.get("status") == "unavailable"
+    )
+
+
+def _source_ref_candidates(
+    source: _QuotedImageSource, quote_ref: str | None
+) -> set[str]:
+    candidates = set(source.aliases)
+    if source.path:
+        candidates.add(source.path)
+    if quote_ref and _source_matches_ref(source, quote_ref):
+        candidates.add(quote_ref)
+    return candidates
+
+
+def _source_matches_ref(source: _QuotedImageSource, ref: str) -> bool:
+    key = image_ref_key(ref)
+    candidates = {image_ref_key(value) for value in source.aliases}
+    if source.path:
+        candidates.add(image_ref_key(source.path))
+    return key in candidates
+
+
+def find_source_prepared_result(
+    source: _QuotedImageSource,
+    prepared: dict,
+    quote_ref: str | None,
+) -> Any:
+    """按来源别名查找唯一准备结果；缺失或歧义时返回内部哨兵。"""
+    candidates = _source_ref_candidates(source, quote_ref)
+    candidate_keys = {image_ref_key(ref) for ref in candidates}
+    results: list[Any] = []
+    for key, value in prepared.items():
+        if key not in candidates and image_ref_key(key) not in candidate_keys:
+            continue
+        if not any(
+            value is existing
+            or (isinstance(value, str) and value == existing)
+            for existing in results
+        ):
+            results.append(value)
+    return results[0] if len(results) == 1 else _NO_PREPARED_RESULT
+
+
+def _source_was_collected_input(
+    source: _QuotedImageSource, state: _RequestImages
+) -> bool:
+    collected = {image_ref_key(ref) for ref in state.collected_refs}
+    return source.collection_failed or any(
+        image_ref_key(ref) in collected
+        for ref in _source_ref_candidates(source, state.quote_ref)
+    )
+
+
+def clear_source_prepared_result(
+    prepared: dict,
+    source: _QuotedImageSource,
+    quote_ref: str | None,
+    recovered_ref: str,
+) -> None:
+    """重新准备前撤销该来源的失败缓存，允许平台修复同路径后重试。"""
+    candidates = _source_ref_candidates(source, quote_ref)
+    candidates.add(recovered_ref)
+    candidate_keys = {image_ref_key(ref) for ref in candidates}
+    old_results = [
+        value
+        for key, value in prepared.items()
+        if key in candidates or image_ref_key(key) in candidate_keys
+    ]
+    for key, value in list(prepared.items()):
+        if (
+            key in candidates
+            or image_ref_key(key) in candidate_keys
+            or any(isinstance(old, dict) and value is old for old in old_results)
+        ):
+            prepared.pop(key, None)
+
+
+def replace_source_prepared_result(
+    prepared: dict,
+    source: _QuotedImageSource,
+    quote_ref: str | None,
+    recovered_result: Any,
+) -> None:
+    """让该来源的旧失败引用及路径别名统一指向恢复后的结果。"""
+    candidates = _source_ref_candidates(source, quote_ref)
+    candidate_keys = {image_ref_key(ref) for ref in candidates}
+    old_results = [
+        value
+        for key, value in prepared.items()
+        if key in candidates or image_ref_key(key) in candidate_keys
+    ]
+    for key, value in list(prepared.items()):
+        if (
+            key in candidates
+            or image_ref_key(key) in candidate_keys
+            or any(isinstance(old, dict) and value is old for old in old_results)
+        ):
+            prepared[key] = recovered_result
+    for ref in candidates:
+        prepared[ref] = recovered_result
 
 
 def quoted_image_sources(event: Any) -> list[_QuotedImageSource]:
@@ -584,7 +919,7 @@ def quoted_image_sources(event: Any) -> list[_QuotedImageSource]:
                     image,
                     reply,
                     index,
-                    {image_ref_key(ref) for ref in refs},
+                    {*refs, *(image_ref_key(ref) for ref in refs)},
                     image_ref_to_local_path(refs[0]) if refs else None,
                 )
             )

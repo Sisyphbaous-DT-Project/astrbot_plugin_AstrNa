@@ -382,11 +382,37 @@ def astr_main_agent(monkeypatch):
     module.DEFAULT_QUOTED_MESSAGE_SETTINGS = object()
     module.Reply = Reply
 
-    core.astr_main_agent = module
+    monkeypatch.setattr(core, "astr_main_agent", module, raising=False)
     monkeypatch.setitem(sys.modules, "astrbot", root)
     monkeypatch.setitem(sys.modules, "astrbot.core", core)
     monkeypatch.setitem(sys.modules, "astrbot.core.astr_main_agent", module)
     return module
+
+
+@pytest.mark.parametrize("parent_has_entry", [False, True])
+def test_quote_fixture_restores_parent_and_module_entries(monkeypatch, parent_has_entry):
+    root = ModuleType("astrbot")
+    core = ModuleType("astrbot.core")
+    original = ModuleType("astrbot.core.astr_main_agent")
+    if parent_has_entry:
+        core.astr_main_agent = original
+    monkeypatch.setitem(sys.modules, "astrbot", root)
+    monkeypatch.setitem(sys.modules, "astrbot.core", core)
+    monkeypatch.setitem(sys.modules, "astrbot.core.astr_main_agent", original)
+
+    patch = pytest.MonkeyPatch()
+    try:
+        fake = astr_main_agent.__wrapped__(patch)
+        assert core.astr_main_agent is fake
+        assert sys.modules["astrbot.core.astr_main_agent"] is fake
+    finally:
+        patch.undo()
+
+    assert sys.modules["astrbot.core.astr_main_agent"] is original
+    if parent_has_entry:
+        assert core.astr_main_agent is original
+    else:
+        assert not hasattr(core, "astr_main_agent")
 
 
 def test_default_config_keeps_reply_target_patch_uninstalled_when_astrbot_missing(

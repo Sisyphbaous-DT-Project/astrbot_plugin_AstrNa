@@ -4,6 +4,7 @@ import contextvars
 import inspect
 import re
 from dataclasses import dataclass
+from functools import wraps
 from typing import Any
 
 from ..utils.patching import (
@@ -17,11 +18,27 @@ from ..utils.patching import (
 
 FIELD_MAX_LENGTH = 512
 QUOTE_IMAGE_CAPTION_PROMPT = "Please describe the image content."
-_QUOTE_PROMPT_CONTEXT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "astrna_quote_image_caption_prompt",
+_MISSING = object()
+
+
+@dataclass(frozen=True)
+class _QuoteCaptionPromptContext:
+    """本轮引用图转述的文字上下文及可选的旧版自定义提示词。"""
+
+    base_prompt: Any
+    user_prompt: Any
+    quoted_text: Any
+    native_prompt: str
+    module: Any
+    generation: object
+
+
+_QUOTE_PROMPT_CONTEXT: contextvars.ContextVar[
+    _QuoteCaptionPromptContext | None
+] = contextvars.ContextVar(
+    "astrna_quote_image_caption_prompt_context",
     default=None,
 )
-_MISSING = object()
 
 
 @dataclass
@@ -45,6 +62,9 @@ class QuoteMessageCall:
     config: Any | None = None
     main_provider_supports_image: bool = False
     skip_quote_image_caption: bool = False
+    image_ref: Any = None
+    image_is_montage: bool = False
+    signature: inspect.Signature | None = None
 
 
 class ImageCaptionModule:
@@ -66,6 +86,7 @@ class ImageCaptionModule:
     def __init__(self, logger: Any):
         self.logger = logger
         self._installed = False
+        self._generation = object()
 
     def install(self) -> bool:
         astr_main_agent = self._load_astr_main_agent()
@@ -86,6 +107,17 @@ class ImageCaptionModule:
             and module_cls._astr_main_agent is not astr_main_agent
         ):
             module_cls.restore_patch()
+        if module_cls._original_ensure_img_caption is not None and (
+            not same_callable(
+                astr_main_agent._ensure_img_caption,
+                module_cls._ensure_img_caption_wrapper,
+            )
+            or not same_callable(
+                astr_main_agent._process_quote_message,
+                module_cls._process_quote_message_wrapper,
+            )
+        ):
+            module_cls.restore_patch()
 
         if module_cls._original_ensure_img_caption is None:
             internal_stage = self._load_internal_stage_module()
@@ -96,13 +128,22 @@ class ImageCaptionModule:
             )
             original_ensure_img_caption = module_cls._original_ensure_img_caption
             original_process_quote_message = module_cls._original_process_quote_message
+            try:
+                original_quote_signature = inspect.signature(
+                    original_process_quote_message
+                )
+            except (TypeError, ValueError):
+                original_quote_signature = None
 
+            @wraps(original_ensure_img_caption)
             async def astrna_ensure_img_caption(
                 event: Any,
                 req: Any,
                 cfg: dict,
                 plugin_context: Any,
                 image_caption_provider: str,
+                *extra_args: Any,
+                **extra_kwargs: Any,
             ) -> Any:
                 active_module = module_cls._active_module
                 if not is_wrapper_active(astrna_ensure_img_caption):
@@ -114,26 +155,43 @@ class ImageCaptionModule:
                         cfg,
                         plugin_context,
                         image_caption_provider,
+                        *extra_args,
+                        **extra_kwargs,
                     )
 
+                generation = active_module._generation
                 optimized_cfg = await active_module.build_image_caption_config(
                     event,
                     req,
                     cfg,
                 )
+                if (
+                    not is_wrapper_active(astrna_ensure_img_caption)
+                    or not active_module._installed
+                    or module_cls._active_module is not active_module
+                    or active_module._generation is not generation
+                ):
+                    optimized_cfg = cfg
                 return await original_ensure_img_caption(
                     event,
                     req,
                     optimized_cfg,
                     plugin_context,
                     image_caption_provider,
+                    *extra_args,
+                    **extra_kwargs,
                 )
 
+            @wraps(original_process_quote_message)
             async def astrna_process_quote_message(*args: Any, **kwargs: Any) -> Any:
                 active_module = module_cls._active_module
                 if not is_wrapper_active(astrna_process_quote_message):
                     active_module = None
-                call = parse_quote_message_call(args, kwargs)
+                call = parse_quote_message_call(
+                    args,
+                    kwargs,
+                    signature=original_quote_signature,
+                )
                 if active_module is None or call is None:
                     return await original_process_quote_message(*args, **kwargs)
 
@@ -187,6 +245,9 @@ class ImageCaptionModule:
 
     @classmethod
     def restore_patch(cls) -> None:
+        if cls._active_module is not None:
+            cls._active_module._generation = object()
+            cls._active_module._installed = False
         mark_wrapper_inactive(cls._ensure_img_caption_wrapper)
         mark_wrapper_inactive(cls._process_quote_message_wrapper)
         if cls._astr_main_agent is not None:
@@ -270,25 +331,54 @@ class ImageCaptionModule:
                 call,
             )
 
+        generation = self._generation
         quoted_text = await self.collect_quoted_text(
             call.event,
             quoted_message_settings=call.quoted_message_settings,
             config=call.config,
         )
+        # 收集引用文字可能等待平台接口；等待结束后确认包装仍属于当前模块。
+        if (
+            type(self)._active_module is not self
+            or not self._installed
+            or self._generation is not generation
+        ):
+            return await call_original_quote_message(
+                original_process_quote_message,
+                call,
+            )
         base_prompt = get_quote_caption_base_prompt(call.config)
         optimized_prompt = build_image_caption_prompt(
             base_prompt,
             user_prompt=getattr(call.req, "prompt", None),
             quoted_text=quoted_text,
         )
-        if optimized_prompt == QUOTE_IMAGE_CAPTION_PROMPT:
+        if (
+            optimized_prompt == base_prompt
+            and base_prompt == QUOTE_IMAGE_CAPTION_PROMPT
+        ):
             return await call_original_quote_message(
                 original_process_quote_message,
                 call,
             )
 
         prompt_context = _ImageCaptionContextProxy(call.plugin_context, self)
-        token = _QUOTE_PROMPT_CONTEXT.set(optimized_prompt)
+        native_prompt = QUOTE_IMAGE_CAPTION_PROMPT
+        animation_notice = getattr(
+            type(self)._astr_main_agent, "ANIMATION_CAPTION_NOTICE", None
+        )
+        if call.image_is_montage and isinstance(animation_notice, str):
+            native_prompt += animation_notice.format(indices="1")
+        token = _QUOTE_PROMPT_CONTEXT.set(
+            _QuoteCaptionPromptContext(
+                base_prompt=base_prompt,
+                user_prompt=getattr(call.req, "prompt", None),
+                quoted_text=quoted_text,
+                native_prompt=native_prompt,
+                module=self,
+                generation=generation,
+            )
+        )
         try:
             return await call_original_quote_message(
                 original_process_quote_message,
@@ -345,7 +435,7 @@ class ImageCaptionModule:
             message_text = getattr(quote, "message_str", "") or ""
         return message_text
 
-    def patch_quote_provider(self, provider: Any) -> None:
+    def patch_quote_provider(self, provider: Any) -> ProviderPatch | None:
         if provider is None:
             return
 
@@ -354,7 +444,7 @@ class ImageCaptionModule:
         patch = module_cls._provider_patches.get(provider_id)
         if patch is not None:
             patch.ref_count += 1
-            return
+            return patch
 
         original_text_chat = getattr(provider, "text_chat", None)
         if not callable(original_text_chat):
@@ -363,9 +453,16 @@ class ImageCaptionModule:
 
         async def astrna_quote_text_chat(*args: Any, **kwargs: Any) -> Any:
             if is_wrapper_active(astrna_quote_text_chat):
-                prompt = _QUOTE_PROMPT_CONTEXT.get()
-                if prompt:
-                    args, kwargs = replace_quote_caption_prompt(args, kwargs, prompt)
+                prompt_context = _QUOTE_PROMPT_CONTEXT.get()
+                if (
+                    prompt_context is not None
+                    and module_cls._active_module is prompt_context.module
+                    and prompt_context.module._installed
+                    and prompt_context.module._generation is prompt_context.generation
+                ):
+                    args, kwargs = replace_quote_caption_prompt(
+                        args, kwargs, prompt_context
+                    )
             result = original_text_chat(*args, **kwargs)
             if inspect.isawaitable(result):
                 return await result
@@ -380,9 +477,16 @@ class ImageCaptionModule:
             had_instance_text_chat=had_instance_text_chat,
             ref_count=1,
         )
+        return module_cls._provider_patches[provider_id]
 
-    def unpatch_quote_provider(self, provider: Any) -> None:
+    def unpatch_quote_provider(
+        self, provider: Any, *, expected_patch: ProviderPatch | None = None
+    ) -> None:
         if provider is None:
+            return
+        if expected_patch is not None and (
+            type(self)._provider_patches.get(id(provider)) is not expected_patch
+        ):
             return
         type(self)._restore_provider_patch(id(provider))
 
@@ -434,7 +538,8 @@ class _ImageCaptionContextProxy:
     def __init__(self, plugin_context: Any, module: ImageCaptionModule):
         self._plugin_context = plugin_context
         self._module = module
-        self._patched_providers: list[Any] = []
+        self._generation = module._generation
+        self._patched_providers: list[tuple[Any, ProviderPatch]] = []
 
     def get_provider_by_id(self, *args: Any, **kwargs: Any) -> Any:
         provider = self._plugin_context.get_provider_by_id(*args, **kwargs)
@@ -446,16 +551,27 @@ class _ImageCaptionContextProxy:
         self._patch(provider)
         return provider
 
+    async def get_using_provider_async(self, *args: Any, **kwargs: Any) -> Any:
+        provider = await self._plugin_context.get_using_provider_async(*args, **kwargs)
+        self._patch(provider)
+        return provider
+
     def restore(self) -> None:
-        for provider in reversed(self._patched_providers):
-            self._module.unpatch_quote_provider(provider)
+        for provider, patch in reversed(self._patched_providers):
+            self._module.unpatch_quote_provider(provider, expected_patch=patch)
         self._patched_providers.clear()
 
     def _patch(self, provider: Any) -> None:
-        if provider is None:
+        if (
+            provider is None
+            or not self._module._installed
+            or type(self._module)._active_module is not self._module
+            or self._module._generation is not self._generation
+        ):
             return
-        self._module.patch_quote_provider(provider)
-        self._patched_providers.append(provider)
+        patch = self._module.patch_quote_provider(provider)
+        if patch is not None:
+            self._patched_providers.append((provider, patch))
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._plugin_context, name)
@@ -502,60 +618,82 @@ def sanitize_caption_context_text(value: Any) -> str:
 def replace_quote_caption_prompt(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
-    optimized_prompt: str,
+    prompt_context: _QuoteCaptionPromptContext,
 ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """在确认是原生引用转述调用后，向实际提示词追加本轮上下文。"""
     kwargs = dict(kwargs)
-    if "prompt" in kwargs:
-        if kwargs["prompt"] == QUOTE_IMAGE_CAPTION_PROMPT:
-            kwargs["prompt"] = optimized_prompt
-        return args, kwargs
+    prompt = kwargs.get("prompt")
+    prompt_in_kwargs = "prompt" in kwargs
+    if not prompt_in_kwargs and args:
+        prompt = args[0]
 
-    if args and args[0] == QUOTE_IMAGE_CAPTION_PROMPT:
+    if prompt != prompt_context.native_prompt:
+        return args, kwargs
+    native_base = QUOTE_IMAGE_CAPTION_PROMPT
+    animation_notice = prompt_context.native_prompt[len(native_base) :]
+    base_prompt = prompt_context.base_prompt
+    if not isinstance(base_prompt, str) or not base_prompt.strip():
+        base_prompt = native_base
+    optimized_prompt = build_image_caption_prompt(
+        base_prompt + animation_notice,
+        user_prompt=prompt_context.user_prompt,
+        quoted_text=prompt_context.quoted_text,
+    )
+
+    if prompt_in_kwargs:
+        kwargs["prompt"] = optimized_prompt
+        return args, kwargs
+    if args:
         mutable_args = list(args)
         mutable_args[0] = optimized_prompt
         return tuple(mutable_args), kwargs
-
     return args, kwargs
 
 
-QUOTE_MESSAGE_PARAM_NAMES = (
+QUOTE_MESSAGE_REQUIRED_PARAMS = (
     "event",
     "req",
     "img_cap_prov_id",
     "plugin_context",
-    "quoted_message_settings",
-    "config",
-    "main_provider_supports_image",
-    "skip_quote_image_caption",
 )
-QUOTE_MESSAGE_REQUIRED_PARAMS = QUOTE_MESSAGE_PARAM_NAMES[:4]
-
-# 上游新增但本模块不消费的参数：解析时容忍，透传时随原始 args/kwargs 保留。
-# AstrBot 4.28.1 起 _process_quote_message 删除 config 参数并新增 image_ref。
-_QUOTE_MESSAGE_PASSTHROUGH_PARAMS = frozenset({"image_ref"})
+_QUOTE_MESSAGE_KNOWN_PARAMS = frozenset(
+    {
+        *QUOTE_MESSAGE_REQUIRED_PARAMS,
+        "quoted_message_settings",
+        "config",
+        "main_provider_supports_image",
+        "skip_quote_image_caption",
+        "image_ref",
+        "image_is_montage",
+    }
+)
 
 
 def parse_quote_message_call(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
+    *,
+    signature: inspect.Signature | None,
 ) -> QuoteMessageCall | None:
-    if len(args) > len(QUOTE_MESSAGE_PARAM_NAMES):
+    """按安装时捕获的真实函数签名解析调用，避免混用新旧参数位置。"""
+    if signature is None:
         return None
 
-    unknown_kwargs = (
-        set(kwargs) - set(QUOTE_MESSAGE_PARAM_NAMES) - _QUOTE_MESSAGE_PASSTHROUGH_PARAMS
-    )
-    if unknown_kwargs:
-        return None
-
-    values: dict[str, Any] = {}
-    for index, value in enumerate(args):
-        name = QUOTE_MESSAGE_PARAM_NAMES[index]
-        if name in kwargs:
+    parameters = tuple(signature.parameters.values())
+    for parameter in parameters:
+        if parameter.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
             return None
-        values[name] = value
+        if parameter.name not in _QUOTE_MESSAGE_KNOWN_PARAMS:
+            return None
 
-    values.update(kwargs)
+    try:
+        bound = signature.bind(*args, **kwargs)
+    except TypeError:
+        return None
+    values = bound.arguments
     if any(name not in values for name in QUOTE_MESSAGE_REQUIRED_PARAMS):
         return None
 
@@ -574,6 +712,9 @@ def parse_quote_message_call(
         skip_quote_image_caption=bool(
             values.get("skip_quote_image_caption", False)
         ),
+        image_ref=values.get("image_ref"),
+        image_is_montage=bool(values.get("image_is_montage", False)),
+        signature=signature,
     )
 
 
@@ -587,6 +728,10 @@ async def call_original_quote_message(
     kwargs = dict(call.kwargs)
 
     if plugin_context is not _MISSING:
+        if call.signature is not None:
+            bound = call.signature.bind(*args, **kwargs)
+            bound.arguments["plugin_context"] = plugin_context
+            return await original(*bound.args, **bound.kwargs)
         if len(args) >= 4:
             args[3] = plugin_context
         else:

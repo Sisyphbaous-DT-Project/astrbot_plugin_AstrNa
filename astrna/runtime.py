@@ -19,6 +19,7 @@ from .modules.group_identity_tools import GroupIdentityToolsModule
 from .modules.group_chat_context_optimizer import GroupChatContextOptimizerModule
 from .modules.dashboard_settings import SETTING_KEYS as _DASHBOARD_SETTING_KEY_TUPLE
 from .modules.group_sender_concurrency import GroupSenderConcurrencyModule
+from .modules.gemini_request_headers import GeminiRequestHeadersModule
 from .modules.group_wake_suppression import GroupWakeSuppressionModule
 from .modules.identity_metadata import IdentityMetadataModule
 from .modules.issue_assistant import IssueAssistantModule
@@ -180,6 +181,7 @@ class AstrNaRuntime:
             allowlist=self.config.get("parallel_tool_use_allowlist", []),
         )
         self.group_sender_concurrency = GroupSenderConcurrencyModule(logger=logger)
+        self.gemini_request_headers = GeminiRequestHeadersModule(logger=logger)
         self.provider_session_headers = ProviderSessionHeadersModule(
             logger=logger,
             plugin_version=plugin_version,
@@ -265,6 +267,7 @@ class AstrNaRuntime:
             self.long_reply_context.install()
         if self.config.get("unlock_group_sender_concurrency", False):
             self.group_sender_concurrency.install()
+        self._sync_gemini_request_headers()
         self._configure_group_chat_context_optimizer()
         self._configure_waking_check_chain()
         self._configure_auto_cache_cleanup()
@@ -289,6 +292,14 @@ class AstrNaRuntime:
             self._configure_quoted_image_input()
         elif key == "optimize_image_caption":
             self._configure_image_caption()
+        elif key == "unlock_group_sender_concurrency":
+            if self._closed:
+                return
+            if value:
+                self.group_sender_concurrency.install()
+            else:
+                self.group_sender_concurrency.terminate()
+            self._sync_gemini_request_headers()
         elif key == "optimize_group_chat_context":
             self._configure_group_chat_context_optimizer()
 
@@ -307,6 +318,18 @@ class AstrNaRuntime:
             self.quoted_image_input.install()
         else:
             self.quoted_image_input.terminate()
+
+    def _sync_gemini_request_headers(self) -> None:
+        """让 Gemini 请求级 CID 适配跟随群并发的真实安装结果。"""
+        enabled = (
+            not self._closed
+            and self.config.get("unlock_group_sender_concurrency", False)
+            and bool(getattr(self.group_sender_concurrency, "_installed", False))
+        )
+        if enabled:
+            self.gemini_request_headers.install()
+        else:
+            self.gemini_request_headers.terminate()
 
     def update_dashboard_setting(self, key: str, value: Any) -> None:
         """同步功能控制台修改的单个子配置，并按组热同步相关模块。
@@ -549,6 +572,7 @@ class AstrNaRuntime:
             self.group_sender_concurrency.install()
         else:
             self.group_sender_concurrency.terminate()
+        self._sync_gemini_request_headers()
 
         if self.config.get("provide_group_identity_tools", False):
             self.group_identity_tools.install()
@@ -739,6 +763,7 @@ class AstrNaRuntime:
             self.long_reply_context.install()
         if group_concurrency_enabled:
             self.group_sender_concurrency.install()
+        self._sync_gemini_request_headers()
 
     def _configure_auto_cache_cleanup(self) -> None:
         enabled = self.config.get("auto_cleanup_astrbot_cache", False)
@@ -890,8 +915,9 @@ class AstrNaRuntime:
         self.quoted_image_input.terminate()
         # 群聊优化必须在首个 await 前停用，避免卸载期间继续收集新增消息。
         self.group_chat_context_optimizer.terminate()
-        await self.issue_assistant.terminate()
+        self.gemini_request_headers.terminate()
         self.group_sender_concurrency.terminate()
+        await self.issue_assistant.terminate()
         self.long_reply_context.terminate()
         self.forward_nodes.terminate()
         self.dynamic_system_prompt.terminate()

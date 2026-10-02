@@ -1267,3 +1267,177 @@ def test_fallback_failure_warns_when_dead_path_was_confirmed(monkeypatch):
     assert req.image_urls == []
     assert req.extra_user_content_parts == []
     assert any("本地临时路径已失效" in warning[0] for warning in logger.warnings)
+
+
+@pytest.fixture
+def new_image_entries(monkeypatch):
+    from astrna.modules import quoted_image_input as images
+
+    def install(prepare):
+        async def collect(event, req):
+            return req, None
+
+        host = SimpleNamespace(
+            collect_initial_request=collect, prepare_request_images=prepare
+        )
+        monkeypatch.setattr(images, "_load_astr_main_agent", lambda: host)
+        monkeypatch.setattr(images, "_load_internal_stage_module", lambda: None)
+        module = QuotedImageInputModule(DummyLogger())
+        assert module.install()
+        return host, module
+
+    return install
+
+
+@pytest.mark.parametrize("status", ["oversized", "captioned"])
+def test_new_prepared_limit_or_caption_does_not_trigger_recovery(new_image_entries, status):
+    async def prepare(req, event, **kwargs):
+        for ref in req.image_urls:
+            kwargs["prepared"][ref] = {"path": None, "status": status}
+        req.image_urls = []
+
+    host, module = new_image_entries(prepare)
+    event = DummyEvent(
+        [Reply("a", chain=[Image(file="/tmp/limited.jpg")])],
+        bot=DirectCallActionBot(),
+    )
+    req = DummyRequest(image_urls=["/tmp/limited.jpg"])
+
+    async def scenario():
+        await host.collect_initial_request(event, req)
+        await host.prepare_request_images(req, event, prepared={}, finalize=False)
+
+    run(scenario())
+    assert event.bot.calls == []
+    assert req.image_urls == []
+
+
+@pytest.mark.parametrize("interruption", ["stop", "unload", "cancel"])
+def test_new_reprepare_wait_cannot_commit_after_interruption(new_image_entries, interruption):
+    async def scenario():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        call_count = 0
+
+        async def prepare(req, event, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                entered.set()
+                await release.wait()
+            for ref in req.image_urls:
+                kwargs["prepared"].setdefault(
+                    ref,
+                    {
+                        "path": ref if ref.startswith("https://") else None,
+                        "status": None if ref.startswith("https://") else "unavailable",
+                        "notices": [],
+                    },
+                )
+            req.image_urls = [
+                kwargs["prepared"][ref]["path"]
+                for ref in req.image_urls
+                if kwargs["prepared"][ref]["path"]
+            ]
+
+        host, module = new_image_entries(prepare)
+        event = DummyEvent(
+            [Reply("a", chain=[Image(file="/tmp/dead-copy.jpg")])],
+            bot=DirectCallActionBot(),
+        )
+        req = DummyRequest(image_urls=["/tmp/dead-copy.jpg"])
+        await host.collect_initial_request(event, req)
+        prepared = {}
+        pending = asyncio.create_task(
+            host.prepare_request_images(req, event, prepared=prepared, finalize=False)
+        )
+        await asyncio.wait_for(entered.wait(), 2)
+        assert req.image_urls == []
+        assert list(prepared) == ["/tmp/dead-copy.jpg"]
+        if interruption == "unload":
+            module.terminate()
+        elif interruption == "stop":
+            event.agent_stop_requested = True
+        else:
+            pending.cancel()
+        release.set()
+        if interruption == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+        else:
+            await pending
+        assert req.image_urls == []
+        assert list(prepared) == ["/tmp/dead-copy.jpg"]
+        assert prepared["/tmp/dead-copy.jpg"]["path"] is None
+
+    run(scenario())
+
+
+def test_old_none_cache_mapping_does_not_replace_other_failed_images():
+    from astrna.modules import quoted_image_input as images
+
+    event = DummyEvent(
+        [Reply("a", chain=[Image(file="/tmp/first.jpg"), Image(file="/tmp/second.jpg")])]
+    )
+    first, second = images.quoted_image_sources(event)
+    prepared = {"/tmp/first.jpg": None, "/tmp/second.jpg": None}
+    images.clear_source_prepared_result(prepared, first, None, "/tmp/recovered.jpg")
+    assert prepared == {"/tmp/second.jpg": None}
+    images.replace_source_prepared_result(prepared, first, None, "/tmp/recovered.jpg")
+    assert prepared["/tmp/first.jpg"] == "/tmp/recovered.jpg"
+    assert prepared[second.path] is None
+
+
+@pytest.mark.parametrize(
+    "request_kind", ["native", "adopted", "explicit_positional", "explicit_keyword"]
+)
+def test_collection_ownership_captured_before_native_request_publication(
+    monkeypatch, request_kind
+):
+    from astrna.modules import quoted_image_input as images
+
+    async def collect(event, plugin_context, config, req=None):
+        req = req or event.get_extra("provider_request") or DummyRequest(image_urls=[])
+        event.extra["provider_request"] = req
+        return req, "/tmp/discovered-quote.jpg"
+
+    async def prepare(req, event, **kwargs):
+        return None
+
+    host = SimpleNamespace(
+        collect_initial_request=collect, prepare_request_images=prepare
+    )
+    monkeypatch.setattr(images, "_load_astr_main_agent", lambda: host)
+    monkeypatch.setattr(images, "_load_internal_stage_module", lambda: None)
+    module = QuotedImageInputModule(DummyLogger())
+    assert module.install()
+    event = DummyEvent([Reply("a")])
+    event.extra = {}
+    event.get_extra = lambda key, default=None: event.extra.get(key, default)
+    supplied = DummyRequest(image_urls=[])
+    if request_kind == "adopted":
+        event.extra["provider_request"] = supplied
+
+    async def scenario():
+        if request_kind == "explicit_positional":
+            req, _ = await host.collect_initial_request(event, None, None, supplied)
+        elif request_kind == "explicit_keyword":
+            req, _ = await host.collect_initial_request(event, None, None, req=supplied)
+        else:
+            req, _ = await host.collect_initial_request(event, None, None)
+        state = images.request_image_state(req, event)
+        assert state.native_quote_handling is (request_kind == "native")
+        assert not state.prepared
+        # collector 发现的引用不等于实际交给准备入口的引用。
+        await host.prepare_request_images(req, event, prepared={}, finalize=False)
+        assert state.prepared
+        assert state.native_quote_handling is (request_kind == "native")
+        # 真正用于专用转述时，第三方请求同样交由原生处理，不后置重新注图。
+        state.prepared = False
+        await host.prepare_request_images(
+            req, event, prepared={}, finalize=False,
+            quote_image_ref="/tmp/discovered-quote.jpg",
+        )
+        assert state.native_quote_handling
+
+    run(scenario())

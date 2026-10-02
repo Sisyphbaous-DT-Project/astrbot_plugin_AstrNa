@@ -45,11 +45,18 @@ from astrbot.core.pipeline.process_stage.method.agent_sub_stages import (
 )
 
 try:
-    from astrbot.core.pipeline.process_stage.method.agent_sub_stages import image_input
+    from astrbot.core.utils import image_input
 except ImportError:
+    try:
+        from astrbot.core.pipeline.process_stage.method.agent_sub_stages import (
+            image_input,
+        )
+    except ImportError:
+        pytest.skip("该流程用例需要 AstrBot 图片准备入口", allow_module_level=True)
+if not callable(getattr(main, "prepare_request_images", None)) and not callable(
+    getattr(internal, "prepare_request_images", None)
+):
     pytest.skip("该流程用例需要 AstrBot 图片准备入口", allow_module_level=True)
-if not callable(getattr(internal, "prepare_request_images", None)):
-    pytest.skip("该流程用例需要 internal 图片准备入口", allow_module_level=True)
 from astrbot.core.pipeline.process_stage.stage import ProcessStage
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
@@ -57,7 +64,7 @@ from astrbot.core.platform.message_type import MessageType
 from astrbot.core.platform.platform_metadata import PlatformMetadata
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 from astrbot.core.provider.provider import Provider
-from astrbot.core.utils import media_utils as media
+from astrbot.core.utils import io as media_io, media_utils as media
 
 from astrna.modules.image_caption import ImageCaptionModule
 from astrna.modules.quoted_image_input import QuotedImageInputModule
@@ -70,8 +77,11 @@ from astrbot.core.star.star_handler import EventType
 # 绑定源码环境下其他测试可能在真实 astr_main_agent 上留下未卸载的包装，
 # 本文件的真实流程断言需要见到原始 from-import 绑定状态。
 _ORIGINAL_MAIN_QUOTE = main._process_quote_message
-_ORIGINAL_INTERNAL_QUOTE = internal._process_quote_message
-_ORIGINAL_INTERNAL_PREPARE = internal.prepare_request_images
+_ORIGINAL_INTERNAL_QUOTE = getattr(internal, "_process_quote_message", None)
+_ORIGINAL_MAIN_PREPARE = getattr(main, "prepare_request_images", None)
+_ORIGINAL_MAIN_COLLECT = getattr(main, "collect_initial_request", None)
+_ORIGINAL_INTERNAL_PREPARE = getattr(internal, "prepare_request_images", None)
+_ORIGINAL_INTERNAL_COLLECT = getattr(internal, "collect_initial_request", None)
 
 
 class DummyLogger:
@@ -132,8 +142,9 @@ class FakeOneBot:
 @pytest.fixture
 def harness(tmp_path, monkeypatch):
     work = tmp_path / "work"
-    for module in (media, internal, preprocess):
-        monkeypatch.setattr(module, "get_astrbot_temp_path", lambda: str(work))
+    for module in (media, media_io, image_input, internal, preprocess):
+        if hasattr(module, "get_astrbot_temp_path"):
+            monkeypatch.setattr(module, "get_astrbot_temp_path", lambda: str(work))
     config = copy.deepcopy(DEFAULT_CONFIG)
     config["provider_settings"].update(
         {
@@ -241,7 +252,11 @@ def harness(tmp_path, monkeypatch):
     )
 
 
-async def process_event(harness, event):
+async def process_event(harness, event, *, preprocess_event=True):
+    if preprocess_event:
+        preprocess_stage = preprocess.PreProcessStage()
+        await preprocess_stage.initialize(harness.ctx)
+        await preprocess_stage.process(event)
     stage = ProcessStage()
     await stage.initialize(harness.ctx)
     async for _ in stage.process(event):
@@ -259,31 +274,54 @@ def restore_astrna_patches():
     ReplyTargetHistoryModule.restore_patch()
     QuotedImageInputModule.restore_patch()
     main._process_quote_message = _ORIGINAL_MAIN_QUOTE
-    internal._process_quote_message = _ORIGINAL_INTERNAL_QUOTE
-    internal.prepare_request_images = _ORIGINAL_INTERNAL_PREPARE
+    if _ORIGINAL_INTERNAL_QUOTE is not None:
+        internal._process_quote_message = _ORIGINAL_INTERNAL_QUOTE
+    if _ORIGINAL_MAIN_PREPARE is not None:
+        main.prepare_request_images = _ORIGINAL_MAIN_PREPARE
+    if _ORIGINAL_MAIN_COLLECT is not None:
+        main.collect_initial_request = _ORIGINAL_MAIN_COLLECT
+    if _ORIGINAL_INTERNAL_PREPARE is not None:
+        internal.prepare_request_images = _ORIGINAL_INTERNAL_PREPARE
+    if _ORIGINAL_INTERNAL_COLLECT is not None:
+        internal.collect_initial_request = _ORIGINAL_INTERNAL_COLLECT
     yield
     ImageCaptionModule.restore_patch()
     ReplyTargetHistoryModule.restore_patch()
     QuotedImageInputModule.restore_patch()
     main._process_quote_message = _ORIGINAL_MAIN_QUOTE
-    internal._process_quote_message = _ORIGINAL_INTERNAL_QUOTE
-    internal.prepare_request_images = _ORIGINAL_INTERNAL_PREPARE
+    if _ORIGINAL_INTERNAL_QUOTE is not None:
+        internal._process_quote_message = _ORIGINAL_INTERNAL_QUOTE
+    if _ORIGINAL_MAIN_PREPARE is not None:
+        main.prepare_request_images = _ORIGINAL_MAIN_PREPARE
+    if _ORIGINAL_MAIN_COLLECT is not None:
+        main.collect_initial_request = _ORIGINAL_MAIN_COLLECT
+    if _ORIGINAL_INTERNAL_PREPARE is not None:
+        internal.prepare_request_images = _ORIGINAL_INTERNAL_PREPARE
+    if _ORIGINAL_INTERNAL_COLLECT is not None:
+        internal.collect_initial_request = _ORIGINAL_INTERNAL_COLLECT
 
 
-def test_internal_stage_imports_are_bound_early():
-    """确证 4.28.1 的 from-import 绑定前提：internal 持有独立函数引用。"""
-    assert internal._process_quote_message is main._process_quote_message
-    assert internal.prepare_request_images is image_input.prepare_request_images
+def test_host_image_entrypoints_match_expected_layout():
+    """按当前宿主确认 main/internal 实际持有并被 AstrNa 覆盖的入口。"""
+    if hasattr(internal, "_process_quote_message"):
+        assert internal._process_quote_message is main._process_quote_message
+    assert Path(main.__file__).resolve().is_relative_to(Path(ASTRBOT_SOURCE).resolve())
+    if hasattr(main, "prepare_request_images"):
+        assert main.prepare_request_images is image_input.prepare_request_images
+    if hasattr(internal, "prepare_request_images"):
+        assert internal.prepare_request_images is image_input.prepare_request_images
 
 
-def test_quote_caption_uses_optimized_prompt_via_internal_reference(harness, tmp_path):
-    """P2-1：第三方自建请求（无 conversation）的引用图转述经 internal 入口收到优化提示词。"""
+def test_quote_caption_uses_optimized_prompt_via_host_reference(harness, tmp_path):
+    """无 conversation 的显式请求经当前宿主真实入口收到优化提示词。"""
     source = source_image(tmp_path)
     harness.config["provider_settings"]["default_image_caption_provider_id"] = "caption"
 
     module = ImageCaptionModule(logger=DummyLogger())
     assert module.install() is True
-    assert internal._process_quote_message is main._process_quote_message
+    if hasattr(internal, "_process_quote_message"):
+        assert internal._process_quote_message is main._process_quote_message
+    assert main._process_quote_message is not _ORIGINAL_MAIN_QUOTE
 
     event = make_event(
         [
@@ -319,6 +357,243 @@ def test_quote_caption_uses_optimized_prompt_via_internal_reference(harness, tmp
 
     assert harness.caption_calls, "卸载后转述仍应发生"
     assert harness.caption_calls[0]["prompt"] == "Please describe the image content."
+
+
+def test_direct_image_and_failed_quote_are_recovered_before_caption(
+    harness, tmp_path, runtime
+):
+    """正常直接图与失效引用图混合时，两者都在转述前完成准备。"""
+    direct = source_image(tmp_path, name="direct")
+    broken = tmp_path / "broken-quote.jpg"
+    broken.write_bytes(b"broken")
+    fallback = source_image(tmp_path, name="fallback")
+    harness.config["provider_settings"]["default_image_caption_provider_id"] = "caption"
+    event = make_event(
+        [
+            Image(file=str(direct)),
+            Reply(
+                id="quote",
+                chain=[Plain(text="quoted-text"), Image(file=str(broken))],
+            ),
+        ],
+        text="current-question",
+    )
+    event.bot = FakeOneBot(str(fallback))
+
+    asyncio.run(process_event(harness, event))
+
+    assert len(event.bot.calls) == 1
+    assert len(harness.caption_calls) == 1
+    caption_call = harness.caption_calls[0]
+    assert len(caption_call["image_urls"]) == 2
+    assert "current-question" in caption_call["prompt"]
+    assert harness.captured_runners[-1].req.image_urls == []
+
+
+@pytest.mark.parametrize("fmt", ["JPEG", "GIF"])
+def test_preprocessed_quote_url_downloaded_and_supplied_once(
+    harness, tmp_path, runtime, image_server, fmt
+):
+    base, bodies = image_server
+    path = tmp_path / f"source.{fmt.lower()}"
+    options = (
+        {
+            "save_all": True,
+            "append_images": [PILImage.new("RGB", (60, 30), "blue")],
+            "duration": 100,
+            "loop": 0,
+        }
+        if fmt == "GIF"
+        else {}
+    )
+    PILImage.new("RGB", (60, 30), "red").save(path, fmt, **options)
+    bodies["/quote"] = path.read_bytes()
+    harness.provider.provider_config["modalities"].append("image")
+    event = make_event(
+        [Reply(id="quote", chain=[Image(file=f"{base}/quote", url=f"{base}/quote")])]
+    )
+    event.bot = FakeOneBot(str(path))
+
+    asyncio.run(process_event(harness, event))
+
+    assert bodies.requests == ["/quote"]
+    assert event.bot.calls == []
+    assert len(harness.captured_runners[-1].req.image_urls) == 1
+    assert harness.caption_calls == []
+
+
+def test_multiple_failed_quotes_restore_distinct_images(harness, tmp_path, runtime):
+    failures = [tmp_path / f"broken-{index}.jpg" for index in range(2)]
+    replacements = []
+    for index, color in enumerate(("red", "blue")):
+        failures[index].write_bytes(b"broken")
+        replacement = tmp_path / f"replacement-{index}.jpg"
+        PILImage.new("RGB", (60, 30), color).save(replacement)
+        replacements.append(replacement)
+
+    class FullMessageBot(FakeOneBot):
+        async def call_action(self, action, **params):
+            self.calls.append((action, params))
+            return {
+                "message": [
+                    {"type": "image", "data": {"url": str(path)}}
+                    for path in replacements
+                ]
+            }
+
+    event = make_event(
+        [Reply(id="quote", chain=[Image(file=str(path)) for path in failures])]
+    )
+    event.bot = FullMessageBot("")
+    asyncio.run(process_event(harness, event))
+
+    assert len(event.bot.calls) == 1
+    assert len(harness.caption_calls) == 1
+    refs = harness.caption_calls[0]["image_urls"]
+    assert len(refs) == 2
+    channels = []
+    for ref in refs:
+        with PILImage.open(ref) as image:
+            pixel = image.convert("RGB").getpixel((0, 0))
+            channels.append(max(range(3), key=pixel.__getitem__))
+    assert channels == [0, 2]
+
+
+def test_explicit_request_failed_quote_maps_recovered_path(
+    harness, tmp_path, runtime
+):
+    """无 conversation 的独立引用转述读取恢复后的 path 和 montage。"""
+    broken = tmp_path / "broken.jpg"
+    broken.write_bytes(b"broken")
+    fallback = tmp_path / "fallback.gif"
+    PILImage.new("RGB", (500, 200), "blue").save(
+        fallback,
+        "GIF",
+        save_all=True,
+        append_images=[PILImage.new("RGB", (500, 200), "red")],
+        duration=100,
+        loop=0,
+    )
+    harness.config["provider_settings"]["default_image_caption_provider_id"] = "caption"
+    event = make_event(
+        [Reply(id="quote", chain=[Plain(text="quoted-text"), Image(file=str(broken))])]
+    )
+    event.bot = FakeOneBot(str(fallback))
+    event.set_extra("provider_request", ProviderRequest(prompt="current-question"))
+
+    asyncio.run(process_event(harness, event))
+
+    assert len(event.bot.calls) == 1
+    assert len(harness.caption_calls) == 1
+    caption_call = harness.caption_calls[0]
+    assert len(caption_call["image_urls"]) == 1
+    with PILImage.open(caption_call["image_urls"][0]) as image:
+        assert image.format == "JPEG"
+    if hasattr(main, "ANIMATION_CAPTION_NOTICE"):
+        assert "Input images at positions 1" in caption_call["prompt"]
+    assert "current-question" in caption_call["prompt"]
+    assert "quoted-text" in caption_call["prompt"]
+    assert harness.captured_runners[-1].req.image_urls == []
+
+
+@pytest.mark.parametrize("initial_images", ["empty", "unrelated", "same"])
+@pytest.mark.parametrize("embedded", [False, True])
+@pytest.mark.parametrize("conversation", [False, True])
+def test_explicit_visual_request_receives_quote_image(
+    harness, tmp_path, runtime, initial_images, embedded, conversation
+):
+    """自建请求只准备过其他附件时，仍补入尚未交给视觉模型的引用图。"""
+    quoted = source_image(tmp_path, "quoted")
+    unrelated = source_image(tmp_path, "unrelated")
+    harness.provider.provider_config["modalities"].append("image")
+    chain = [Plain(text="quoted-text")]
+    if embedded:
+        chain.append(Image(file=str(quoted)))
+    event = make_event([Reply(id="quote", chain=chain)])
+    event.bot = FakeOneBot(str(quoted))
+    req = ProviderRequest(prompt="describe-the-quote")
+    if initial_images == "unrelated":
+        req.image_urls = [str(unrelated)]
+    elif initial_images == "same":
+        req.image_urls = [str(quoted)]
+    if conversation:
+        req.conversation = (
+            harness.context.conversation_manager.get_conversation.return_value
+        )
+    event.set_extra("provider_request", req)
+
+    asyncio.run(process_event(harness, event))
+
+    expected_count = 2 if initial_images == "unrelated" else 1
+    assert len(harness.captured_runners[-1].req.image_urls) == expected_count
+    payload = harness.provider.text_chat.await_args.kwargs
+    actual_images = [
+        part
+        for message in payload["contexts"]
+        for part in (
+            message["content"] if isinstance(message.get("content"), list) else []
+        )
+        if isinstance(part, dict) and part.get("type") == "image_url"
+    ]
+    assert len(actual_images) == expected_count
+    assert not harness.caption_calls
+
+
+@pytest.mark.parametrize("caption_failed", [False, True])
+def test_explicit_native_quote_caption_does_not_reinject_image(
+    harness, tmp_path, runtime, caption_failed
+):
+    """实际交给专用转述的引用图，成功和失败都不走后置视觉补图。"""
+    quoted = source_image(tmp_path, "quoted")
+    event = make_event([Reply(id="quote", chain=[Image(file=str(quoted))])])
+    event.bot = FakeOneBot(str(quoted))
+    event.set_extra("provider_request", ProviderRequest(prompt="caption-the-quote"))
+    if caption_failed:
+        harness.caption.text_chat.side_effect = RuntimeError("caption unavailable")
+
+    asyncio.run(process_event(harness, event))
+
+    assert harness.caption.text_chat.await_count == 1
+    assert harness.captured_runners[-1].req.image_urls == []
+    assert event.bot.calls == []
+
+
+@pytest.mark.parametrize("lookup_failed", [False, True])
+def test_native_reply_id_collection_does_not_repeat_lookup(
+    harness, tmp_path, runtime, monkeypatch, lookup_failed
+):
+    quoted = source_image(tmp_path, "quoted")
+    harness.provider.provider_config["modalities"].append("image")
+    bot = FakeOneBot(str(quoted))
+    if lookup_failed:
+        async def missing(action, **params):
+            bot.calls.append((action, params))
+            return {}
+
+        bot.call_action = missing
+    event = make_event([Reply(id="quote", chain=[Plain(text="quoted-text")])])
+    event.bot = SimpleNamespace(api=SimpleNamespace(call_action=bot.call_action))
+    monkeypatch.setattr(event, "get_platform_name", lambda: "aiocqhttp")
+    original_optimize = runtime.quoted_image_input.optimize
+    inspected = []
+
+    async def check_native_ownership(current_event, req):
+        before = (list(req.image_urls), list(bot.calls))
+        await original_optimize(current_event, req)
+        assert (list(req.image_urls), bot.calls) == before
+        inspected.append(True)
+
+    monkeypatch.setattr(
+        runtime.quoted_image_input, "optimize", check_native_ownership
+    )
+
+    asyncio.run(process_event(harness, event))
+
+    assert inspected == [True]
+    assert bot.calls
+    assert len(harness.captured_runners[-1].req.image_urls) == (
+        0 if lookup_failed else 1
+    )
 
 
 def test_dead_quoted_image_recovered_and_captioned(harness, tmp_path):
@@ -398,7 +673,9 @@ def test_runtime_quote_chain_keeps_both_features(
     original_hint = runtime.reply_target_history.optimize_quote_message
     hint = AsyncMock(wraps=original_hint)
     monkeypatch.setattr(runtime.reply_target_history, "optimize_quote_message", hint)
-    assert internal._process_quote_message is main._process_quote_message
+    if hasattr(internal, "_process_quote_message"):
+        assert internal._process_quote_message is main._process_quote_message
+    assert main._process_quote_message is not _ORIGINAL_MAIN_QUOTE
     event = make_event(
         [
             Reply(
@@ -487,10 +764,15 @@ def test_partial_failure_full_message_does_not_duplicate(harness, tmp_path, runt
 
 @pytest.fixture
 def image_server():
-    bodies = {}
+    class Bodies(dict):
+        requests = None
+
+    bodies = Bodies()
+    bodies.requests = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            bodies.requests.append(self.path)
             body = bodies[self.path]
             status = 200
             if isinstance(body, tuple):
@@ -602,13 +884,20 @@ def test_concurrent_url_collections_keep_request_sources_separate(
 
 def test_runtime_unload_restores_collection_and_conversion(runtime):
     module_cls = type(runtime.quoted_image_input)
-    original_collect = module_cls._collect_original
+    collect_targets = list(module_cls._collect_targets)
     original_convert = module_cls._image_original
     asyncio.run(runtime.terminate())
-    assert internal.collect_initial_request is unwrap_inactive_wrapper(original_collect)
+    for target in collect_targets:
+        assert getattr(target.owner, target.attribute) is unwrap_inactive_wrapper(
+            target.original
+        )
     assert Image.convert_to_file_path is unwrap_inactive_wrapper(original_convert)
-    assert internal.prepare_request_images is _ORIGINAL_INTERNAL_PREPARE
-    assert internal._process_quote_message is _ORIGINAL_INTERNAL_QUOTE
+    if _ORIGINAL_INTERNAL_PREPARE is not None:
+        assert internal.prepare_request_images is _ORIGINAL_INTERNAL_PREPARE
+    if _ORIGINAL_INTERNAL_QUOTE is not None:
+        assert internal._process_quote_message is _ORIGINAL_INTERNAL_QUOTE
+    if _ORIGINAL_MAIN_PREPARE is not None:
+        assert main.prepare_request_images is _ORIGINAL_MAIN_PREPARE
     assert main._process_quote_message is _ORIGINAL_MAIN_QUOTE
 
 
@@ -631,7 +920,11 @@ def test_caption_toggle_preserves_reply_history_chain(harness, tmp_path, runtime
     for enabled in (False, True, False):
         runtime.update_dashboard_switch("optimize_image_caption", enabled)
         harness.caption_calls.clear()
-        assert internal._process_quote_message is main._process_quote_message
+        if hasattr(internal, "_process_quote_message"):
+            assert internal._process_quote_message is main._process_quote_message
+        assert (
+            ImageCaptionModule._active_module is runtime.image_caption
+        ) is enabled
         event = make_event(
             [
                 Reply(
@@ -648,12 +941,13 @@ def test_caption_toggle_preserves_reply_history_chain(harness, tmp_path, runtime
 
 def test_closed_runtime_cannot_reinstall_image_wrappers(harness, runtime):
     asyncio.run(runtime.terminate())
-    original_prepare = internal.prepare_request_images
-    original_quote = internal._process_quote_message
+    prepare_owner = main if hasattr(main, "prepare_request_images") else internal
+    original_prepare = prepare_owner.prepare_request_images
+    original_quote = main._process_quote_message
     runtime.update_dashboard_switch("optimize_quoted_image_input", True)
     runtime.update_dashboard_switch("optimize_image_caption", True)
-    assert internal.prepare_request_images is original_prepare
-    assert internal._process_quote_message is original_quote
+    assert prepare_owner.prepare_request_images is original_prepare
+    assert main._process_quote_message is original_quote
 
 
 def test_platform_can_repair_same_failed_path(harness, tmp_path, runtime):

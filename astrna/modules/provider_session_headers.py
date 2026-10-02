@@ -68,6 +68,22 @@ def _get_astrbot_default_user_agent() -> str | None:
             _astrbot_default_ua_loaded = True
     return _astrbot_default_ua
 
+
+def _is_gemini_combined_default_user_agent(
+    value: str, astrbot_default: str | None
+) -> bool:
+    """识别 SDK 合并两种默认大小写 UA 后的值，不覆盖手填后缀。"""
+    if astrbot_default is None:
+        return False
+    parts = value.split(", ")
+    if len(parts) != 2 or astrbot_default not in parts:
+        return False
+    sdk_part = parts[1] if parts[0] == astrbot_default else parts[0]
+    return re.fullmatch(
+        r"google-genai-sdk/[0-9A-Za-z.+_-]+ gl-python/[0-9A-Za-z.+_-]+",
+        sdk_part,
+    ) is not None
+
 _HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 # 额外头名不得覆盖这些头，避免破坏鉴权、请求格式或主功能头。
 _RESERVED_HEADER_NAMES = frozenset(
@@ -197,6 +213,8 @@ class ProviderSessionHeadersModule:
                     astrbot_default_ua = _get_astrbot_default_user_agent()
                     if ua.startswith(_SDK_DEFAULT_UA_PREFIXES) or (
                         astrbot_default_ua is not None and ua == astrbot_default_ua
+                    ) or _is_gemini_combined_default_user_agent(
+                        ua, astrbot_default_ua
                     ):
                         headers["user-agent"] = self._user_agent
             except Exception as exc:  # noqa: BLE001 - 绝不让加头失败影响请求

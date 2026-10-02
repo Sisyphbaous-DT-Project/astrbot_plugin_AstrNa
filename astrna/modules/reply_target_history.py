@@ -6,6 +6,7 @@ import inspect
 import json
 import re
 from dataclasses import replace
+from functools import wraps
 from typing import Any
 
 from ..utils.patching import (
@@ -455,6 +456,8 @@ class ReplyTargetHistoryModule:
             module_cls._original_process_quote_message = original
             original_process_quote_message = original
 
+            # 保留宿主签名：外层的图像转述兼容层需要据此区分新旧参数位置。
+            @wraps(original_process_quote_message)
             async def astrna_process_quote_message(*args: Any, **kwargs: Any) -> Any:
                 active_module = module_cls._active_module
                 if not is_wrapper_active(astrna_process_quote_message):

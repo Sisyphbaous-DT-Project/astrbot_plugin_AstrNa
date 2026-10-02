@@ -39,6 +39,13 @@ except Exception:  # pragma: no cover - 极简测试环境无 AstrBot Runner
     class _ToolExecutionInterrupted(Exception):
         pass
 
+try:
+    from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
+    from astrbot.core.tools.computer_tools.shell import ShellSessionTool
+except Exception:  # pragma: no cover - 旧版或极简测试环境兜底
+    FunctionToolExecutor = None  # type: ignore[assignment]
+    ShellSessionTool = None  # type: ignore[assignment]
+
 
 from ..utils.patching import (
     is_wrapper_active,
@@ -110,6 +117,9 @@ class ParallelToolUseModule:
     _runner_wrapper: Any = None
     _active_module: ParallelToolUseModule | None = None
     _installed_modules: list[ParallelToolUseModule] = []
+    _executor_cls: type | None = None
+    _original_executor_execute: Any = None
+    _executor_wrapper: Any = None
 
     def __init__(
         self,
@@ -141,6 +151,7 @@ class ParallelToolUseModule:
         if self._installed:
             if module_cls._layer_is_live():
                 if self._registration_intact(runner_cls):
+                    self._install_executor_patch()
                     return True
                 # 层标记活着但注册状态已被外部破坏（工具被移出当前管理器，
                 # 或 Runner 方法被整体替换）：自愈重装，禁止报告假安装。
@@ -183,6 +194,7 @@ class ParallelToolUseModule:
         previous_active = module_cls._active_module
         if not self._install_runner_patch(runner_cls):
             return False
+        self._install_executor_patch()
 
         manager = _get_llm_tools(self.context)
         func_list = getattr(manager, "func_list", None)
@@ -322,6 +334,46 @@ class ParallelToolUseModule:
                 return False
         current = getattr(runner_cls, "_handle_function_tools", None)
         return same_callable(current, type(self)._runner_wrapper)
+
+    def _install_executor_patch(self) -> None:
+        """仅给当前有效的 AstrNa 并发批次传递执行层预算覆盖。"""
+        executor_cls = FunctionToolExecutor
+        if executor_cls is None:
+            return
+        module_cls = type(self)
+        if module_cls._executor_wrapper is not None:
+            current = getattr(executor_cls, "execute", None)
+            if (
+                getattr(current, "__func__", current) is module_cls._executor_wrapper
+                and is_wrapper_active(module_cls._executor_wrapper)
+            ):
+                return
+            mark_wrapper_inactive(module_cls._executor_wrapper)
+
+        original_descriptor = executor_cls.__dict__.get("execute")
+        if not isinstance(original_descriptor, classmethod):
+            return
+        original_function = original_descriptor.__func__
+
+        async def astrna_executor_execute(cls: Any, tool: Any, run_context: Any, **kwargs: Any):
+            original = original_descriptor.__get__(cls, cls)
+            if is_wrapper_active(astrna_executor_execute):
+                timeout = await _parallel_batch_timeout(tool, run_context, kwargs)
+                if timeout is not None:
+                    kwargs["tool_call_timeout"] = timeout
+            upstream = original(tool=tool, run_context=run_context, **kwargs)
+            try:
+                async for item in upstream:
+                    yield item
+            finally:
+                await upstream.aclose()
+
+        astrna_executor_execute._astrna_parallel_executor_patch = True
+        mark_wrapper_active(astrna_executor_execute, original_function)
+        module_cls._executor_cls = executor_cls
+        module_cls._original_executor_execute = original_descriptor
+        module_cls._executor_wrapper = astrna_executor_execute
+        executor_cls.execute = classmethod(astrna_executor_execute)
 
     def _install_runner_patch(self, runner_cls: type) -> bool:
         module_cls = type(self)
@@ -510,6 +562,15 @@ class ParallelToolUseModule:
                 cls._original_handle_function_tools = unwrap_inactive_wrapper(
                     cls._original_handle_function_tools
                 )
+        mark_wrapper_inactive(cls._executor_wrapper)
+        if cls._executor_cls is not None and cls._original_executor_execute is not None:
+            current_execute = getattr(cls._executor_cls, "execute", None)
+            if getattr(current_execute, "__func__", current_execute) is cls._executor_wrapper:
+                original = cls._original_executor_execute.__func__
+                cls._executor_cls.execute = classmethod(unwrap_inactive_wrapper(original))
+        cls._executor_cls = None
+        cls._original_executor_execute = None
+        cls._executor_wrapper = None
         cls._runner_cls = None
         cls._original_handle_function_tools = None
         cls._runner_wrapper = None
@@ -521,6 +582,7 @@ class ParallelToolUseModule:
     def _deactivate_current_layer(cls) -> None:
         """供下一代插件模块接管时停用本代包装，不恢复旧配置。"""
         mark_wrapper_inactive(cls._runner_wrapper)
+        mark_wrapper_inactive(cls._executor_wrapper)
         cls._active_module = None
 
     def _request_tool_set(self, runner: Any, req: Any) -> Any:
@@ -789,9 +851,10 @@ async def _execute_one_tool(
 
     try:
         await _call_tool_start(binding, tool, valid_params)
-        timeout = _tool_timeout(binding.run_context)
+        execution_tool = _execution_tool(binding, tool)
+        timeout = _tool_timeout(binding.run_context, execution_tool, valid_params)
         async with asyncio.timeout(timeout):
-            executor = _execute_tool_results(binding, tool, valid_params)
+            executor = _execute_tool_results(binding, tool, valid_params, execution_tool)
             iterator = _iter_executor_results(binding.runner, executor)
             async for response in iterator:
                 if response is None:
@@ -978,6 +1041,7 @@ async def _execute_tool_results(
     binding: _ExecutionBinding,
     tool: Any,
     params: dict[str, Any],
+    execution_tool: Any | None = None,
 ) -> Any:
     """在真正启动原生 Executor 的同一任务内再次复核非内置工具权限。"""
     manager = binding.tool_manager
@@ -987,7 +1051,8 @@ async def _execute_tool_results(
         if permission_error is not None:
             raise _ToolPermissionChanged
 
-    execution_tool = _execution_tool(binding, tool)
+    if execution_tool is None:
+        execution_tool = _execution_tool(binding, tool)
     executor = binding.executor.execute(
         tool=execution_tool,
         run_context=binding.run_context,
@@ -1105,11 +1170,85 @@ def _runner_stop_requested(runner: Any) -> bool:
     return bool(is_set()) if callable(is_set) else False
 
 
-def _tool_timeout(run_context: Any) -> float:
+_SHELL_WAIT_ACTIONS = frozenset({"poll", "write", "write_line", "interrupt"})
+_PARALLEL_BATCH_SCHEDULE_MARGIN_SECONDS = 1
+
+
+def _base_tool_timeout(run_context: Any) -> float:
     value = getattr(run_context, "tool_call_timeout", 120)
     if isinstance(value, (int, float)) and value > 0:
         return float(value)
     return 120.0
+
+
+def _shell_wait_timeout(
+    base_timeout: float, tool: Any, params: dict[str, Any]
+) -> float | None:
+    """按 AstrBot 对真实 ShellSessionTool 等待动作的口径计算有效预算。"""
+    if ShellSessionTool is None or not isinstance(tool, ShellSessionTool):
+        return None
+    if params.get("action") not in _SHELL_WAIT_ACTIONS:
+        return None
+    yield_time_ms = params.get("yield_time_ms", 5_000)
+    if not isinstance(yield_time_ms, int) or not 0 <= yield_time_ms <= 300_000:
+        return None
+    return max(base_timeout, yield_time_ms / 1000 + 5)
+
+
+def _tool_timeout(
+    run_context: Any, tool: Any | None = None, params: dict[str, Any] | None = None
+) -> float:
+    base_timeout = _base_tool_timeout(run_context)
+    if tool is None or params is None:
+        return base_timeout
+    return _shell_wait_timeout(base_timeout, tool, params) or base_timeout
+
+
+async def _parallel_batch_timeout(
+    tool: Any, run_context: Any, tool_args: dict[str, Any]
+) -> int | None:
+    """计算 AstrNa 自身并发批次所需的最大外层预算。"""
+    binding = _CURRENT_EXECUTION.get()
+    active_module = ParallelToolUseModule._active_module
+    if (
+        binding is None
+        or binding.closed
+        or binding.run_context is not run_context
+        or binding.module is None
+        or active_module is not binding.module
+    ):
+        return None
+    execution_tool = _execution_tool(binding, tool)
+    if (
+        active_module._registered_tool is not execution_tool
+        or not _is_astrna_parallel_tool(execution_tool)
+    ):
+        return None
+    try:
+        normalized = normalize_tool_uses(tool_args.get("tool_uses"))
+    except ValueError:
+        return None
+
+    base_timeout = _base_tool_timeout(run_context)
+    budgets: list[float] = []
+    for name, parameters in normalized:
+        if await _validate_target(binding, name) is not None:
+            continue
+        target = _tool_from_set(binding.tool_set, name)
+        if target is None or not _tool_is_active(target) or blocked_tool_reason(target):
+            continue
+        filtered = _filter_tool_parameters(target, parameters)
+        timeout = _shell_wait_timeout(
+            base_timeout, _execution_tool(binding, target), filtered
+        )
+        if timeout is not None:
+            budgets.append(timeout)
+    if binding.closed or ParallelToolUseModule._active_module is not binding.module:
+        return None
+    max_budget = max(budgets, default=base_timeout)
+    if max_budget <= base_timeout:
+        return None
+    return math.ceil(max_budget + _PARALLEL_BATCH_SCHEDULE_MARGIN_SECONDS)
 
 
 def _tool_from_set(tool_set: Any, name: str) -> Any:
