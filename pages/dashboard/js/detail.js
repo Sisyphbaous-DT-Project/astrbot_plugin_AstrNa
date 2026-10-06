@@ -15,6 +15,8 @@ const DETAIL_LABELS = {
   provider_configured: "清洗模型",
   persona_configured: "清洗参考人格",
   all_groups: "应用于所有群聊",
+  all_private: "应用于所有私聊",
+  umo_count: "隐藏会话 UMO 数量",
   group_id_count: "指定群 ID 数量",
   allowlist_count: "允许使用的内置指令",
   devkit_enabled: "开发工具箱",

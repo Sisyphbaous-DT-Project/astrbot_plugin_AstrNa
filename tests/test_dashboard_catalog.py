@@ -26,6 +26,7 @@ EXPECTED_ORDER = [
     "optimize_image_caption",
     "optimize_send_message_to_user",
     "output_length_limit_enabled",
+    "hide_tool_call_preamble",
     "provide_group_identity_tools",
     "parallel_tool_use_enabled",
     "provider_session_headers_enabled",
@@ -69,7 +70,7 @@ def _walk_strings(payload):
 
 def test_switch_keys_exact_order_and_count():
     assert list(SWITCH_KEYS) == EXPECTED_ORDER
-    assert len(SWITCH_KEYS) == 22
+    assert len(SWITCH_KEYS) == 23
     assert [feature["key"] for feature in FEATURES] == EXPECTED_ORDER
 
 
@@ -92,7 +93,7 @@ def test_feature_copy_is_complete():
 
 def test_build_state_defaults_all_disabled():
     state = build_state({})
-    assert len(state["features"]) == 22
+    assert len(state["features"]) == 23
     assert all(feature["enabled"] is False for feature in state["features"])
     assert state["warnings"] == []
 
@@ -116,6 +117,7 @@ def test_build_state_never_leaks_sensitive_values():
         "disable_group_at_bot_wake_group_ids": ["123456789", "987654321"],
         "disable_group_reply_to_bot_wake_group_ids": ["55555555"],
         "output_length_limit_whitelist_umos": ["aiocqhttp:GroupMessage:424242"],
+        "hide_tool_call_preamble_umos": ["aiocqhttp:GroupMessage:989898"],
         "custom_builtin_commands_enabled": True,
         "custom_builtin_commands_allowlist": ["help"],
     }
@@ -128,6 +130,7 @@ def test_build_state_never_leaks_sensitive_values():
         "987654321",
         "55555555",
         "aiocqhttp:GroupMessage:424242",
+        "aiocqhttp:GroupMessage:989898",
     ):
         assert secret not in blob, secret
 
@@ -137,7 +140,56 @@ def test_build_state_never_leaks_sensitive_values():
     assert details["disable_group_at_bot_wake"]["group_id_count"] == 2
     assert details["disable_group_reply_to_bot_wake"]["group_id_count"] == 1
     assert details["output_length_limit_enabled"]["whitelist_count"] == 1
+    assert details["hide_tool_call_preamble"]["umo_count"] == 1
+    assert details["hide_tool_call_preamble"]["all_groups"] is False
+    assert details["hide_tool_call_preamble"]["all_private"] is False
     assert details["custom_builtin_commands_enabled"]["allowlist_count"] == 1
+
+
+def test_build_state_tool_call_preamble_scope_warnings():
+    # 主开关开但三个范围都未设置：提示不会影响任何会话。
+    state = build_state({"hide_tool_call_preamble": True})
+    assert any("不会影响任何会话" in text for text in state["warnings"])
+    # 任一范围生效即不再提示。
+    for scoped in (
+        {"hide_tool_call_preamble_all_groups": True},
+        {"hide_tool_call_preamble_all_private": True},
+        {"hide_tool_call_preamble_umos": ["a:b:c"]},
+    ):
+        config = {"hide_tool_call_preamble": True, **scoped}
+        assert not any(
+            "不会影响任何会话" in text for text in build_state(config)["warnings"]
+        ), scoped
+    # 主开关关闭时不提示。
+    assert not any(
+        "不会影响任何会话" in text for text in build_state({})["warnings"]
+    )
+
+
+def test_build_state_tool_call_preamble_details():
+    state = build_state(
+        {
+            "hide_tool_call_preamble": True,
+            "hide_tool_call_preamble_all_groups": True,
+            "hide_tool_call_preamble_all_private": False,
+            "hide_tool_call_preamble_umos": ["a:b:c", "d:e:f"],
+        }
+    )
+    feature = next(
+        item for item in state["features"] if item["key"] == "hide_tool_call_preamble"
+    )
+    assert feature["enabled"] is True
+    assert feature["details"] == {
+        "all_groups": True,
+        "all_private": False,
+        "umo_count": 2,
+    }
+    # 三个子配置已进入 Dashboard 可编辑清单。
+    assert [item["key"] for item in feature["settings"]] == [
+        "hide_tool_call_preamble_all_groups",
+        "hide_tool_call_preamble_all_private",
+        "hide_tool_call_preamble_umos",
+    ]
 
 
 def test_build_state_warnings():
@@ -179,7 +231,7 @@ def test_validate_switch_rejects_unknown_and_wrong_type():
     with pytest.raises(ValueError):
         validate_switch("fix_deepseek_v4_400", 1)
     with pytest.raises(ValueError):
-        # 子配置不属于 21 个主开关，必须拒绝
+        # 子配置不属于主开关，必须拒绝
         validate_switch("output_length_limit_max_chars", True)
     validate_switch("fix_deepseek_v4_400", True)
     validate_switch("fix_deepseek_v4_400", False)

@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.6.8"
+    assert metadata["version"] == "1.7.1"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -51,6 +51,10 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "output_length_limit_max_chars",
         "output_length_limit_provider_id",
         "output_length_limit_persona_id",
+        "hide_tool_call_preamble",
+        "hide_tool_call_preamble_all_groups",
+        "hide_tool_call_preamble_all_private",
+        "hide_tool_call_preamble_umos",
         "provide_group_identity_tools",
         "parallel_tool_use_enabled",
         "parallel_tool_use_allowlist",
@@ -254,6 +258,35 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "output_length_limit_enabled": True,
     }
     assert "本轮实际 system prompt" in schema["output_length_limit_persona_id"]["hint"]
+    assert schema["hide_tool_call_preamble"]["type"] == "bool"
+    assert schema["hide_tool_call_preamble"]["description"] == "隐藏工具调用前的过场白"
+    assert schema["hide_tool_call_preamble"]["default"] is False
+    assert "默认关闭" in schema["hide_tool_call_preamble"]["hint"]
+    assert "仍留在模型上下文里" in schema["hide_tool_call_preamble"]["hint"]
+    assert "流式" in schema["hide_tool_call_preamble"]["hint"]
+    assert schema["hide_tool_call_preamble_all_groups"]["type"] == "bool"
+    assert schema["hide_tool_call_preamble_all_groups"]["description"] == "隐藏所有群聊"
+    assert schema["hide_tool_call_preamble_all_groups"]["default"] is False
+    assert schema["hide_tool_call_preamble_all_groups"]["collapsed"] is True
+    assert schema["hide_tool_call_preamble_all_groups"]["condition"] == {
+        "hide_tool_call_preamble": True,
+    }
+    assert schema["hide_tool_call_preamble_all_private"]["type"] == "bool"
+    assert schema["hide_tool_call_preamble_all_private"]["description"] == "隐藏所有私聊"
+    assert schema["hide_tool_call_preamble_all_private"]["default"] is False
+    assert schema["hide_tool_call_preamble_all_private"]["collapsed"] is True
+    assert schema["hide_tool_call_preamble_all_private"]["condition"] == {
+        "hide_tool_call_preamble": True,
+    }
+    assert schema["hide_tool_call_preamble_umos"]["type"] == "list"
+    assert schema["hide_tool_call_preamble_umos"]["description"] == "隐藏的会话 UMO"
+    assert schema["hide_tool_call_preamble_umos"]["items"] == {"type": "string"}
+    assert schema["hide_tool_call_preamble_umos"]["default"] == []
+    assert schema["hide_tool_call_preamble_umos"]["collapsed"] is True
+    assert schema["hide_tool_call_preamble_umos"]["condition"] == {
+        "hide_tool_call_preamble": True,
+    }
+    assert "/sid" in schema["hide_tool_call_preamble_umos"]["hint"]
     assert schema["provide_group_identity_tools"]["type"] == "bool"
     assert (
         schema["provide_group_identity_tools"]["description"]
@@ -480,6 +513,7 @@ def test_changelog_contains_release_notes():
     assert "## 1.6.6" in changelog
     assert "## 1.6.7" in changelog
     assert "## 1.6.8" in changelog
+    assert "## 1.7.1" in changelog
     assert "## 1.2.5" in changelog
     assert "## 1.2.4" in changelog
 

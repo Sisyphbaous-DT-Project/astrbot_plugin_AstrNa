@@ -6,6 +6,7 @@
 import { createBridge } from "./bridge-client.js";
 import { buildFallbackState } from "./fallback-catalog.js";
 import { normalizeVersion, versionLabel } from "./dashboard-version.js";
+import { computeDashboardCounts, frameTotalText, footerSummaryText } from "./dashboard-counts.js";
 import { runBoot, BootSkippedError } from "./boot.js";
 import { confirmDialog, errorDialog } from "./modal.js";
 import { createFilmstrip } from "./filmstrip.js";
@@ -231,6 +232,12 @@ async function bootstrap() {
     }
 
     const features = state.features || [];
+    // 标题与页脚数量按真实状态动态统计，不再写死；fallback 状态同样带 settings。
+    const dashboardCounts = computeDashboardCounts(features);
+    const frameTotalEl = $("[data-frame-total]");
+    if (frameTotalEl) frameTotalEl.textContent = frameTotalText(dashboardCounts);
+    const countsSummaryEl = $("[data-counts-summary]");
+    if (countsSummaryEl) countsSummaryEl.textContent = footerSummaryText(dashboardCounts);
     const featureMap = new Map(features.map((f) => [f.key, f]));
     const pending = new Set();
     const switchRegistry = new Map();

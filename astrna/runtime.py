@@ -34,6 +34,7 @@ from .modules.provider_session_headers import ProviderSessionHeadersModule
 from .modules.quoted_image_input import QuotedImageInputModule
 from .modules.reply_target_history import ReplyTargetHistoryModule
 from .modules.send_message_to_user import SendMessageToUserModule
+from .modules.tool_call_preamble import ToolCallPreambleModule
 from .modules.tool_history_context import ToolHistoryContextModule
 
 
@@ -60,6 +61,10 @@ DEFAULT_CONFIG = {
     "output_length_limit_max_chars": DEFAULT_OUTPUT_LENGTH_LIMIT,
     "output_length_limit_provider_id": "",
     "output_length_limit_persona_id": "",
+    "hide_tool_call_preamble": False,
+    "hide_tool_call_preamble_all_groups": False,
+    "hide_tool_call_preamble_all_private": False,
+    "hide_tool_call_preamble_umos": [],
     "provide_group_identity_tools": False,
     "parallel_tool_use_enabled": False,
     "parallel_tool_use_allowlist": [],
@@ -84,7 +89,7 @@ DEFAULT_CONFIG = {
     "custom_builtin_commands_allowlist": [],
 }
 
-# Dashboard 允许编辑的子配置严格白名单（22 项，注册表见 dashboard_settings）。
+# Dashboard 允许编辑的子配置严格白名单（注册表见 dashboard_settings）。
 DASHBOARD_SETTING_KEYS = frozenset(_DASHBOARD_SETTING_KEY_TUPLE)
 
 _FORWARD_LENGTH_SETTING_KEYS = frozenset(
@@ -119,6 +124,13 @@ _PROVIDER_SESSION_HEADER_SETTING_KEYS = frozenset(
     {
         "provider_session_headers_user_agent",
         "provider_session_headers_extra_name",
+    }
+)
+_TOOL_CALL_PREAMBLE_SETTING_KEYS = frozenset(
+    {
+        "hide_tool_call_preamble_all_groups",
+        "hide_tool_call_preamble_all_private",
+        "hide_tool_call_preamble_umos",
     }
 )
 
@@ -174,6 +186,12 @@ class AstrNaRuntime:
         self.group_identity_tools = GroupIdentityToolsModule(
             context=context,
             logger=logger,
+        )
+        self.tool_call_preamble = ToolCallPreambleModule(
+            logger=logger,
+            all_groups=self.config.get("hide_tool_call_preamble_all_groups", False),
+            all_private=self.config.get("hide_tool_call_preamble_all_private", False),
+            umos=self.config.get("hide_tool_call_preamble_umos", []),
         )
         self.parallel_tool_use = ParallelToolUseModule(
             context=context,
@@ -260,6 +278,7 @@ class AstrNaRuntime:
             self.send_message_to_user.install()
         if self.config.get("output_length_limit_enabled", False):
             self.output_length_limiter.install()
+        self._configure_tool_call_preamble()
         if self.config.get("provide_group_identity_tools", False):
             self.group_identity_tools.install()
         self._configure_parallel_tool_use()
@@ -302,6 +321,8 @@ class AstrNaRuntime:
             self._sync_gemini_request_headers()
         elif key == "optimize_group_chat_context":
             self._configure_group_chat_context_optimizer()
+        elif key == "hide_tool_call_preamble":
+            self._configure_tool_call_preamble()
 
     def _configure_image_caption(self) -> None:
         if self._closed:
@@ -331,15 +352,31 @@ class AstrNaRuntime:
         else:
             self.gemini_request_headers.terminate()
 
+    def _configure_tool_call_preamble(self) -> None:
+        """按主开关热安装或卸载过场白门卫，并同步三个范围子配置。"""
+        if getattr(self, "_closed", False):
+            # 插件已终止：被 shield 保护的旧 Dashboard 保存任务不得重新激活。
+            return
+        self.tool_call_preamble.configure(
+            all_groups=self.config.get("hide_tool_call_preamble_all_groups", False),
+            all_private=self.config.get("hide_tool_call_preamble_all_private", False),
+            umos=self.config.get("hide_tool_call_preamble_umos", []),
+        )
+        if self.config.get("hide_tool_call_preamble", False):
+            self.tool_call_preamble.install()
+        else:
+            self.tool_call_preamble.terminate()
+
     def update_dashboard_setting(self, key: str, value: Any) -> None:
         """同步功能控制台修改的单个子配置，并按组热同步相关模块。
 
-        严格白名单：只接受 DASHBOARD_SETTING_KEYS 中的 22 个键；列表值写入
+        严格白名单：只接受 DASHBOARD_SETTING_KEYS 中的键；列表值写入
         副本，前端对象不会继续引用 Runtime 配置。各组同步规则：
         - 身份元数据四项：只写配置，下一次 LLM 请求读取；
         - 合并转发长度：重新配置 ForwardNodesModule，无需重启插件；
         - 群聊压缩模型：调用现有 configure()；
         - 输出限制四项：统一调用 OutputLengthLimiterModule.configure()；
+        - 过场白范围三项：统一调用 ToolCallPreambleModule.configure()；
         - 群唤醒范围与内置指令允许列表：重建共享 WakingCheck 链；
         - Issue 助手三项：调用现有配置同步入口（Token/UMO 不进日志）。
         """
@@ -394,6 +431,8 @@ class AstrNaRuntime:
             self._configure_parallel_tool_use()
         elif key in _PROVIDER_SESSION_HEADER_SETTING_KEYS:
             self._configure_provider_session_headers()
+        elif key in _TOOL_CALL_PREAMBLE_SETTING_KEYS:
+            self._configure_tool_call_preamble()
         # 身份元数据四项只写配置，下一次 LLM 请求由 sanitize_request 读取。
 
     async def sanitize_request(self, event: Any, req: Any) -> None:
@@ -521,6 +560,9 @@ class AstrNaRuntime:
         await self.issue_assistant.prepare_request(event, req)
         if not self._is_lifecycle_current(lifecycle_token):
             return
+
+        # 每个请求复核一次过场白门卫：开销很小，且能在本请求 step 之前生效。
+        self._configure_tool_call_preamble()
 
         self.reply_target_history.sanitize_request(req)
 
@@ -912,6 +954,8 @@ class AstrNaRuntime:
         self.parallel_tool_use.terminate()
         # 会话请求头必须在第一个 await 前拆除，避免中途异常把钩子残留在 httpx 客户端里。
         self.provider_session_headers.terminate()
+        # 过场白门卫必须在第一个 await 前停用，避免卸载后继续扣住文字。
+        self.tool_call_preamble.terminate()
         self.quoted_image_input.terminate()
         # 群聊优化必须在首个 await 前停用，避免卸载期间继续收集新增消息。
         self.group_chat_context_optimizer.terminate()

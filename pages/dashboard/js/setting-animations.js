@@ -1,5 +1,5 @@
 /**
- * 22 项子配置的专属原理动画。
+ * 全部子配置的专属原理动画。
  * 与主功能动画共用同一套 SVG 视觉语言；每个标签驱动真实的数据流与解释，
  * 布尔值立即切换，数字/选择项以草稿值预览；减少动态模式下不启动循环时间轴，
  * 布尔场景始终以双路径静态呈现“关闭路径 / 开启路径”的前后状态。
@@ -421,8 +421,75 @@ function buildOutputPersona(stage, ctx) {
   });
 }
 
-/* ---------- 群聊唤醒抑制（@ / 引用链共用场景，路径不同） ---------- */
+/* ---------- 隐藏工具调用前的过场白 ---------- */
 
+function buildPreambleAll(kind) {
+  const scope = kind === "groups" ? "群聊" : "私聊";
+  return (stage, ctx) => scene(stage, ctx, (g, value) => {
+    const on = Boolean(value);
+    chip(g, "模型输出", 6, 30, COLOR.warn);
+    label(g, 10, 68, "「我去查一下」+ 工具调用", { size: 9, color: COLOR.gray });
+    const gateColor = on ? COLOR.ok : COLOR.gray;
+    const gate = box(g, 118, 24, 120, 52, "#0a2b2b", { stroke: gateColor });
+    label(g, 128, 46, "过场白门卫", { size: 11, color: gateColor, bold: on });
+    label(g, 128, 64, on ? `所有${scope}：拦下不发送` : "未启用：照常发出", {
+      size: 9, color: on ? COLOR.ok : COLOR.gray,
+    });
+    arrow(g, 74, 50, 116, 50, COLOR.gray);
+    box(g, 262, 14, 128, 24, "#4a3a1d");
+    label(g, 270, 30, "🔨 工具调用（照常执行）", { size: 9, color: COLOR.warn });
+    box(g, 262, 52, 128, 24, "#1d4a1d");
+    label(g, 270, 68, "最终回答（正常发送）", { size: 9, color: COLOR.ok });
+    arrow(g, 240, 40, 260, 26, COLOR.warn);
+    arrow(g, 240, 60, 260, 64, COLOR.ok);
+    const note = label(g, 20, 120, on
+      ? `所有${scope}的过场白只留在模型上下文，不发给用户`
+      : `开启后，所有${scope}的工具调用前过场白不再发送`, {
+      size: 10, color: on ? COLOR.ok : COLOR.gray,
+    });
+    return {
+      caption: on
+        ? `开启：所有${scope}的工具调用前过场白都被拦下，只发送最终回答`
+        : `关闭：所有${scope}的过场白维持原生行为，随工具调用前发出`,
+      animate: () => ctx.gsap.to([gate, note], {
+        opacity: on ? 0.55 : 0.85, duration: 0.6, repeat: -1, yoyo: true,
+      }),
+    };
+  });
+}
+
+function buildPreambleUmos(stage, ctx) {
+  return scene(stage, ctx, (g, value) => {
+    const count = (value && Number(value.count)) || 0;
+    ["会话 A", "会话 B"].forEach((text, i) => {
+      chip(g, text, 10, 40 + i * 60, COLOR.info);
+    });
+    const gate = box(g, 150, 50, 100, 60, "#0a2b2b", { stroke: COLOR.warn });
+    label(g, 162, 76, "过场白", { size: 11, color: COLOR.warn, bold: true });
+    label(g, 162, 94, "门卫", { size: 11, color: COLOR.warn });
+    arrow(g, 88, 55, 148, 70, COLOR.gray);
+    arrow(g, 88, 115, 148, 95, COLOR.gray);
+    box(g, 280, 30, 110, 24, "#4a3a1d");
+    label(g, 288, 46, "🔨 工具调用", { size: 9, color: COLOR.warn });
+    box(g, 280, 70, 110, 24, count > 0 ? "#1d4a1d" : "#123f5a");
+    label(g, 288, 86, "最终回答 √", { size: 9, color: COLOR.ok });
+    arrow(g, 252, 70, 278, 45, COLOR.warn);
+    arrow(g, 252, 90, 278, 82, COLOR.ok);
+    const hit = label(g, 20, 170, `命中列表（${count} 条）的会话：过场白拦下`, {
+      size: 10, color: count > 0 ? COLOR.ok : COLOR.gray, bold: count > 0,
+    });
+    label(g, 20, 192, "与「所有群聊 / 所有私聊」任一命中即生效", { size: 9, color: COLOR.gray });
+    return {
+      caption: count > 0
+        ? `已配置 ${count} 条会话 UMO：命中的会话不发送工具调用前的过场白`
+        : "列表为空：没有会话因 UMO 命中而隐藏过场白",
+      animate: () => ctx.gsap.to([gate, hit], { opacity: 0.4, duration: 0.6, repeat: -1, yoyo: true }),
+    };
+  });
+}
+
+
+/* ---------- 群聊唤醒抑制（@ / 引用链共用场景，路径不同） ---------- */
 function buildWakeAll(kind) {
   const trigger = kind === "at" ? "@Bot" : "引用 Bot 消息";
   const pathLabel = kind === "at" ? "@ 路径" : "引用链路径";
@@ -717,6 +784,9 @@ const BUILDERS = {
   "output-max-chars": buildOutputMaxChars,
   "output-clean-model": buildOutputCleanModel,
   "output-persona": buildOutputPersona,
+  "preamble-all-groups": buildPreambleAll("groups"),
+  "preamble-all-private": buildPreambleAll("private"),
+  "preamble-umos": buildPreambleUmos,
   "wake-at-all": buildWakeAll("at"),
   "wake-at-groups": buildWakeGroups("at"),
   "wake-reply-all": buildWakeAll("reply"),

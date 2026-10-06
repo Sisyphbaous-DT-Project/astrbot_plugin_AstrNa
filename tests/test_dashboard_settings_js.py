@@ -20,6 +20,7 @@ EXPECTED_PARENTS_WITH_SETTINGS = {
     "optimize_forward_nodes",
     "optimize_group_chat_context",
     "output_length_limit_enabled",
+    "hide_tool_call_preamble",
     "disable_group_at_bot_wake",
     "disable_group_reply_to_bot_wake",
     "custom_builtin_commands_enabled",
@@ -45,7 +46,7 @@ def test_setting_animation_ids_match_backend_registry():
       const {{ SETTING_ANIMATION_IDS }} = await import(moduleUrl);
       const backend = {backend};
       assert.deepEqual(SETTING_ANIMATION_IDS, backend);
-      assert.equal(new Set(SETTING_ANIMATION_IDS).size, 22);
+      assert.equal(new Set(SETTING_ANIMATION_IDS).size, 25);
     """
     subprocess.run(
         ["node", "--input-type=module", "--eval", script],
@@ -178,16 +179,71 @@ def test_setting_save_warnings_sync_memory_state():
     assert "state.warnings = Array.isArray(warnings) ? warnings : [];" in app
 
 
-def test_fallback_catalog_keeps_22_settings_readonly():
+def test_fallback_catalog_keeps_all_settings_readonly():
     text = _read("fallback-catalog.js")
     for parent in EXPECTED_PARENTS_WITH_SETTINGS:
         assert f"{parent}: [" in text, parent
-    # 22 个静态子配置条目
-    assert text.count("    setting(") == 22
+    # 全部静态子配置条目
+    assert text.count("    setting(") == 25
     # 状态未知时不能伪装成真实值
     assert "value: null" in text
     assert "configured: null" in text
     assert "count: null" in text
+
+
+# ---------------------------------------------------------------------------
+# 数量动态统计（防写死回归）
+# ---------------------------------------------------------------------------
+
+DASHBOARD_DIR = DASHBOARD_JS.parent
+
+
+def test_index_html_has_no_hardcoded_counts():
+    html = (DASHBOARD_DIR / "index.html").read_text(encoding="utf-8")
+    # 标题、帧计数器与页脚统计只留中性占位，数量由 dashboard-counts.js 动态填写。
+    assert "— 帧" in html
+    assert "- / -" in html
+    assert "data-counts-summary" in html
+    for stale in ("20 帧", "/ 20", "个主开关 + ", "组共 20 项"):
+        assert stale not in html, stale
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="需要 Node.js 校验动态统计")
+def test_dashboard_counts_match_backend_registry():
+    from astrna.modules.dashboard_catalog import SWITCH_KEYS
+
+    fallback_b64 = base64.b64encode(
+        (DASHBOARD_JS / "fallback-catalog.js").read_bytes()
+    ).decode("ascii")
+    counts_b64 = base64.b64encode(
+        (DASHBOARD_JS / "dashboard-counts.js").read_bytes()
+    ).decode("ascii")
+    expected = json.dumps(
+        {
+            "featureCount": len(SWITCH_KEYS),
+            "parentCount": len(EXPECTED_PARENTS_WITH_SETTINGS),
+            "settingCount": len(SETTINGS),
+        }
+    )
+    script = rf"""
+      import assert from "node:assert/strict";
+      const fallbackUrl = "data:text/javascript;base64,{fallback_b64}";
+      const countsUrl = "data:text/javascript;base64,{counts_b64}";
+      const {{ buildFallbackState }} = await import(fallbackUrl);
+      const {{ computeDashboardCounts, frameTotalText, footerSummaryText }} = await import(countsUrl);
+      const state = buildFallbackState();
+      const counts = computeDashboardCounts(state.features);
+      assert.deepEqual(counts, {expected});
+      assert.equal(frameTotalText(counts), `— ${{counts.featureCount}} 帧`);
+      assert.equal(footerSummaryText(counts), `${{counts.featureCount}} 个主开关 + ${{counts.parentCount}} 组共 ${{counts.settingCount}} 项子配置`);
+      assert.deepEqual(computeDashboardCounts(undefined), {{ featureCount: 0, parentCount: 0, settingCount: 0 }});
+    """
+    subprocess.run(
+        ["node", "--input-type=module", "--eval", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_settings_css_hooks():

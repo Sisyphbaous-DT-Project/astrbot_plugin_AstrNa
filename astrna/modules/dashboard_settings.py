@@ -1,6 +1,6 @@
 """Dashboard 子配置目录、安全状态与单项更新交易。
 
-本模块显式登记 10 个父功能共 22 项允许在 Dashboard 编辑的子配置。
+本模块显式登记允许在 Dashboard 编辑的全部子配置（按父功能分组）。
 未登记的配置键不会出现在状态接口里，也无法通过 setting 接口写入；
 不会从 `_conf_schema.json` 自动暴露任何新增配置。
 
@@ -196,6 +196,39 @@ SETTINGS: tuple[dict[str, Any], ...] = (
         "输出清洗参考人格",
         "清洗模型参考该人格提示词改写短回复；留空时使用本轮实际 system prompt。",
         "output-persona",
+    ),
+    # 隐藏工具调用前的过场白（3）
+    _setting(
+        "hide_tool_call_preamble_all_groups",
+        "hide_tool_call_preamble",
+        CONTROL_BOOL,
+        "隐藏所有群聊",
+        "所有群聊里，模型调用工具前顺口说的过场白都不发送，只看最终回答。",
+        "preamble-all-groups",
+        notes=("与「隐藏所有私聊」「隐藏的会话 UMO」任一命中即生效",),
+    ),
+    _setting(
+        "hide_tool_call_preamble_all_private",
+        "hide_tool_call_preamble",
+        CONTROL_BOOL,
+        "隐藏所有私聊",
+        "所有私聊里，模型调用工具前顺口说的过场白都不发送，只看最终回答。",
+        "preamble-all-private",
+        notes=("与「隐藏所有群聊」「隐藏的会话 UMO」任一命中即生效",),
+    ),
+    _setting(
+        "hide_tool_call_preamble_umos",
+        "hide_tool_call_preamble",
+        CONTROL_PROTECTED_LIST,
+        "隐藏的会话 UMO",
+        "逐项管理需要隐藏过场白的会话 UMO；与上方两个开关任一命中即生效，互不影响。",
+        "preamble-umos",
+        notes=(
+            "可用 AstrBot 的 /sid 指令获取 UMO",
+            "条目以匿名编号显示，不暴露完整 UMO",
+            "与上方两个开关任一命中即生效",
+        ),
+        sensitive=SENSITIVE_LIST,
     ),
     # 关闭群聊 @Bot 唤醒（2）
     _setting(

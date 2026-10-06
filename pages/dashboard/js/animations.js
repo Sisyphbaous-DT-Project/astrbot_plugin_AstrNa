@@ -1,5 +1,5 @@
 /**
- * 21 个功能的专属 SVG 原理动画。
+ * 全部功能的专属 SVG 原理动画。
  * 每个功能都有“开启前 / 开启后”两个语义场景，使用统一视觉语言但表达内容不同。
  */
 
@@ -960,6 +960,46 @@ function buildIssueAssistant(stage, ctx) {
   });
 }
 
+/* ---------- 隐藏工具调用前的过场白 ---------- */
+function buildToolCallPreamble(stage, ctx) {
+  return stateful(stage, {
+    before: "开启前：「我去查一下」先发到群里，工具结果和最终回答跟在后面",
+    after: "开启后：过场白被拦下留在模型上下文，聊天里只看得到最终回答",
+  }, ctx, (svg, beforeG, afterG, { gsap }) => {
+    const drawChat = (g, lines) => {
+      box(g, 30, 30, 340, 240, "#0f3d3d", { stroke: COLOR.info });
+      label(g, 44, 54, "聊天窗口", { size: 11, color: COLOR.info });
+      return lines.map((item, i) => {
+        const y = 78 + i * 48;
+        const node = box(g, 48, y, 300, 34, item.color, {
+          stroke: item.stroke || "#062b2b",
+          dashed: Boolean(item.dashed),
+        });
+        label(g, 60, y + 21, item.text, { size: 11, color: item.textColor || COLOR.ink });
+        return node;
+      });
+    };
+    const before = drawChat(beforeG, [
+      { text: "Bot：我去查一下（过场白）", color: "#5a3a3a", textColor: COLOR.bad },
+      { text: "🔨 调用工具：查生日簿", color: "#4a3a1d", textColor: COLOR.warn },
+      { text: "Bot：最近生日的是……（最终回答）", color: "#1d4a1d", textColor: COLOR.ok },
+      { text: "群友被过场白刷屏", color: "#2b2b2b", textColor: COLOR.gray },
+    ]);
+    const after = drawChat(afterG, [
+      { text: "「我去查一下」（拦下，不发送 ✂）", color: "#0a2b2b", textColor: COLOR.gray, dashed: true, stroke: COLOR.gray },
+      { text: "🔨 调用工具：查生日簿", color: "#4a3a1d", textColor: COLOR.warn },
+      { text: "Bot：最近生日的是……（最终回答）", color: "#1d4a1d", textColor: COLOR.ok },
+      { text: "过场白仍留在模型上下文 √", color: "#123f5a", textColor: COLOR.info },
+    ]);
+    return {
+      animateBefore: () => gsap.timeline({ repeat: -1, yoyo: true })
+        .to(before[0], { opacity: 0.35, duration: 0.5 }),
+      animateAfter: () => gsap.timeline({ repeat: -1, yoyo: true })
+        .to(after[0], { opacity: 0.25, duration: 0.6 }),
+    };
+  });
+}
+
 const BUILDERS = {
   fix_deepseek_v4_400: buildDeepseek,
   optimize_identity_metadata: buildIdentity,
@@ -973,6 +1013,7 @@ const BUILDERS = {
   optimize_image_caption: buildImageCaption,
   optimize_send_message_to_user: buildSendMessageToUser,
   output_length_limit_enabled: buildOutputLength,
+  hide_tool_call_preamble: buildToolCallPreamble,
   provide_group_identity_tools: buildGroupIdentityTools,
   parallel_tool_use_enabled: buildParallelToolUse,
   provider_session_headers_enabled: buildProviderSessionHeaders,

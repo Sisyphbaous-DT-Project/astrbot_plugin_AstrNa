@@ -2,7 +2,7 @@
 
 本模块只负责两件事：
 
-1. 生成 22 个主开关的静态文案与安全状态摘要（绝不包含 Token、UMO、
+1. 生成全部主开关的静态文案与安全状态摘要（绝不包含 Token、UMO、
    群号等敏感原文）。
 2. 校验并应用单个主开关的修改，写回共享配置对象、持久化，并同步
    Runtime 的合并配置副本。
@@ -31,6 +31,7 @@ SWITCH_KEYS: tuple[str, ...] = (
     "optimize_image_caption",
     "optimize_send_message_to_user",
     "output_length_limit_enabled",
+    "hide_tool_call_preamble",
     "provide_group_identity_tools",
     "parallel_tool_use_enabled",
     "provider_session_headers_enabled",
@@ -189,6 +190,19 @@ FEATURES: tuple[dict[str, Any], ...] = (
             "清洗模型留空或调用失败时会直接硬截断到设定字符数",
             "白名单、最大字数、清洗模型与参考人格可在「功能设置」中调整",
             "只处理普通纯文本最终回复；工具、报错、流式 chunk、媒体结果不处理",
+        ),
+    ),
+    _feature(
+        "hide_tool_call_preamble",
+        "隐藏工具调用前的过场白",
+        "模型调用工具前顺口说的「我去查一下」不再发送，只看最终回答。",
+        "模型在调用工具前生成的过场白会先把聊天节奏打断。AstrNa 把后面紧跟工具调用的文字段扣下不发送，"
+        "多轮工具调用每一轮都不发，只发送最终回答；这段话仍留在模型自己的上下文里，不影响工具调用配对。",
+        ("拟人 Bot 频繁调用工具，不希望群友看到过场白时",),
+        (
+            "只按「后面是否紧跟工具调用」判断：先写完整回答再调工具（如发表情、记忆）也会被隐藏",
+            "流式会话不处理；只对 AstrBot 本地 Agent 执行器生效，不覆盖 Dify/Coze 等第三方 Agent",
+            "群聊/私聊/会话 UMO 三个范围任一命中即生效，可在「功能设置」中调整；都未设置时不影响任何会话",
         ),
     ),
     _feature(
@@ -381,6 +395,12 @@ def _build_details(key: str, config: Mapping[str, Any]) -> dict[str, Any]:
                 config, "output_length_limit_persona_id"
             ),
         }
+    if key == "hide_tool_call_preamble":
+        return {
+            "all_groups": _truthy_flag(config, "hide_tool_call_preamble_all_groups"),
+            "all_private": _truthy_flag(config, "hide_tool_call_preamble_all_private"),
+            "umo_count": _list_count(config, "hide_tool_call_preamble_umos"),
+        }
     if key == "disable_group_at_bot_wake":
         return {
             "all_groups": _truthy_flag(config, "disable_group_at_bot_wake_all_groups"),
@@ -444,6 +464,14 @@ def _build_warnings(config: Mapping[str, Any]) -> list[str]:
         config, "output_length_limit_provider_id"
     ):
         warnings.append("输出字数限制已开启但未配置清洗模型：超长回复将直接硬截断。")
+    if _truthy_flag(config, "hide_tool_call_preamble") and not (
+        _truthy_flag(config, "hide_tool_call_preamble_all_groups")
+        or _truthy_flag(config, "hide_tool_call_preamble_all_private")
+        or _list_count(config, "hide_tool_call_preamble_umos")
+    ):
+        warnings.append(
+            "隐藏工具过场白已开启但三个范围都未设置：不会影响任何会话。"
+        )
     return warnings
 
 

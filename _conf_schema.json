@@ -188,6 +188,45 @@
       "output_length_limit_enabled": true
     }
   },
+  "hide_tool_call_preamble": {
+    "type": "bool",
+    "description": "隐藏工具调用前的过场白",
+    "hint": "开启后，模型在调用工具前顺口说的「我去查一下」这类过场白不再发送给用户，多轮工具调用每一轮都不发，只发送最终回答。模型照样会生成这句话，它只是不发送，仍留在模型上下文里；只按「后面是否紧跟工具调用」判断，同一轮里模型若先写了完整回答再调用工具（例如发表情、记忆、send_message_to_user 发图），这段内容也会被隐藏。开启流式输出的会话不处理（流式文字边生成边发送，无法收回）；AstrBot 自己的「🔨 调用工具」状态提示和工具直接发送的结果不受影响；只对 AstrBot 本地 Agent 执行器生效，不覆盖 Dify/Coze 等第三方 Agent。需在下方选择生效范围（群聊/私聊/指定会话 UMO，任一命中即生效），三个范围都未设置时不影响任何会话。默认关闭。",
+    "default": false
+  },
+  "hide_tool_call_preamble_all_groups": {
+    "type": "bool",
+    "description": "隐藏所有群聊",
+    "hint": "开启后，所有群聊的工具调用前过场白都不发送。与「隐藏所有私聊」「隐藏的会话 UMO」任一命中即生效。默认关闭。",
+    "default": false,
+    "collapsed": true,
+    "condition": {
+      "hide_tool_call_preamble": true
+    }
+  },
+  "hide_tool_call_preamble_all_private": {
+    "type": "bool",
+    "description": "隐藏所有私聊",
+    "hint": "开启后，所有私聊的工具调用前过场白都不发送。与「隐藏所有群聊」「隐藏的会话 UMO」任一命中即生效。默认关闭。",
+    "default": false,
+    "collapsed": true,
+    "condition": {
+      "hide_tool_call_preamble": true
+    }
+  },
+  "hide_tool_call_preamble_umos": {
+    "type": "list",
+    "description": "隐藏的会话 UMO",
+    "items": {
+      "type": "string"
+    },
+    "hint": "逐项填写需要隐藏过场白的会话 UMO，可逐项添加多个，也可批量导入；与「隐藏所有群聊」「隐藏所有私聊」任一命中即生效。可用 AstrBot 的 /sid 指令获取 UMO。默认留空。",
+    "default": [],
+    "collapsed": true,
+    "condition": {
+      "hide_tool_call_preamble": true
+    }
+  },
   "provide_group_identity_tools": {
     "type": "bool",
     "description": "提供群身份查询工具",

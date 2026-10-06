@@ -36,6 +36,9 @@ EXPECTED_SETTING_ORDER = [
     "output_length_limit_max_chars",
     "output_length_limit_provider_id",
     "output_length_limit_persona_id",
+    "hide_tool_call_preamble_all_groups",
+    "hide_tool_call_preamble_all_private",
+    "hide_tool_call_preamble_umos",
     "disable_group_at_bot_wake_all_groups",
     "disable_group_at_bot_wake_group_ids",
     "disable_group_reply_to_bot_wake_all_groups",
@@ -54,6 +57,7 @@ EXPECTED_PARENTS = {
     "optimize_forward_nodes": 2,
     "optimize_group_chat_context": 1,
     "output_length_limit_enabled": 4,
+    "hide_tool_call_preamble": 3,
     "disable_group_at_bot_wake": 2,
     "disable_group_reply_to_bot_wake": 2,
     "custom_builtin_commands_enabled": 1,
@@ -74,6 +78,9 @@ EXPECTED_ANIMATIONS = {
     "output_length_limit_max_chars": "output-max-chars",
     "output_length_limit_provider_id": "output-clean-model",
     "output_length_limit_persona_id": "output-persona",
+    "hide_tool_call_preamble_all_groups": "preamble-all-groups",
+    "hide_tool_call_preamble_all_private": "preamble-all-private",
+    "hide_tool_call_preamble_umos": "preamble-umos",
     "disable_group_at_bot_wake_all_groups": "wake-at-all",
     "disable_group_at_bot_wake_group_ids": "wake-at-groups",
     "disable_group_reply_to_bot_wake_all_groups": "wake-reply-all",
@@ -213,12 +220,12 @@ def _run(coro):
 
 def test_settings_registry_exact_order_count_and_parents():
     assert list(SETTING_KEYS) == EXPECTED_SETTING_ORDER
-    assert len(SETTINGS) == 22
+    assert len(SETTINGS) == 25
     parents = {}
     for item in SETTINGS:
         parents[item["parent"]] = parents.get(item["parent"], 0) + 1
     assert parents == EXPECTED_PARENTS
-    assert len(EXPECTED_PARENTS) == 10
+    assert len(EXPECTED_PARENTS) == 11
 
 
 def test_settings_registry_copy_complete():
@@ -237,7 +244,7 @@ def test_settings_registry_copy_complete():
             "secret",
             "text",
         }
-    assert len({item["animation"] for item in SETTINGS}) == 22
+    assert len({item["animation"] for item in SETTINGS}) == 25
 
 
 def test_settings_animation_ids_match_frontend_registry():
@@ -795,6 +802,7 @@ def test_build_state_includes_settings_arrays():
     assert len(by_key["optimize_identity_metadata"]["settings"]) == 4
     assert len(by_key["issue_assistant_enabled"]["settings"]) == 3
     assert len(by_key["parallel_tool_use_enabled"]["settings"]) == 1
+    assert len(by_key["hide_tool_call_preamble"]["settings"]) == 3
     assert "settings" not in by_key["fix_deepseek_v4_400"]
 
 
@@ -853,6 +861,7 @@ def test_state_never_leaks_sensitive_setting_values():
         "disable_group_at_bot_wake_group_ids": ["123456789"],
         "disable_group_reply_to_bot_wake_group_ids": ["55555555"],
         "output_length_limit_whitelist_umos": ["aiocqhttp:GroupMessage:424242"],
+        "hide_tool_call_preamble_umos": ["aiocqhttp:GroupMessage:989898"],
     }
     state = build_state(config)
     blob = "\n".join(_walk_strings(state))
@@ -862,6 +871,7 @@ def test_state_never_leaks_sensitive_setting_values():
         "123456789",
         "55555555",
         "aiocqhttp:GroupMessage:424242",
+        "aiocqhttp:GroupMessage:989898",
     ):
         assert secret not in blob, secret
 
@@ -1588,6 +1598,26 @@ def test_runtime_hot_sync_waking_and_issue_groups(fakes):
     )
     assert runtime.issue_assistant.devkit_enabled is True
     assert runtime.issue_assistant.target_umo == "aiocqhttp:FriendMessage:10001"
+    _run(runtime.terminate())
+
+
+def test_runtime_hot_sync_tool_call_preamble_group(fakes):
+    runtime = fakes.build_runtime({})
+    module = runtime.tool_call_preamble
+    runtime.update_dashboard_setting("hide_tool_call_preamble_all_groups", True)
+    assert module.all_groups is True
+    assert module.all_private is False
+    runtime.update_dashboard_setting("hide_tool_call_preamble_all_private", True)
+    assert module.all_private is True
+    runtime.update_dashboard_setting(
+        "hide_tool_call_preamble_umos", ["aiocqhttp:GroupMessage:789"]
+    )
+    assert module.umos == {"aiocqhttp:GroupMessage:789"}
+    assert runtime.config["hide_tool_call_preamble_umos"] == [
+        "aiocqhttp:GroupMessage:789"
+    ]
+    # 主开关关闭时范围子配置只写配置，不会激活门卫。
+    assert module._installed is False
     _run(runtime.terminate())
 
 

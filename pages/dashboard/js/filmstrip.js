@@ -1,4 +1,4 @@
-/** 横向胶卷：20 帧功能卡片，滚轮/拖动/键盘/按钮导航，居中高亮。 */
+/** 横向胶卷：功能卡片逐帧排布，滚轮/拖动/键盘/按钮导航，居中高亮。 */
 
 import { createWheelGesture, normalizeWheelDelta } from "./wheel-gesture.js";
 
@@ -59,7 +59,7 @@ export function createFilmstrip({ container, counterEl, features, onOpenDetail, 
     status.className = "badge status-badge";
     noticesLine.appendChild(status);
 
-    // 有子配置的 8 帧：主开关 | 功能设置（N） | 放大查看 >>；其余帧不渲染占位。
+    // 有子配置的帧：主开关 | 功能设置（N） | 放大查看 >>；其余帧不渲染占位。
     const settingsCount = Array.isArray(feature.settings) ? feature.settings.length : 0;
     if (settingsCount > 0 && typeof onOpenSettings === "function") {
       const settingsBtn = document.createElement("button");

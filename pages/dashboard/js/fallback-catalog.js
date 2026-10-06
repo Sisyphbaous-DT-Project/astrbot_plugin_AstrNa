@@ -117,6 +117,14 @@ const FEATURES = [
     ["拟人 Bot 需要保持简短聊天节奏时"],
   ),
   feature(
+    "hide_tool_call_preamble",
+    "隐藏工具调用前的过场白",
+    "模型调用工具前顺口说的「我去查一下」不再发送，只看最终回答。",
+    "后面紧跟工具调用的文字段会被扣下不发送，这段话仍留在模型自己的上下文里，不影响工具调用配对。",
+    ["拟人 Bot 频繁调用工具，不希望群友看到过场白时"],
+    ["流式会话不处理", "只对 AstrBot 本地 Agent 执行器生效", "三个范围都未设置时不影响任何会话"],
+  ),
+  feature(
     "provide_group_identity_tools",
     "提供群身份查询工具",
     "让模型按需查询群身份，而不是每轮塞入上下文。",
@@ -198,7 +206,7 @@ const FEATURES = [
 ];
 
 /**
- * 9 个功能的 20 项子配置静态目录：状态接口失败时保留说明与动画，
+ * 全部子配置静态目录：状态接口失败时保留说明与动画，
  * 所有状态值一律为空，控件显示“状态未知”并禁用。
  */
 const COMMAND_OPTIONS = [
@@ -274,6 +282,22 @@ const FALLBACK_SETTINGS = {
     setting("output_length_limit_persona_id", "persona", "输出清洗参考人格",
       "清洗模型参考该人格提示词改写短回复；留空时使用本轮实际 system prompt。",
       "output-persona", { options: [], state: { value: "", stale: false } }),
+  ],
+  hide_tool_call_preamble: [
+    setting("hide_tool_call_preamble_all_groups", "bool", "隐藏所有群聊",
+      "所有群聊里，模型调用工具前顺口说的过场白都不发送，只看最终回答。",
+      "preamble-all-groups",
+      { notes: ["与「隐藏所有私聊」「隐藏的会话 UMO」任一命中即生效"], state: { value: null } }),
+    setting("hide_tool_call_preamble_all_private", "bool", "隐藏所有私聊",
+      "所有私聊里，模型调用工具前顺口说的过场白都不发送，只看最终回答。",
+      "preamble-all-private",
+      { notes: ["与「隐藏所有群聊」「隐藏的会话 UMO」任一命中即生效"], state: { value: null } }),
+    setting("hide_tool_call_preamble_umos", "protected_list", "隐藏的会话 UMO",
+      "逐项管理需要隐藏过场白的会话 UMO；与上方两个开关任一命中即生效，互不影响。",
+      "preamble-umos",
+      { notes: ["可用 AstrBot 的 /sid 指令获取 UMO", "条目以匿名编号显示，不暴露完整 UMO",
+        "与上方两个开关任一命中即生效"],
+        sensitive: "list", state: { count: null, items: [] } }),
   ],
   disable_group_at_bot_wake: [
     setting("disable_group_at_bot_wake_all_groups", "bool", "应用于所有群聊",

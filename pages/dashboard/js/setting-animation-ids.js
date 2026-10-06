@@ -1,5 +1,5 @@
 /**
- * 22 项子配置动画标识的唯一列表（纯模块，无 DOM 依赖，Node 可直接测试）。
+ * 全部子配置动画标识的唯一列表（纯模块，无 DOM 依赖，Node 可直接测试）。
  * 必须与后端 astrna/modules/dashboard_settings.py 注册表一一对应。
  */
 
@@ -15,6 +15,9 @@ export const SETTING_ANIMATION_IDS = [
   "output-max-chars",
   "output-clean-model",
   "output-persona",
+  "preamble-all-groups",
+  "preamble-all-private",
+  "preamble-umos",
   "wake-at-all",
   "wake-at-groups",
   "wake-reply-all",
