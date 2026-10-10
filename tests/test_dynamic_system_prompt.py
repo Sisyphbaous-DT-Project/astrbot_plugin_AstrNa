@@ -17,6 +17,7 @@ from astrna.modules.dynamic_system_prompt import (
     build_migration,
     build_takeover_rule,
     detect_system_prompt_diff,
+    is_heartflow_plugin,
 )
 
 
@@ -1110,3 +1111,397 @@ def test_dynamic_wrapper_reopens_above_wraps_outer_and_observes_once(
     assert req.system_prompt == "base\nDYNAMIC"
     assert len(module._observed_diffs[injection_key]) == 1
     run(runtime.terminate())
+
+
+class FakeHeartflowPlugin:
+    """模拟官方 Heartflow 插件原版 on_llm_request 的核心行为。"""
+
+    def __init__(self):
+        self.calls = []
+
+    async def on_llm_request(self, event, req):
+        self.calls.append((event, req))
+        if event.get_extra("heartflow_triggered", False):
+            req.system_prompt += "\n[心流主动回复] 固定说明"
+
+
+class HeartflowEvent:
+    """带 get_extra 的模拟事件，记录 Heartflow 的 extra 读取。"""
+
+    def __init__(self, triggered=False):
+        self.triggered = triggered
+        self.get_extra_calls = []
+
+    def get_extra(self, key, default=None):
+        self.get_extra_calls.append((key, default))
+        if key == "heartflow_triggered":
+            return self.triggered
+        return default
+
+
+def register_heartflow_plugin(registry, module_path, **metadata_kwargs):
+    metadata_kwargs.setdefault("name", "astrbot_plugin_Heartflow")
+    metadata_kwargs.setdefault("display_name", "心流主动回复")
+    return registry.add_plugin(module_path, **metadata_kwargs)
+
+
+def test_heartflow_identification_rules():
+    """精确识别：metadata 名称优先，路径只做完整插件根兜底。"""
+    assert is_heartflow_plugin(
+        SimpleNamespace(name="astrbot_plugin_Heartflow"), "plugins.whatever"
+    )
+    assert is_heartflow_plugin(
+        SimpleNamespace(name="AstrBot_Plugin_HeartFlow"), "plugins.whatever"
+    )
+    # 元数据明确声明为其他插件时，以元数据身份为准，路径不再兜底
+    assert not is_heartflow_plugin(
+        SimpleNamespace(name="astrbot_plugin_Heartflow_extra"),
+        "data.plugins.astrbot_plugin_Heartflow.main",
+    )
+    assert not is_heartflow_plugin(
+        SimpleNamespace(name="my_custom_fork"),
+        "data.plugins.astrbot_plugin_Heartflow.main",
+    )
+    # 元数据缺失或名称为空时，规范安装路径兜底
+    assert is_heartflow_plugin(None, "data.plugins.astrbot_plugin_Heartflow.main")
+    assert is_heartflow_plugin(None, "plugins.astrbot_plugin_Heartflow")
+    assert is_heartflow_plugin(
+        SimpleNamespace(name=""), "data.plugins.astrbot_plugin_heartflow.sub.mod"
+    )
+    # 相似名称、相似路径、任意包含 heartflow 的字符串均不匹配
+    assert not is_heartflow_plugin(None, "plugins.astrbot_plugin_Heartflow_extra.main")
+    assert not is_heartflow_plugin(None, "data.plugins.astrbot_plugin_Heartflow_extra")
+    assert not is_heartflow_plugin(None, "plugins.heartflow_helpers.main")
+    assert not is_heartflow_plugin(None, "myplugins.astrbot_plugin_Heartflow.main")
+    assert not is_heartflow_plugin(
+        None, "vendor.data.plugins.astrbot_plugin_Heartflow.main"
+    )
+    assert not is_heartflow_plugin(
+        None, "data.plugins.other.data.plugins.astrbot_plugin_Heartflow.main"
+    )
+    assert not is_heartflow_plugin(None, "plugins.not_heartflow.main")
+    assert not is_heartflow_plugin(None, "")
+    assert not is_heartflow_plugin(None, None)
+
+
+def test_install_excludes_heartflow_by_metadata_name_case_insensitive(
+    fakes,
+    fake_astrbot_llm_registry,
+):
+    """官方 metadata 名称及大小写变体被排除；目录改名但名称正确仍排除。"""
+    plugin = FakeHeartflowPlugin()
+    upper_plugin = FakeHeartflowPlugin()
+    original = plugin.on_llm_request
+    upper_original = upper_plugin.on_llm_request
+    register_heartflow_plugin(
+        fake_astrbot_llm_registry, "data.plugins.renamed_heartflow_dir.main"
+    )
+    register_heartflow_plugin(
+        fake_astrbot_llm_registry,
+        "plugins.another_renamed_dir.main",
+        name="ASTRBOT_PLUGIN_HEARTFLOW",
+    )
+    renamed = build_handler(
+        "on_llm_request",
+        original,
+        module_path="data.plugins.renamed_heartflow_dir.main",
+    )
+    upper = build_handler(
+        "on_llm_request",
+        upper_original,
+        module_path="plugins.another_renamed_dir.main",
+    )
+    fake_astrbot_llm_registry.handlers.extend([renamed, upper])
+
+    runtime = fakes.build_runtime({"optimize_dynamic_system_prompt": True})
+
+    assert renamed.handler is original
+    assert upper.handler is upper_original
+    assert runtime.dynamic_system_prompt._wrapped_handlers == {}
+    run(runtime.terminate())
+
+
+def test_install_excludes_heartflow_by_module_path_when_metadata_missing(
+    fakes,
+    fake_astrbot_llm_registry,
+):
+    """元数据缺失或名称为空时，规范安装模块路径兜底排除。"""
+    plugin = FakeHeartflowPlugin()
+    empty_name_plugin = FakeHeartflowPlugin()
+    original = plugin.on_llm_request
+    empty_name_original = empty_name_plugin.on_llm_request
+    # 元数据完全缺失
+    missing = build_handler(
+        "on_llm_request",
+        original,
+        module_path="data.plugins.astrbot_plugin_Heartflow.main",
+    )
+    # 元数据存在但名称为空
+    metadata = fake_astrbot_llm_registry.add_plugin(
+        "plugins.astrbot_plugin_Heartflow.main", display_name="心流主动回复"
+    )
+    metadata.name = ""
+    empty_name = build_handler(
+        "on_llm_request",
+        empty_name_original,
+        module_path="plugins.astrbot_plugin_Heartflow.main",
+    )
+    fake_astrbot_llm_registry.handlers.extend([missing, empty_name])
+
+    runtime = fakes.build_runtime({"optimize_dynamic_system_prompt": True})
+
+    assert missing.handler is original
+    assert empty_name.handler is empty_name_original
+    assert runtime.dynamic_system_prompt._wrapped_handlers == {}
+    run(runtime.terminate())
+
+
+def test_similar_plugins_are_not_excluded(
+    fakes,
+    fake_astrbot_llm_registry,
+):
+    """相似名称、相似路径、相同展示名称的其他插件不会被误排除。"""
+    async def extra_handler(event, req):
+        req.system_prompt += "dynamic"
+
+    async def helper_handler(event, req):
+        req.system_prompt += "dynamic"
+
+    async def same_display_handler(event, req):
+        req.system_prompt += "dynamic"
+
+    async def renamed_fork_handler(event, req):
+        req.system_prompt += "dynamic"
+
+    fake_astrbot_llm_registry.add_plugin("plugins.astrbot_plugin_Heartflow_extra")
+    fake_astrbot_llm_registry.add_plugin("plugins.heartflow_helpers")
+    fake_astrbot_llm_registry.add_plugin(
+        "plugins.some_other_plugin",
+        name="some_other_plugin",
+        display_name="心流主动回复",
+    )
+    # 元数据明确声明为其他插件，即使路径匹配 Heartflow 根也以元数据为准
+    fake_astrbot_llm_registry.add_plugin(
+        "data.plugins.astrbot_plugin_Heartflow.main",
+        name="my_custom_fork",
+    )
+    handlers = [
+        build_handler(
+            "extra_handler",
+            extra_handler,
+            module_path="plugins.astrbot_plugin_Heartflow_extra",
+        ),
+        build_handler(
+            "helper_handler",
+            helper_handler,
+            module_path="plugins.heartflow_helpers",
+        ),
+        build_handler(
+            "same_display_handler",
+            same_display_handler,
+            module_path="plugins.some_other_plugin",
+        ),
+        build_handler(
+            "renamed_fork_handler",
+            renamed_fork_handler,
+            module_path="data.plugins.astrbot_plugin_Heartflow.main",
+        ),
+    ]
+    fake_astrbot_llm_registry.handlers.extend(handlers)
+
+    runtime = fakes.build_runtime({"optimize_dynamic_system_prompt": True})
+
+    originals = [extra_handler, helper_handler, same_display_handler, renamed_fork_handler]
+    for entry, original in zip(handlers, originals, strict=True):
+        assert entry.handler is not original
+        assert getattr(entry.handler, "_astrna_dynamic_system_prompt_patch") is True
+    assert len(runtime.dynamic_system_prompt._wrapped_handlers) == 4
+    run(runtime.terminate())
+
+
+def test_excluded_heartflow_runs_natively_with_real_event_and_req(
+    fakes,
+    fake_astrbot_llm_registry,
+):
+    """排除后 Heartflow 按原生流程运行：event/req 原样传入，行为不被改写。"""
+    plugin = FakeHeartflowPlugin()
+    original = plugin.on_llm_request
+    module_path = "data.plugins.astrbot_plugin_Heartflow.main"
+    register_heartflow_plugin(fake_astrbot_llm_registry, module_path)
+    handler = build_handler("on_llm_request", original, module_path=module_path)
+    fake_astrbot_llm_registry.handlers.append(handler)
+    kv_store = fakes.KVStore()
+    runtime = fakes.build_runtime(
+        {"optimize_dynamic_system_prompt": True},
+        kv_store=kv_store,
+    )
+
+    assert handler.handler is original
+    assert runtime.dynamic_system_prompt._wrapped_handlers == {}
+
+    triggered_event = HeartflowEvent(triggered=True)
+    req = fakes.Request(contexts=[])
+    req.system_prompt = "base"
+    run(handler.handler(triggered_event, req))
+
+    assert plugin.calls == [(triggered_event, req)]
+    assert triggered_event.get_extra_calls == [("heartflow_triggered", False)]
+    assert req.system_prompt == "base\n[心流主动回复] 固定说明"
+    assert req.extra_user_content_parts == []
+
+    idle_event = HeartflowEvent(triggered=False)
+    idle_req = fakes.Request(contexts=[])
+    idle_req.system_prompt = "base"
+    run(handler.handler(idle_event, idle_req))
+
+    assert plugin.calls == [(triggered_event, req), (idle_event, idle_req)]
+    assert idle_event.get_extra_calls == [("heartflow_triggered", False)]
+    assert idle_req.system_prompt == "base"
+    assert idle_req.extra_user_content_parts == []
+    assert kv_store.data == {}
+    run(runtime.terminate())
+
+
+def test_excluded_heartflow_survives_host_rebind_after_disable_enable(
+    fakes,
+    fake_astrbot_llm_registry,
+):
+    """已绑定旧实例的入口重新绑定新实例后，参数不错位且不再调用旧实例。"""
+    old_plugin = FakeHeartflowPlugin()
+    plugin = FakeHeartflowPlugin()
+    original_handler = partial(FakeHeartflowPlugin.on_llm_request, old_plugin)
+    module_path = "data.plugins.astrbot_plugin_Heartflow.main"
+    register_heartflow_plugin(fake_astrbot_llm_registry, module_path)
+    handler = build_handler(
+        "on_llm_request",
+        original_handler,
+        module_path=module_path,
+    )
+    fake_astrbot_llm_registry.handlers.append(handler)
+    runtime = fakes.build_runtime({"optimize_dynamic_system_prompt": True})
+
+    assert handler.handler is original_handler
+
+    # 宿主先解开保留入口的旧 partial，再绑定重新创建的插件实例。
+    current = handler.handler
+    raw = current.func if isinstance(current, partial) else current
+    handler.handler = partial(raw, plugin)
+    rebound_handler = handler.handler
+
+    event = HeartflowEvent(triggered=True)
+    req = fakes.Request(contexts=[])
+    req.system_prompt = "base"
+    run(handler.handler(event, req))
+
+    assert old_plugin.calls == []
+    assert len(plugin.calls) == 1
+    assert plugin.calls[0][0] is event
+    assert plugin.calls[0][1] is req
+    assert event.get_extra_calls == [("heartflow_triggered", False)]
+    assert req.system_prompt == "base\n[心流主动回复] 固定说明"
+    assert req.extra_user_content_parts == []
+    run(runtime.terminate())
+    assert handler.handler is rebound_handler
+
+
+def test_normal_plugin_still_optimized_alongside_excluded_heartflow(
+    fakes,
+    fake_astrbot_llm_registry,
+):
+    """普通插件仍被包装、观察动态追加并迁移，Heartflow 不进入接管状态。"""
+    plugin = FakeHeartflowPlugin()
+    heartflow_original = plugin.on_llm_request
+    heartflow_path = "data.plugins.astrbot_plugin_Heartflow.main"
+    register_heartflow_plugin(fake_astrbot_llm_registry, heartflow_path)
+    heartflow = build_handler(
+        "on_llm_request", heartflow_original, module_path=heartflow_path
+    )
+
+    counter = 0
+
+    async def dynamic_handler(event, req):
+        nonlocal counter
+        counter += 1
+        req.system_prompt += f"\n动态片段 {counter}"
+
+    fake_astrbot_llm_registry.add_plugin("plugins.dynamic_demo", name="dynamic_demo")
+    normal = build_handler(
+        "dynamic_handler", dynamic_handler, module_path="plugins.dynamic_demo"
+    )
+    fake_astrbot_llm_registry.handlers.extend([heartflow, normal])
+    kv_store = fakes.KVStore()
+    runtime = fakes.build_runtime(
+        {"optimize_dynamic_system_prompt": True},
+        kv_store=kv_store,
+    )
+
+    assert heartflow.handler is heartflow_original
+    assert normal.handler is not dynamic_handler
+
+    for _ in range(3):
+        req = fakes.Request(contexts=[])
+        req.system_prompt = "base"
+        run(normal.handler(fakes.Event(), req))
+
+    # Heartflow 调用不干扰普通插件的观察计数，自身也不被迁移
+    heartflow_req = fakes.Request(contexts=[])
+    heartflow_req.system_prompt = "base"
+    run(heartflow.handler(HeartflowEvent(triggered=True), heartflow_req))
+    assert heartflow_req.system_prompt == "base\n[心流主动回复] 固定说明"
+    assert heartflow_req.extra_user_content_parts == []
+
+    fourth_req = fakes.Request(contexts=[])
+    fourth_req.system_prompt = "base"
+    run(normal.handler(fakes.Event(), fourth_req))
+
+    assert fourth_req.system_prompt == "base"
+    assert part_texts(fourth_req) == ["\n动态片段 4"]
+    persisted = kv_store.data[DYNAMIC_SYSTEM_PROMPT_STATE_KEY]["handlers"]
+    assert all(key.startswith("dynamic_demo::") for key in persisted)
+    run(runtime.terminate())
+
+
+def test_heartflow_exclusion_survives_toggle_and_reinstall(
+    fakes,
+    fake_astrbot_llm_registry,
+):
+    """开关切换与重复安装后，Heartflow 仍被排除，普通插件恢复原有行为。"""
+    plugin = FakeHeartflowPlugin()
+    heartflow_original = plugin.on_llm_request
+    heartflow_path = "data.plugins.astrbot_plugin_Heartflow.main"
+    register_heartflow_plugin(fake_astrbot_llm_registry, heartflow_path)
+    heartflow = build_handler(
+        "on_llm_request", heartflow_original, module_path=heartflow_path
+    )
+
+    async def dynamic_handler(event, req):
+        req.system_prompt += "dynamic"
+
+    fake_astrbot_llm_registry.add_plugin("plugins.toggle_demo", name="toggle_demo")
+    normal = build_handler(
+        "dynamic_handler", dynamic_handler, module_path="plugins.toggle_demo"
+    )
+    fake_astrbot_llm_registry.handlers.extend([heartflow, normal])
+    runtime = fakes.build_runtime({"optimize_dynamic_system_prompt": True})
+
+    assert heartflow.handler is heartflow_original
+    assert normal.handler is not dynamic_handler
+
+    runtime.config["optimize_dynamic_system_prompt"] = False
+    run(runtime.sanitize_request(fakes.Event(), fakes.Request([])))
+
+    assert normal.handler is dynamic_handler
+    assert heartflow.handler is heartflow_original
+    assert runtime.dynamic_system_prompt._wrapped_handlers == {}
+
+    runtime.config["optimize_dynamic_system_prompt"] = True
+    run(runtime.sanitize_request(fakes.Event(), fakes.Request([])))
+
+    assert heartflow.handler is heartflow_original
+    assert normal.handler is not dynamic_handler
+    assert getattr(normal.handler, "_astrna_dynamic_system_prompt_patch") is True
+    assert len(runtime.dynamic_system_prompt._wrapped_handlers) == 1
+    run(runtime.terminate())
+
+    assert heartflow.handler is heartflow_original
+    assert normal.handler is dynamic_handler

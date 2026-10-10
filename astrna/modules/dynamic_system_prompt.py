@@ -23,6 +23,8 @@ except Exception:  # pragma: no cover
 TAKEOVER_THRESHOLD = 3
 DYNAMIC_SYSTEM_PROMPT_STATE_KEY = "dynamic_system_prompt_state_v3"
 ASTRNA_PLUGIN_NAME = "astrbot_plugin_AstrNa"
+# 官方 Heartflow 插件（心流主动回复）的 metadata 名称，统一小写后做大小写无关比较。
+HEARTFLOW_PLUGIN_NAME = "astrbot_plugin_heartflow"
 
 
 @dataclass(frozen=True)
@@ -313,6 +315,8 @@ class DynamicSystemPromptModule:
         metadata = star_map.get(module_path)
         if getattr(metadata, "reserved", False):
             return False
+        if is_heartflow_plugin(metadata, module_path):
+            return False
         plugin_name = getattr(metadata, "name", None)
         display_name = getattr(metadata, "display_name", None)
         if (
@@ -369,6 +373,34 @@ def load_star_map() -> dict[str, Any]:
     except Exception:
         return {}
     return star_map
+
+
+def is_heartflow_plugin(metadata: Any, module_path: Any) -> bool:
+    """判断 handler 是否属于官方 Heartflow 插件（缓存优化精确排除对象）。
+
+    Heartflow 被 AstrBot 禁用后重新启用时，宿主会把插件实例直接绑定到
+    保留下来的注册入口上；如果入口已被本模块包装，实例会被错位传进
+    event 位置，导致 get_extra 等调用报错。因此在安装包装前精确跳过。
+
+    识别规则：
+    - 元数据有非空 name 时，只对完整名称做大小写无关比较，以元数据身份为准；
+    - 元数据缺失或名称为空时，用规范安装模块路径兜底；
+    - 不按 display_name、中文名、类名或任意包含 heartflow 的字符串匹配。
+    """
+    plugin_name = str(getattr(metadata, "name", "") or "").strip()
+    if plugin_name:
+        return plugin_name.lower() == HEARTFLOW_PLUGIN_NAME
+    return module_path_has_heartflow_root(module_path)
+
+
+def module_path_has_heartflow_root(module_path: Any) -> bool:
+    """模块路径是否以完整插件根 data.plugins./plugins. + Heartflow 目录开头。"""
+    path = str(module_path or "").lower()
+    roots = (
+        f"data.plugins.{HEARTFLOW_PLUGIN_NAME}",
+        f"plugins.{HEARTFLOW_PLUGIN_NAME}",
+    )
+    return any(path == root or path.startswith(f"{root}.") for root in roots)
 
 
 async def call_handler_with_compatible_args(
