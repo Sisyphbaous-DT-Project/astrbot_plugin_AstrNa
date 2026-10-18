@@ -8,6 +8,7 @@ import pytest
 
 from astrna.modules.output_length_limiter import (
     OutputLengthLimiterModule,
+    is_cron_event,
     parse_whitelist_umos,
 )
 from astrna.modules.send_message_to_user import (
@@ -316,6 +317,93 @@ def test_live_event_is_not_disabled_or_limited(astrbot_runner_modules):
     assert actual is response
     assert provider.calls == []
     asyncio.run(runtime.terminate())
+
+
+class DummyCronEvent(DummyEvent):
+    """模拟 AstrBot 定时任务合成事件：平台名固定为 cron。"""
+
+    def get_platform_name(self):
+        return "cron"
+
+
+class DummySilentNightEvent(DummyCronEvent):
+    """模拟 AstrHe 夜间静默事件：沿用定时任务事件，只把发送改为丢弃。"""
+
+    async def send(self, message):
+        return None
+
+
+class DummyPlatformEvent(DummyEvent):
+    def __init__(self, platform_name, umo="aiocqhttp:GroupMessage:123456"):
+        super().__init__(umo)
+        self.platform_name = platform_name
+
+    def get_platform_name(self):
+        return self.platform_name
+
+
+def test_cron_events_keep_streaming_and_response_unchanged(astrbot_runner_modules):
+    provider = DummyProvider("不会用到")
+    runtime = build_runtime(
+        {
+            "output_length_limit_enabled": True,
+            "output_length_limit_provider_id": "clean",
+            "output_length_limit_max_chars": 5,
+        },
+        providers={"clean": provider},
+    )
+
+    for event_cls in (DummyCronEvent, DummySilentNightEvent):
+        event = event_cls(umo="default:GroupMessage:762038320")
+        response = long_response("夜间复盘报告" * 200)
+        runner = build_runner(response, event=event)
+
+        asyncio.run(collect_internal_process(astrbot_runner_modules, event))
+        [actual] = asyncio.run(collect_runner_responses(runner))
+
+        assert event.get_extra("enable_streaming") is None
+        assert actual is response
+        assert actual.completion_text == "夜间复盘报告" * 200
+    assert provider.calls == []
+    asyncio.run(runtime.terminate())
+
+
+def test_chat_events_beside_cron_are_still_limited(astrbot_runner_modules):
+    provider = DummyProvider("清洗后")
+    runtime = build_runtime(
+        {
+            "output_length_limit_enabled": True,
+            "output_length_limit_provider_id": "clean",
+            "output_length_limit_max_chars": 5,
+        },
+        providers={"clean": provider},
+    )
+
+    for event in (DummyEvent(), DummyPlatformEvent("aiocqhttp")):
+        runner = build_runner(long_response(), event=event)
+
+        asyncio.run(collect_internal_process(astrbot_runner_modules, event))
+        [actual] = asyncio.run(collect_runner_responses(runner))
+
+        assert event.get_extra("enable_streaming") is False
+        assert actual.completion_text == "清洗后"
+    assert len(provider.calls) == 2
+    asyncio.run(runtime.terminate())
+
+
+def test_cron_event_detection_rules():
+    class BrokenPlatformEvent(DummyEvent):
+        def get_platform_name(self):
+            raise RuntimeError("broken")
+
+    assert is_cron_event(DummyCronEvent())
+    assert is_cron_event(DummySilentNightEvent())
+    assert is_cron_event(DummyPlatformEvent("CRON"))
+    assert not is_cron_event(DummyPlatformEvent("aiocqhttp"))
+    assert not is_cron_event(DummyPlatformEvent(None))
+    assert not is_cron_event(DummyEvent())
+    assert not is_cron_event(BrokenPlatformEvent())
+    assert not is_cron_event(None)
 
 
 def test_multiple_whitelist_umos_keep_streaming_and_response_unchanged(

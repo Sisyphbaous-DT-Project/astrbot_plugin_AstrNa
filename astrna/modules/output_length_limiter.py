@@ -333,7 +333,12 @@ class OutputLengthLimiterModule:
         runner_cls._resolve_tool_exec = astrna_resolve_tool_exec
 
     def prepare_event_for_process(self, event: Any) -> None:
-        if event is None or self.is_event_whitelisted(event) or is_live_event(event):
+        if (
+            event is None
+            or self.is_event_whitelisted(event)
+            or is_live_event(event)
+            or is_cron_event(event)
+        ):
             return
         setter = getattr(event, "set_extra", None)
         if callable(setter):
@@ -399,7 +404,7 @@ class OutputLengthLimiterModule:
         event = get_runner_event(runner)
         if event is None or self.is_event_whitelisted(event):
             return False
-        if is_live_event(event):
+        if is_live_event(event) or is_cron_event(event):
             return False
         if getattr(llm_response, "is_chunk", False):
             return False
@@ -776,6 +781,24 @@ def get_runner_event(runner: Any) -> Any | None:
 
 def is_live_event(event: Any) -> bool:
     return safe_event_extra(event, "action_type") == "live"
+
+
+def is_cron_event(event: Any) -> bool:
+    """定时任务事件不做限制。
+
+    AstrBot 定时任务及后台任务完成后唤醒主 Agent 时使用平台名为 cron 的合成事件，
+    要发给用户的内容通过工具发送，最终文字只写入历史备注；
+    AstrHe 夜间复盘的各个 Agent 沿用该事件的子类，最终文字是交给插件的报告。
+    两者的最终文字都不是聊天回复，限制字数只会损坏内容。
+    """
+    getter = getattr(event, "get_platform_name", None)
+    if not callable(getter):
+        return False
+    try:
+        platform_name = getter()
+    except Exception:  # noqa: BLE001
+        return False
+    return isinstance(platform_name, str) and platform_name.lower() == "cron"
 
 
 def safe_event_extra(event: Any, key: str, default: Any = None) -> Any:

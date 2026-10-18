@@ -25,6 +25,8 @@ DYNAMIC_SYSTEM_PROMPT_STATE_KEY = "dynamic_system_prompt_state_v3"
 ASTRNA_PLUGIN_NAME = "astrbot_plugin_AstrNa"
 # 官方 Heartflow 插件（心流主动回复）的 metadata 名称，统一小写后做大小写无关比较。
 HEARTFLOW_PLUGIN_NAME = "astrbot_plugin_heartflow"
+# AstrHe 插件（夜间复盘与白天规划注入）的 metadata 名称，比较方式同上。
+ASTRHE_PLUGIN_NAME = "astrbot_plugin_astrhe"
 
 
 @dataclass(frozen=True)
@@ -315,7 +317,10 @@ class DynamicSystemPromptModule:
         metadata = star_map.get(module_path)
         if getattr(metadata, "reserved", False):
             return False
-        if is_heartflow_plugin(metadata, module_path):
+        if is_heartflow_plugin(metadata, module_path) or is_astrhe_plugin(
+            metadata,
+            module_path,
+        ):
             return False
         plugin_name = getattr(metadata, "name", None)
         display_name = getattr(metadata, "display_name", None)
@@ -387,18 +392,31 @@ def is_heartflow_plugin(metadata: Any, module_path: Any) -> bool:
     - 元数据缺失或名称为空时，用规范安装模块路径兜底；
     - 不按 display_name、中文名、类名或任意包含 heartflow 的字符串匹配。
     """
-    plugin_name = str(getattr(metadata, "name", "") or "").strip()
-    if plugin_name:
-        return plugin_name.lower() == HEARTFLOW_PLUGIN_NAME
-    return module_path_has_heartflow_root(module_path)
+    return matches_plugin_identity(metadata, module_path, HEARTFLOW_PLUGIN_NAME)
 
 
-def module_path_has_heartflow_root(module_path: Any) -> bool:
-    """模块路径是否以完整插件根 data.plugins./plugins. + Heartflow 目录开头。"""
+def is_astrhe_plugin(metadata: Any, module_path: Any) -> bool:
+    """判断 handler 是否属于 AstrHe 插件（缓存优化精确排除对象）。
+
+    AstrHe 的请求钩子按原生流程运行，不做观察与迁移；识别规则与 Heartflow 相同。
+    """
+    return matches_plugin_identity(metadata, module_path, ASTRHE_PLUGIN_NAME)
+
+
+def matches_plugin_identity(metadata: Any, module_path: Any, plugin_name: str) -> bool:
+    """元数据名称优先做完整的大小写无关比较，名称缺失时按规范安装路径兜底。"""
+    metadata_name = str(getattr(metadata, "name", "") or "").strip()
+    if metadata_name:
+        return metadata_name.lower() == plugin_name
+    return module_path_has_plugin_root(module_path, plugin_name)
+
+
+def module_path_has_plugin_root(module_path: Any, plugin_name: str) -> bool:
+    """模块路径是否以完整插件根 data.plugins./plugins. + 插件目录开头。"""
     path = str(module_path or "").lower()
     roots = (
-        f"data.plugins.{HEARTFLOW_PLUGIN_NAME}",
-        f"plugins.{HEARTFLOW_PLUGIN_NAME}",
+        f"data.plugins.{plugin_name}",
+        f"plugins.{plugin_name}",
     )
     return any(path == root or path.startswith(f"{root}.") for root in roots)
 

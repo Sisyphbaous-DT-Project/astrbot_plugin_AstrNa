@@ -17,6 +17,7 @@ from astrna.modules.dynamic_system_prompt import (
     build_migration,
     build_takeover_rule,
     detect_system_prompt_diff,
+    is_astrhe_plugin,
     is_heartflow_plugin,
 )
 
@@ -1504,4 +1505,116 @@ def test_heartflow_exclusion_survives_toggle_and_reinstall(
     run(runtime.terminate())
 
     assert heartflow.handler is heartflow_original
+    assert normal.handler is dynamic_handler
+
+
+class FakeAstrHePlugin:
+    """模拟 AstrHe 的白天规划注入钩子：每轮往请求追加内容。"""
+
+    def __init__(self):
+        self.calls = []
+
+    async def inject_plan(self, event, req):
+        self.calls.append((event, req))
+        req.system_prompt += f"\n[AstrHe] 今日规划 {len(self.calls)}"
+
+
+def register_astrhe_plugin(registry, module_path, **metadata_kwargs):
+    metadata_kwargs.setdefault("name", "astrbot_plugin_astrhe")
+    metadata_kwargs.setdefault("display_name", "AstrHe")
+    return registry.add_plugin(module_path, **metadata_kwargs)
+
+
+def test_astrhe_identification_rules():
+    """元数据名称优先、大小写无关，名称缺失时按规范安装路径兜底，相似名称不误伤。"""
+    assert is_astrhe_plugin(SimpleNamespace(name="astrbot_plugin_astrhe"), "plugins.x")
+    assert is_astrhe_plugin(
+        SimpleNamespace(name="ASTRBOT_PLUGIN_AstrHe"), "data.plugins.renamed.main"
+    )
+    assert is_astrhe_plugin(None, "data.plugins.astrbot_plugin_astrhe.main")
+    assert is_astrhe_plugin(None, "plugins.astrbot_plugin_astrhe")
+    assert is_astrhe_plugin(
+        SimpleNamespace(name=""), "data.plugins.astrbot_plugin_AstrHe.night.pipeline"
+    )
+    # 元数据明确声明为其他插件时以元数据为准
+    assert not is_astrhe_plugin(
+        SimpleNamespace(name="my_astrhe_fork"),
+        "data.plugins.astrbot_plugin_astrhe.main",
+    )
+    assert not is_astrhe_plugin(
+        SimpleNamespace(name="astrbot_plugin_astrhe_extra"), "plugins.x"
+    )
+    assert not is_astrhe_plugin(None, "plugins.astrbot_plugin_astrhe_extra.main")
+    assert not is_astrhe_plugin(None, "plugins.astrhe_helpers.main")
+    assert not is_astrhe_plugin(
+        None, "vendor.data.plugins.astrbot_plugin_astrhe.main"
+    )
+    assert not is_astrhe_plugin(None, "")
+    assert not is_astrhe_plugin(None, None)
+    # 两个排除对象互不混淆
+    assert not is_astrhe_plugin(SimpleNamespace(name="astrbot_plugin_Heartflow"), "")
+    assert not is_heartflow_plugin(SimpleNamespace(name="astrbot_plugin_astrhe"), "")
+
+
+def test_astrhe_runs_natively_while_normal_plugin_is_still_optimized(
+    fakes,
+    fake_astrbot_llm_registry,
+):
+    """AstrHe 钩子保持原对象、按原生流程运行且不被迁移；普通插件照常接管。"""
+    plugin = FakeAstrHePlugin()
+    astrhe_original = plugin.inject_plan
+    astrhe_path = "data.plugins.astrbot_plugin_astrhe.main"
+    register_astrhe_plugin(fake_astrbot_llm_registry, astrhe_path)
+    astrhe = build_handler("inject_plan", astrhe_original, module_path=astrhe_path)
+
+    counter = 0
+
+    async def dynamic_handler(event, req):
+        nonlocal counter
+        counter += 1
+        req.system_prompt += f"\n动态片段 {counter}"
+
+    fake_astrbot_llm_registry.add_plugin("plugins.dynamic_demo", name="dynamic_demo")
+    normal = build_handler(
+        "dynamic_handler", dynamic_handler, module_path="plugins.dynamic_demo"
+    )
+    fake_astrbot_llm_registry.handlers.extend([astrhe, normal])
+    kv_store = fakes.KVStore()
+    runtime = fakes.build_runtime(
+        {"optimize_dynamic_system_prompt": True},
+        kv_store=kv_store,
+    )
+
+    assert astrhe.handler is astrhe_original
+    assert normal.handler is not dynamic_handler
+
+    event = fakes.Event()
+    for index in range(1, 5):
+        astrhe_req = fakes.Request(contexts=[])
+        astrhe_req.system_prompt = "base"
+        run(astrhe.handler(event, astrhe_req))
+        assert astrhe_req.system_prompt == f"base\n[AstrHe] 今日规划 {index}"
+        assert astrhe_req.extra_user_content_parts == []
+    assert [call[0] for call in plugin.calls] == [event] * 4
+
+    for _ in range(4):
+        req = fakes.Request(contexts=[])
+        req.system_prompt = "base"
+        run(normal.handler(fakes.Event(), req))
+    assert req.system_prompt == "base"
+    assert part_texts(req) == ["\n动态片段 4"]
+    persisted = kv_store.data[DYNAMIC_SYSTEM_PROMPT_STATE_KEY]["handlers"]
+    assert all(key.startswith("dynamic_demo::") for key in persisted)
+
+    runtime.config["optimize_dynamic_system_prompt"] = False
+    run(runtime.sanitize_request(fakes.Event(), fakes.Request([])))
+    runtime.config["optimize_dynamic_system_prompt"] = True
+    run(runtime.sanitize_request(fakes.Event(), fakes.Request([])))
+
+    assert astrhe.handler is astrhe_original
+    assert getattr(normal.handler, "_astrna_dynamic_system_prompt_patch") is True
+    assert len(runtime.dynamic_system_prompt._wrapped_handlers) == 1
+    run(runtime.terminate())
+
+    assert astrhe.handler is astrhe_original
     assert normal.handler is dynamic_handler
