@@ -527,4 +527,4 @@ def test_readme_current_version_matches_metadata():
     version = str(metadata["version"])
     label = "当前测试版" if "beta" in version else "当前正式版"
     assert f"{label}：`{version}`" in readme
-    assert "当前已测试兼容 AstrBot 版本：`4.29.1`" in readme
+    assert "当前已测试兼容 AstrBot 版本：`4.29.3`" in readme

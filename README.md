@@ -11,7 +11,7 @@ AstrNa 是一款面向 AstrBot 的优化插件，目标是在不修改 AstrBot C
 
 🎉 AstrNa 当前正式版：`1.7.3`
 
-当前已测试兼容 AstrBot 版本：`4.29.1`
+当前已测试兼容 AstrBot 版本：`4.29.3`
 
 - 仓库地址：[Sisyphbaous-DT-Project/astrbot_plugin_AstrNa](https://github.com/Sisyphbaous-DT-Project/astrbot_plugin_AstrNa)
 - 作者主页：[Sisyphbaous-DT-Project](https://github.com/Sisyphbaous-DT-Project)
@@ -543,7 +543,7 @@ GitHub Token 是可选的。留空时只能生成草稿，不能自动提交。�
 
 ## 兼容性
 
-AstrNa 主要面向 AstrBot 当前 4.x 版本。当前正式版 `1.7.3` 已在 AstrBot `4.29.1` 源码环境中完成全量回归；旧宿主缺少新入口时按能力保留原有处理，具体验证结果见下方说明。
+AstrNa 主要面向 AstrBot 当前 4.x 版本。当前正式版 `1.7.3` 已在 AstrBot `4.29.3` 源码环境中完成全量回归；旧宿主缺少新入口时按能力保留原有处理，具体验证结果见下方说明。
 
 部分能力依赖平台：
 
@@ -567,7 +567,7 @@ AstrNa 主要面向 AstrBot 当前 4.x 版本。当前正式版 `1.7.3` 已在 A
 
 ## 验证状态
 
-本版在 AstrBot `4.29.1` 源码环境中验证。绑定源码时，`ASTRBOT_SOURCE_PATH` 与 `PYTHONPATH` 必须同时指向目标版本，避免测试收集阶段提前缓存其他宿主。下面的 `/path/to/AstrBot` 应替换为实际源码目录，Python 环境需安装该宿主的测试依赖：
+本版在 AstrBot `4.29.3` 源码环境中验证。绑定源码时，`ASTRBOT_SOURCE_PATH` 与 `PYTHONPATH` 必须同时指向目标版本，避免测试收集阶段提前缓存其他宿主。下面的 `/path/to/AstrBot` 应替换为实际源码目录，Python 环境需安装该宿主的测试依赖：
 
 ```bash
 TMPDIR=/tmp PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q -rs -p no:cacheprovider
@@ -581,7 +581,7 @@ git diff --check
 
 本轮（`1.7.3`）让「输出字数限制」跳过平台名为 `cron` 的定时任务事件，修复 AstrHe 夜间复盘的汇报、审稿等内部 Agent 最终文字被清洗成短句的问题；「AstrBot插件缓存优化」与 Heartflow 共用同一套精确识别规则，自动排除 AstrHe。
 
-全量：绑定 `4.29.1` 源码 `1147 passed`，无跳过（`4.29.0` 结果相同）；明确导入只读导出的 `4.28.2` 源码 `1132 passed, 2 skipped`；未指定源码的参考 venv 环境 `1021 passed, 17 skipped`（各 57 条既有弃用警告）。新增 19 项：定时任务与 AstrHe 同构静默事件不限制且不关闭流式、普通平台事件照常限制、事件识别规则；AstrHe 识别规则与相似名称不误伤、钩子保持原对象并按原生流程运行、普通插件照常迁移及开关切换；另用真实 `Context.tool_loop_agent` 按 AstrHe 夜间调用方式，在普通与流式两种模式下回归纯文本、真实工具执行器的多步工具循环与 skills_like 二次询问退回三条路径，并以普通平台事件作对照，新旧宿主均通过。`ruff`、语法、结构化数据、LF 与 diff 检查通过；验证使用本地模拟，未调用真实模型或进行线上实发。
+全量：绑定 `4.29.3` 源码 `1147 passed`，无跳过（`4.29.1`、`4.29.0` 结果相同）；明确导入只读导出的 `4.28.2` 源码 `1132 passed, 2 skipped`；未指定源码的参考 venv 环境 `1021 passed, 17 skipped`（各 57 条既有弃用警告）。新增 19 项：定时任务与 AstrHe 同构静默事件不限制且不关闭流式、普通平台事件照常限制、事件识别规则；AstrHe 识别规则与相似名称不误伤、钩子保持原对象并按原生流程运行、普通插件照常迁移及开关切换；另用真实 `Context.tool_loop_agent` 按 AstrHe 夜间调用方式，在普通与流式两种模式下回归纯文本、真实工具执行器的多步工具循环与 skills_like 二次询问退回三条路径，并以普通平台事件作对照，新旧宿主均通过。`ruff`、语法、结构化数据、LF 与 diff 检查通过；验证使用本地模拟，未调用真实模型或进行线上实发。
 
 历史（`1.7.2`）为「AstrBot插件缓存优化」增加 Heartflow 精确排除，保持其原生提示词注入行为，避免禁用后重新启用时的入口绑定冲突。补齐规范插件根识别、旧实例重新绑定新实例、普通插件共存与开关切换的回归，并明确普通更新和已经报错时的热重载恢复步骤。
 
