@@ -72,6 +72,18 @@ def resp(kind, text=""):
     return SimpleNamespace(type=kind, data={"chain": FakeChain(text)})
 
 
+def completed(text="", *, status="completed", parts=None):
+    """新版 message.completed 事件：普通文字段。"""
+    if parts is None:
+        parts = (SimpleNamespace(type="plain", text=text),) if text else ()
+    return SimpleNamespace(type="message.completed", status=status, content=parts)
+
+
+def new_event(kind, *, status=None):
+    """新版其余事件（tool.started / tool.rejected / request.finished 等）。"""
+    return SimpleNamespace(type=kind, status=status)
+
+
 class FakeEvent:
     def __init__(self, umo="aiocqhttp:GroupMessage:10001", message_type_value=None):
         self.unified_msg_origin = umo
@@ -86,13 +98,23 @@ class FakeEvent:
 class FakeRunner:
     """模拟 ToolLoopAgentRunner：script 依次 yield，"DONE" 标记置完成态。"""
 
-    def __init__(self, script, *, streaming=False, event=None, aborted=False, func_tool=None):
+    def __init__(
+        self,
+        script,
+        *,
+        streaming=False,
+        event=None,
+        aborted=False,
+        func_tool=None,
+        finish_done=True,
+    ):
         self.script = list(script)
         self.streaming = streaming
         self.event = event
         self.run_context = SimpleNamespace(context=SimpleNamespace(event=event))
         self.req = SimpleNamespace(func_tool=func_tool if func_tool is not None else object())
         self.aborted = aborted
+        self.finish_done = finish_done
         self._done = False
         self.exhausted = False
         self.closed_early = False
@@ -106,7 +128,8 @@ class FakeRunner:
                 if isinstance(item, BaseException):
                     raise item
                 yield item
-            self._done = True
+            if self.finish_done:
+                self._done = True
             self.exhausted = True
         finally:
             if not self.exhausted:
@@ -393,6 +416,200 @@ def test_held_text_length_never_logs_original_text(module_factory):
     module = install_module(module_factory, umos=["aiocqhttp:GroupMessage:10001"])
     runner = FakeRunner(
         [llm_text("这句过场白绝不能进日志"), resp("tool_call"), "DONE"],
+        event=FakeEvent(),
+    )
+    run_step(runner)
+    blob = str(module.logger.debugs)
+    assert "这句过场白绝不能进日志" not in blob
+    assert module.logger.debugs, "应记录一条只含字数的 debug 日志"
+
+
+# ----------------------------------------------------------------------
+# AstrBot 4.30+ 事件流（message.completed / tool.started / request.finished）
+# ----------------------------------------------------------------------
+
+
+def test_new_event_preamble_before_tool_started_is_suppressed(module_factory):
+    install_module(module_factory, umos=["aiocqhttp:GroupMessage:10001"])
+    runner = FakeRunner(
+        [
+            completed("我去查一下"),
+            new_event("tool.started"),
+            new_event("tool.finished"),
+            "DONE",
+            completed("最终回答"),
+        ],
+        event=FakeEvent(),
+    )
+    outputs = run_step(runner)
+    assert [item.type for item in outputs] == [
+        "tool.started",
+        "tool.finished",
+        "message.completed",
+    ]
+    texts = [item.content[0].text for item in outputs if item.type == "message.completed"]
+    assert texts == ["最终回答"]
+
+
+def test_new_event_final_answer_released_immediately(module_factory):
+    install_module(module_factory, umos=["aiocqhttp:GroupMessage:10001"])
+    runner = FakeRunner(
+        ["DONE", completed("最终回答"), new_event("usage.updated")],
+        event=FakeEvent(),
+    )
+    kinds = [item.type for item in run_step(runner)]
+    # 最终回答当场放行，不被扣到步末，也不影响后续统计事件。
+    assert kinds == ["message.completed", "usage.updated"]
+
+
+def test_new_event_tool_rejected_drops_preamble(module_factory):
+    install_module(module_factory, umos=["aiocqhttp:GroupMessage:10001"])
+    runner = FakeRunner(
+        [completed("我去查一下"), new_event("tool.rejected"), "DONE"],
+        event=FakeEvent(),
+    )
+    outputs = run_step(runner)
+    assert [item.type for item in outputs] == ["tool.rejected"]
+
+
+def test_new_event_request_failed_drops_preamble(module_factory):
+    install_module(module_factory, umos=["aiocqhttp:GroupMessage:10001"])
+    runner = FakeRunner(
+        [completed("我去查一下"), new_event("request.finished", status="failed")],
+        event=FakeEvent(),
+    )
+    outputs = run_step(runner)
+    assert [item.type for item in outputs] == ["request.finished"]
+
+
+def test_new_event_cancelled_message_drops_preamble(module_factory):
+    install_module(module_factory, umos=["aiocqhttp:GroupMessage:10001"])
+    runner = FakeRunner(
+        [
+            completed("我去查一下"),
+            completed("已中断", status="cancelled"),
+            "DONE",
+        ],
+        event=FakeEvent(),
+        aborted=True,
+    )
+    outputs = run_step(runner)
+    texts = [item.content[0].text for item in outputs if item.type == "message.completed"]
+    # 取消段原样放行（宿主自己的中断提示），扣住的过场白不补发。
+    assert texts == ["已中断"]
+
+
+def test_new_event_skills_like_fallback_releases_only_last(module_factory):
+    install_module(module_factory, umos=["aiocqhttp:GroupMessage:10001"])
+    runner = FakeRunner(
+        [
+            completed("过场白"),
+            new_event("request.started"),
+            new_event("request.finished", status="completed"),
+            completed("退回回答"),
+            "DONE",
+        ],
+        event=FakeEvent(),
+    )
+    texts = [
+        item.content[0].text
+        for item in run_step(runner)
+        if item.type == "message.completed"
+    ]
+    assert texts == ["退回回答"]
+
+
+def test_new_event_empty_fallback_releases_preamble(module_factory):
+    """二次询问与修复重询都退回空回答：只扣住一段，保守放行（与原生一致）。"""
+    install_module(module_factory, umos=["aiocqhttp:GroupMessage:10001"])
+    runner = FakeRunner(
+        [
+            completed("过场白"),
+            new_event("request.started"),
+            new_event("request.finished", status="completed"),
+            "DONE",
+        ],
+        event=FakeEvent(),
+    )
+    texts = [
+        item.content[0].text
+        for item in run_step(runner)
+        if item.type == "message.completed"
+    ]
+    assert texts == ["过场白"]
+
+
+def test_new_event_late_held_text_not_resent_after_final_release(module_factory):
+    """同一步先扣住过场白、随后放行最终回答：步末兜底不得再补发过场白。"""
+    install_module(module_factory, umos=["aiocqhttp:GroupMessage:10001"])
+    runner = FakeRunner(
+        [completed("过场白"), "DONE", completed("最终回答")],
+        event=FakeEvent(),
+    )
+    texts = [item.content[0].text for item in run_step(runner)]
+    assert texts == ["最终回答"]
+
+
+def test_new_event_reasoning_only_message_passes_through(module_factory):
+    install_module(module_factory, umos=["aiocqhttp:GroupMessage:10001"])
+    reasoning = completed(
+        parts=(SimpleNamespace(type="reasoning", text="思考中"),)
+    )
+    runner = FakeRunner(
+        [reasoning, new_event("tool.started"), "DONE"],
+        event=FakeEvent(),
+    )
+    outputs = run_step(runner)
+    assert [item.type for item in outputs] == ["message.completed", "tool.started"]
+
+
+def test_new_event_direct_send_tool_drops_preamble(module_factory):
+    install_module(module_factory, umos=["aiocqhttp:GroupMessage:10001"])
+    runner = FakeRunner(
+        [
+            completed("我去查一下"),
+            new_event("tool.started"),
+            new_event("tool.finished"),
+            "DONE",
+        ],
+        event=FakeEvent(),
+    )
+    kinds = [item.type for item in run_step(runner)]
+    assert kinds == ["tool.started", "tool.finished"]
+
+
+def test_new_event_step_without_final_answer_drops_preamble(module_factory):
+    """步末 Runner 未完也未中止：扣住的文字不补发。"""
+    install_module(module_factory, umos=["aiocqhttp:GroupMessage:10001"])
+    runner = FakeRunner([completed("过场白")], event=FakeEvent(), finish_done=False)
+    assert run_step(runner) == []
+
+
+def test_new_event_unknown_event_passes_through(module_factory):
+    install_module(module_factory, umos=["aiocqhttp:GroupMessage:10001"])
+    runner = FakeRunner(
+        [completed("过场白"), new_event("some.future.event"), new_event("tool.started")],
+        event=FakeEvent(),
+    )
+    kinds = [item.type for item in run_step(runner)]
+    assert kinds == ["some.future.event", "tool.started"]
+
+
+def test_new_event_streaming_passes_through(module_factory):
+    install_module(module_factory, umos=["aiocqhttp:GroupMessage:10001"])
+    runner = FakeRunner(
+        [completed("我去查一下"), new_event("tool.started")],
+        event=FakeEvent(),
+        streaming=True,
+    )
+    kinds = [item.type for item in run_step(runner)]
+    assert kinds == ["message.completed", "tool.started"]
+
+
+def test_new_event_held_text_length_logs_only_count(module_factory):
+    module = install_module(module_factory, umos=["aiocqhttp:GroupMessage:10001"])
+    runner = FakeRunner(
+        [completed("这句过场白绝不能进日志"), new_event("tool.started")],
         event=FakeEvent(),
     )
     run_step(runner)

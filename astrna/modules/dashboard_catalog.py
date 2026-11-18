@@ -479,12 +479,15 @@ def build_state(
     config: Mapping[str, Any],
     version: Any = "unknown",
     context: Any = None,
+    capabilities: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """生成页面完整状态。config 为 AstrBot 注入的共享配置对象或其映射。
 
     version 由调用方从正式插件元数据读取后传入；本模块不自行探测工作目录。
     非空字符串以外的值一律降级为 "unknown"，绝不猜测版本。
     context 用于读取模型/人格可选项；缺失时对应选项为空列表。
+    capabilities 提供「配置已开启」之外的宿主能力与真实安装状态，
+    缺失时对应功能不输出 capability 字段。
     """
     # 延迟导入避免循环依赖：dashboard_settings 复用本模块的锁与警告逻辑。
     from .dashboard_settings import build_feature_settings, settings_for_feature
@@ -497,6 +500,8 @@ def build_state(
         entry["details"] = _build_details(key, config)
         if settings_for_feature(key):
             entry["settings"] = build_feature_settings(config, key, context)
+        if capabilities and key in capabilities:
+            entry["capability"] = dict(capabilities[key])
         features.append(entry)
     normalized = version.strip() if isinstance(version, str) else ""
     return {

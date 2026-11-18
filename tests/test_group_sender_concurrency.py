@@ -24,6 +24,34 @@ from astrna.modules.group_sender_concurrency import (
     SendRound,
     locate_current_unit,
 )
+from astrna.modules.group_sender_concurrency_session import (
+    GroupSenderConcurrencySessionModule,
+)
+
+
+@pytest.fixture(autouse=True)
+def force_legacy_group_backend(monkeypatch):
+    """本文件验证旧包装后端；新版 AgentSession 后端有独立测试文件。"""
+    from astrna.modules.image_history_context import ImageHistoryContextModule
+    from astrna.modules.long_reply_context import LongReplyContextModule
+    from astrna.modules.reply_target_history import ReplyTargetHistoryModule
+    from astrna.modules.tool_history_context import ToolHistoryContextModule
+
+    def reset_all() -> None:
+        GroupSenderConcurrencyModule.restore_patch()
+        ToolHistoryContextModule.restore_patch()
+        ImageHistoryContextModule.restore_patch()
+        LongReplyContextModule.restore_patch()
+        ReplyTargetHistoryModule.restore_patch()
+
+    reset_all()
+    monkeypatch.setattr(
+        GroupSenderConcurrencySessionModule,
+        "probe",
+        classmethod(lambda cls: False),
+    )
+    yield
+    reset_all()
 
 
 def run(coro):
@@ -188,6 +216,18 @@ def turn(tag):
         {"role": "user", "content": f"{tag} question"},
         {"role": "assistant", "content": f"{tag} reply"},
     ]
+
+
+def _skip_without_legacy_follow_up() -> None:
+    """旧版 follow-up Runner 登记入口在 4.30 被移除，相关契约只对旧宿主成立。"""
+    try:
+        follow_up = importlib.import_module(
+            "astrbot.core.pipeline.process_stage.follow_up"
+        )
+    except ModuleNotFoundError:
+        pytest.skip("当前环境没有 AstrBot 源码")
+    if not hasattr(follow_up, "register_active_runner"):
+        pytest.skip("AstrBot 4.30 已移除旧 follow-up Runner 登记入口")
 
 
 def load_real_astrbot_context_modules():
@@ -598,6 +638,17 @@ def fake_astrbot_modules(monkeypatch):
     ]
     for name in module_names:
         monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    # 旧包装链测试显式屏蔽新版历史入口，保证在 4.30 上也走
+    # InternalAgentSubStage._save_to_history；新入口由独立测试覆盖。
+    for name in (
+        "astrbot.core.astr_agent_runtime.history",
+        "astrbot.core.astr_agent_runtime.session",
+    ):
+        monkeypatch.setitem(sys.modules, name, None)
+    history_parent = sys.modules.get("astrbot.core.astr_agent_runtime")
+    if history_parent is not None:
+        for attribute in ("history", "session"):
+            monkeypatch.delattr(history_parent, attribute, raising=False)
     monkeypatch.setitem(sys.modules, "astrbot.core.utils.session_lock", session_lock_module)
     monkeypatch.setitem(
         sys.modules,
@@ -1814,6 +1865,8 @@ def test_truncated_history_stays_truncated_without_concurrency(fake_astrbot_modu
 
 def test_real_astrbot_30_15_truncation_reaches_32_then_34():
     message_module, truncator_cls = load_real_astrbot_context_modules()
+    if not hasattr(message_module, "dump_messages_with_checkpoints"):
+        pytest.skip("AstrBot 4.30 已移除检查点序列化，旧群并发不再承担该合并")
     message_cls = message_module.Message
     truncator = truncator_cls()
     base = [
@@ -2088,6 +2141,8 @@ def test_tool_chain_and_checkpoint_stay_intact(fake_astrbot_modules):
 
 def test_real_astrbot_tool_unit_keeps_calls_media_and_checkpoints():
     message_module, _ = load_real_astrbot_context_modules()
+    if not hasattr(message_module, "CheckpointData"):
+        pytest.skip("AstrBot 4.30 已移除检查点数据，旧群并发不再承担该合并")
     checkpoint_data = message_module.CheckpointData
     message_cls = message_module.Message
     tool_call = message_module.ToolCall(
@@ -2988,6 +3043,7 @@ def test_real_astrbot_stop_callback_and_sender_isolation():
     source = os.environ.get("ASTRBOT_SOURCE_PATH")
     if not source:
         pytest.skip("未设置 ASTRBOT_SOURCE_PATH")
+    _skip_without_legacy_follow_up()
     script = textwrap.dedent(
         f"""
         import asyncio
@@ -3182,6 +3238,7 @@ def test_real_astrbot_cross_generation_stop_callback_survival():
     source = os.environ.get("ASTRBOT_SOURCE_PATH")
     if not source:
         pytest.skip("未设置 ASTRBOT_SOURCE_PATH")
+    _skip_without_legacy_follow_up()
     script = textwrap.dedent(
         f"""
         import asyncio

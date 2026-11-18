@@ -35,7 +35,12 @@ if str(ASTRBOT_SOURCE) not in sys.path:
 
 from PIL import Image as PILImage
 
-from astrbot.core import astr_main_agent as main
+try:
+    # AstrBot 4.30 删除了 astr_main_agent，主对话链路拆进 astr_agent_runtime。
+    from astrbot.core import astr_main_agent as main
+except ImportError:  # 新版没有旧版主对话模块，本文件按能力跳过相关流程。
+    main = None
+
 from astrbot.core.agent.message import TextPart
 from astrbot.core.config.default import DEFAULT_CONFIG
 from astrbot.core.message.components import Image, Plain, Reply
@@ -53,9 +58,7 @@ except ImportError:
         )
     except ImportError:
         pytest.skip("该流程用例需要 AstrBot 图片准备入口", allow_module_level=True)
-if not callable(getattr(main, "prepare_request_images", None)) and not callable(
-    getattr(internal, "prepare_request_images", None)
-):
+if not callable(getattr(image_input, "prepare_request_images", None)):
     pytest.skip("该流程用例需要 AstrBot 图片准备入口", allow_module_level=True)
 from astrbot.core.pipeline.process_stage.stage import ProcessStage
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
@@ -64,6 +67,7 @@ from astrbot.core.platform.message_type import MessageType
 from astrbot.core.platform.platform_metadata import PlatformMetadata
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 from astrbot.core.provider.provider import Provider
+from astrbot.core.star.context import Context as StarContext
 from astrbot.core.utils import io as media_io, media_utils as media
 
 from astrna.modules.image_caption import ImageCaptionModule
@@ -73,10 +77,23 @@ from astrna.runtime import AstrNaRuntime
 from astrna.utils.patching import unwrap_inactive_wrapper
 from astrbot.core.star.star_handler import EventType
 
+# AstrNa 的图片转述与引用补图包装依赖旧版主对话模块的引用消息入口。
+# AstrBot 4.30 删除了 _process_quote_message/_ensure_img_caption，转述链路改由
+# astr_agent_media 承担；本文件的流程驱动建立在 ProcessStage + 旧版入口之上，
+# 没有等价入口时逐用例跳过。
+HOST_HAS_LEGACY_QUOTE_CHAIN = main is not None and callable(
+    getattr(main, "_process_quote_message", None)
+)
+LEGACY_QUOTE_CHAIN_SKIP_REASON = (
+    "AstrBot 4.30 删除了 astr_main_agent._process_quote_message 与 "
+    "_ensure_img_caption（转述链路移入 astr_agent_media），"
+    "本用例依赖的 ProcessStage + 旧版引用处理入口在新版没有等价实现"
+)
+
 # 模块导入时（pytest 收集阶段，尚无测试运行）记录真实模块的原始绑定。
 # 绑定源码环境下其他测试可能在真实 astr_main_agent 上留下未卸载的包装，
 # 本文件的真实流程断言需要见到原始 from-import 绑定状态。
-_ORIGINAL_MAIN_QUOTE = main._process_quote_message
+_ORIGINAL_MAIN_QUOTE = getattr(main, "_process_quote_message", None)
 _ORIGINAL_INTERNAL_QUOTE = getattr(internal, "_process_quote_message", None)
 _ORIGINAL_MAIN_PREPARE = getattr(main, "prepare_request_images", None)
 _ORIGINAL_MAIN_COLLECT = getattr(main, "collect_initial_request", None)
@@ -153,7 +170,7 @@ def harness(tmp_path, monkeypatch):
             "enable": True,
         }
     )
-    context = MagicMock(spec=main.Context)
+    context = MagicMock(spec=main.Context if main is not None else StarContext)
     context.persona_manager = MagicMock()
     context.conversation_manager = MagicMock()
     context.get_config.return_value = config
@@ -216,20 +233,25 @@ def harness(tmp_path, monkeypatch):
     async def hook(event, kind, *args):
         return False
 
-    monkeypatch.setattr(internal, "call_event_hook", hook)
-    monkeypatch.setattr(internal, "try_capture_follow_up", lambda event: None)
-    monkeypatch.setattr(internal, "_record_internal_agent_stats", AsyncMock())
-    monkeypatch.setattr(internal.Metric, "upload", AsyncMock())
-    monkeypatch.setattr(main, "retrieve_knowledge_base", AsyncMock(return_value=None))
-    from astrbot.core.pipeline.process_stage.method.agent_request import (
-        SessionServiceManager,
-    )
-
-    monkeypatch.setattr(
-        SessionServiceManager,
-        "should_process_llm_request",
-        AsyncMock(return_value=True),
-    )
+    if HOST_HAS_LEGACY_QUOTE_CHAIN:
+        monkeypatch.setattr(internal, "call_event_hook", hook)
+        monkeypatch.setattr(internal, "try_capture_follow_up", lambda event: None)
+        monkeypatch.setattr(internal, "_record_internal_agent_stats", AsyncMock())
+        monkeypatch.setattr(internal.Metric, "upload", AsyncMock())
+    if main is not None:
+        monkeypatch.setattr(main, "retrieve_knowledge_base", AsyncMock(return_value=None))
+    try:
+        from astrbot.core.pipeline.process_stage.method.agent_request import (
+            SessionServiceManager,
+        )
+    except ImportError:  # AstrBot 4.30 的 agent request 子阶段不再暴露该服务。
+        SessionServiceManager = None
+    if SessionServiceManager is not None:
+        monkeypatch.setattr(
+            SessionServiceManager,
+            "should_process_llm_request",
+            AsyncMock(return_value=True),
+        )
 
     captured_runners = []
 
@@ -239,7 +261,8 @@ def harness(tmp_path, monkeypatch):
             runner.final_llm_resp = response
             yield None
 
-    monkeypatch.setattr(internal, "run_agent", run)
+    if hasattr(internal, "run_agent"):
+        monkeypatch.setattr(internal, "run_agent", run)
     return SimpleNamespace(
         config=config,
         context=context,
@@ -253,6 +276,8 @@ def harness(tmp_path, monkeypatch):
 
 
 async def process_event(harness, event, *, preprocess_event=True):
+    if not HOST_HAS_LEGACY_QUOTE_CHAIN:
+        pytest.skip(LEGACY_QUOTE_CHAIN_SKIP_REASON)
     if preprocess_event:
         preprocess_stage = preprocess.PreProcessStage()
         await preprocess_stage.initialize(harness.ctx)
@@ -273,7 +298,8 @@ def restore_astrna_patches():
     ImageCaptionModule.restore_patch()
     ReplyTargetHistoryModule.restore_patch()
     QuotedImageInputModule.restore_patch()
-    main._process_quote_message = _ORIGINAL_MAIN_QUOTE
+    if main is not None:
+        main._process_quote_message = _ORIGINAL_MAIN_QUOTE
     if _ORIGINAL_INTERNAL_QUOTE is not None:
         internal._process_quote_message = _ORIGINAL_INTERNAL_QUOTE
     if _ORIGINAL_MAIN_PREPARE is not None:
@@ -288,7 +314,8 @@ def restore_astrna_patches():
     ImageCaptionModule.restore_patch()
     ReplyTargetHistoryModule.restore_patch()
     QuotedImageInputModule.restore_patch()
-    main._process_quote_message = _ORIGINAL_MAIN_QUOTE
+    if main is not None:
+        main._process_quote_message = _ORIGINAL_MAIN_QUOTE
     if _ORIGINAL_INTERNAL_QUOTE is not None:
         internal._process_quote_message = _ORIGINAL_INTERNAL_QUOTE
     if _ORIGINAL_MAIN_PREPARE is not None:
@@ -302,7 +329,26 @@ def restore_astrna_patches():
 
 
 def test_host_image_entrypoints_match_expected_layout():
-    """按当前宿主确认 main/internal 实际持有并被 AstrNa 覆盖的入口。"""
+    """按当前宿主确认 AstrNa 实际覆盖的图片准备入口来自源码目录。"""
+    if not HOST_HAS_LEGACY_QUOTE_CHAIN:
+        # 新版把图片准备入口放在 agent_input / main_agent 包里，AstrNa 按
+        # prepare_request_images 与 collect_initial_request 的能力探测挂载。
+        module = QuotedImageInputModule(logger=DummyLogger())
+        assert module.install() is True
+        root = Path(ASTRBOT_SOURCE).resolve()
+        try:
+            assert QuotedImageInputModule._prepare_targets, "新版应至少包装一个准备入口"
+            assert QuotedImageInputModule._collect_targets, "新版应至少包装一个收集入口"
+            for target in (
+                QuotedImageInputModule._prepare_targets
+                + QuotedImageInputModule._collect_targets
+            ):
+                module_file = getattr(target.owner, "__file__", None)
+                assert module_file is not None
+                assert Path(module_file).resolve().is_relative_to(root)
+        finally:
+            module.terminate()
+        return
     if hasattr(internal, "_process_quote_message"):
         assert internal._process_quote_message is main._process_quote_message
     assert Path(main.__file__).resolve().is_relative_to(Path(ASTRBOT_SOURCE).resolve())
@@ -319,9 +365,10 @@ def test_quote_caption_uses_optimized_prompt_via_host_reference(harness, tmp_pat
 
     module = ImageCaptionModule(logger=DummyLogger())
     assert module.install() is True
-    if hasattr(internal, "_process_quote_message"):
-        assert internal._process_quote_message is main._process_quote_message
-    assert main._process_quote_message is not _ORIGINAL_MAIN_QUOTE
+    if HOST_HAS_LEGACY_QUOTE_CHAIN:
+        if hasattr(internal, "_process_quote_message"):
+            assert internal._process_quote_message is main._process_quote_message
+        assert main._process_quote_message is not _ORIGINAL_MAIN_QUOTE
 
     event = make_event(
         [
@@ -661,7 +708,8 @@ def runtime(harness, monkeypatch):
             await runtime.sanitize_request(event, args[0])
         return False
 
-    monkeypatch.setattr(internal, "call_event_hook", hook)
+    if HOST_HAS_LEGACY_QUOTE_CHAIN:
+        monkeypatch.setattr(internal, "call_event_hook", hook)
     harness.config["provider_settings"]["default_image_caption_provider_id"] = "caption"
     yield runtime
     asyncio.run(runtime.terminate())
@@ -673,9 +721,10 @@ def test_runtime_quote_chain_keeps_both_features(
     original_hint = runtime.reply_target_history.optimize_quote_message
     hint = AsyncMock(wraps=original_hint)
     monkeypatch.setattr(runtime.reply_target_history, "optimize_quote_message", hint)
-    if hasattr(internal, "_process_quote_message"):
-        assert internal._process_quote_message is main._process_quote_message
-    assert main._process_quote_message is not _ORIGINAL_MAIN_QUOTE
+    if HOST_HAS_LEGACY_QUOTE_CHAIN:
+        if hasattr(internal, "_process_quote_message"):
+            assert internal._process_quote_message is main._process_quote_message
+        assert main._process_quote_message is not _ORIGINAL_MAIN_QUOTE
     event = make_event(
         [
             Reply(
@@ -898,7 +947,8 @@ def test_runtime_unload_restores_collection_and_conversion(runtime):
         assert internal._process_quote_message is _ORIGINAL_INTERNAL_QUOTE
     if _ORIGINAL_MAIN_PREPARE is not None:
         assert main.prepare_request_images is _ORIGINAL_MAIN_PREPARE
-    assert main._process_quote_message is _ORIGINAL_MAIN_QUOTE
+    if HOST_HAS_LEGACY_QUOTE_CHAIN:
+        assert main._process_quote_message is _ORIGINAL_MAIN_QUOTE
 
 
 def test_dashboard_toggle_affects_first_new_request(harness, tmp_path, runtime):
@@ -940,14 +990,27 @@ def test_caption_toggle_preserves_reply_history_chain(harness, tmp_path, runtime
 
 
 def test_closed_runtime_cannot_reinstall_image_wrappers(harness, runtime):
+    module_cls = type(runtime.quoted_image_input)
+    targets = [
+        (target.owner, target.attribute)
+        for target in module_cls._prepare_targets + module_cls._collect_targets
+    ]
     asyncio.run(runtime.terminate())
-    prepare_owner = main if hasattr(main, "prepare_request_images") else internal
-    original_prepare = prepare_owner.prepare_request_images
-    original_quote = main._process_quote_message
+    originals = [getattr(owner, attribute) for owner, attribute in targets]
+    legacy_prepare_owner = legacy_prepare = legacy_quote = None
+    if HOST_HAS_LEGACY_QUOTE_CHAIN:
+        legacy_prepare_owner = (
+            main if hasattr(main, "prepare_request_images") else internal
+        )
+        legacy_prepare = legacy_prepare_owner.prepare_request_images
+        legacy_quote = main._process_quote_message
     runtime.update_dashboard_switch("optimize_quoted_image_input", True)
     runtime.update_dashboard_switch("optimize_image_caption", True)
-    assert prepare_owner.prepare_request_images is original_prepare
-    assert main._process_quote_message is original_quote
+    for (owner, attribute), original in zip(targets, originals):
+        assert getattr(owner, attribute) is unwrap_inactive_wrapper(original)
+    if HOST_HAS_LEGACY_QUOTE_CHAIN:
+        assert legacy_prepare_owner.prepare_request_images is legacy_prepare
+        assert main._process_quote_message is legacy_quote
 
 
 def test_platform_can_repair_same_failed_path(harness, tmp_path, runtime):
@@ -971,6 +1034,8 @@ def test_platform_can_repair_same_failed_path(harness, tmp_path, runtime):
 def test_limited_fallback_images_are_not_restored(
     harness, tmp_path, runtime, monkeypatch
 ):
+    if not HOST_HAS_LEGACY_QUOTE_CHAIN:
+        pytest.skip(LEGACY_QUOTE_CHAIN_SKIP_REASON)
     broken = tmp_path / "broken.jpg"
     broken.write_bytes(b"broken")
     excluded = source_image(tmp_path, "excluded")

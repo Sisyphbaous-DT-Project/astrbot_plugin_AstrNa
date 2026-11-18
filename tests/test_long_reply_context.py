@@ -10,6 +10,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from astrna.modules import group_sender_concurrency_session as gsc
 from astrna.modules.forward_nodes import ForwardNodesModule
 from astrna.modules.long_reply_context import (
     LongReplyContextModule,
@@ -324,6 +325,15 @@ def astrbot_modules(monkeypatch):
     ]
     for name in module_names:
         monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    for name in (
+        "astrbot.core.astr_agent_runtime.history",
+        "astrbot.core.astr_agent_runtime.session",
+    ):
+        monkeypatch.setitem(sys.modules, name, None)
+    parent = sys.modules.get("astrbot.core.astr_agent_runtime")
+    if parent is not None:
+        for attribute in ("history", "session"):
+            monkeypatch.delattr(parent, attribute, raising=False)
     monkeypatch.setitem(
         sys.modules,
         "astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal",
@@ -1217,3 +1227,380 @@ def test_runtime_terminate_restores_long_reply_before_forward_nodes(
     run(runtime.terminate())
 
     assert astrbot_modules.respond_cls.process is original
+
+
+def test_agent_history_pending_uses_bound_event_not_latest_cid():
+    module = LongReplyContextModule(logger=DummyLogger())
+    umo = "aiocqhttp:GroupMessage:g1"
+    cid = "cid-shared"
+
+    class Event:
+        def __init__(self, name):
+            self.unified_msg_origin = umo
+            self.name = name
+            self._extras = {}
+
+        def get_extra(self, key, default=None):
+            return self._extras.get(key, default)
+
+    event_a = Event("A")
+    event_b = Event("B")
+    module._pending["key-a"] = {
+        "text": "A-MODEL",
+        "final_text": "A-FINAL",
+        "conversation_id": cid,
+        "unified_msg_origin": umo,
+        "event_id": str(id(event_a)),
+    }
+    module._pending["key-b"] = {
+        "text": "B-MODEL",
+        "final_text": "B-FINAL",
+        "conversation_id": cid,
+        "unified_msg_origin": umo,
+        "event_id": str(id(event_b)),
+    }
+    req_a = SimpleNamespace(conversation=SimpleNamespace(cid=cid))
+    module.bind_request_event(event_a, req_a)
+    key, pending = module._find_pending_for_request(
+        req_a, SimpleNamespace(umo=umo)
+    )
+    assert key == "key-a"
+    assert pending["final_text"] == "A-FINAL"
+
+    del module._pending["key-a"]
+    assert module._find_pending_for_request(req_a) == (None, None)
+    assert module._find_pending_for_request(req_a, SimpleNamespace(umo=umo)) == (None, None)
+    module._pending["key-a"] = pending
+
+    unbound = SimpleNamespace(conversation=SimpleNamespace(cid=cid))
+    assert module._find_pending_for_request(
+        unbound, SimpleNamespace(umo=umo)
+    ) == (None, None)
+
+
+def test_real_deferred_settlement_does_not_touch_other_sender(tmp_path):
+    import importlib.util
+
+    if importlib.util.find_spec("astrbot.core.astr_agent_runtime") is None:
+        pytest.skip("旧宿主没有 4.30 的 conversation event 运行时")
+    from astrbot.core.agent.conversation_events import ConversationEventWriter
+    from astrbot.core.db.sqlite import SQLiteDatabase
+
+    async def scenario():
+        db = SQLiteDatabase(str(tmp_path / "long-reply.db"))
+        await db.initialize()
+        try:
+            store = db.conversation_store
+            umo = "aiocqhttp:GroupMessage:g1"
+            conv = await store.create(umo=umo, platform_id="aiocqhttp")
+            cid = conv.conversation_id
+            writer = ConversationEventWriter(store, await store.read(cid))
+            await writer.start_turn({"kind": "agent"}, event_id="seed")
+
+            def response(event_id, text):
+                return SimpleNamespace(
+                    type="message.appended",
+                    data={
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": text}],
+                        }
+                    },
+                    event_id=event_id,
+                )
+
+            await writer.consume(response("assistant-a", "A-MODEL"))
+            await writer.consume(response("assistant-b", "B-MODEL"))
+            await writer.finish_turn("completed")
+            snapshot = await store.read(cid)
+            entry_a, entry_b = snapshot.entries
+
+            module = LongReplyContextModule(logger=DummyLogger())
+            req = SimpleNamespace(conversation=SimpleNamespace(cid=cid))
+            pending_a = {
+                "text": "A-MODEL",
+                "final_text": "A-FINAL",
+                "conversation_id": cid,
+                "unified_msg_origin": umo,
+                "event_id": "event-a",
+                "send_succeeded": True,
+                "send_failed": False,
+            }
+            pending_b = {
+                "text": "B-MODEL",
+                "final_text": "B-FINAL",
+                "conversation_id": cid,
+                "unified_msg_origin": umo,
+                "event_id": "event-b",
+            }
+            common = {"umo": umo, "store": store, "_astrna_base_entries": []}
+            module._remember_deferred_history(
+                SimpleNamespace(_entries=[entry_a], **common), req, pending_a
+            )
+            module._remember_deferred_history(
+                SimpleNamespace(_entries=[entry_b], **common), req, pending_b
+            )
+            assert len(module._deferred_history) == 2
+            module._schedule_deferred_settlement(pending_a)
+            await asyncio.gather(*list(module._settle_tasks))
+
+            final = await store.read(cid)
+            texts = {
+                entry["id"]: entry["message"]["content"][0]["text"]
+                for entry in final.entries
+            }
+            assert texts == {
+                "assistant-a": "A-FINAL",
+                "assistant-b": "B-MODEL",
+            }
+        finally:
+            await db.engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_agent_history_reinstall_restores_and_does_not_double_process(monkeypatch):
+    import importlib.util
+
+    if importlib.util.find_spec("astrbot.core.astr_agent_runtime") is None:
+        pytest.skip("旧宿主没有新版历史保存入口")
+    from astrbot.core.astr_agent_runtime import history, session
+
+    async def fake_save_agent_history(**kwargs):
+        return kwargs["all_messages"][-1].content
+
+    monkeypatch.setattr(history, "save_agent_history", fake_save_agent_history)
+    monkeypatch.setattr(session, "save_agent_history", fake_save_agent_history)
+    first = LongReplyContextModule(logger=DummyLogger())
+    assert first.install()
+    first.terminate()
+    assert history.save_agent_history is fake_save_agent_history
+    assert session.save_agent_history is fake_save_agent_history
+
+    second = LongReplyContextModule(logger=DummyLogger())
+    assert second.install()
+    cid = "cid-1"
+    umo = "aiocqhttp:GroupMessage:g1"
+    second._pending["key-a"] = {
+        "text": "MODEL",
+        "final_text": "MERGED",
+        "conversation_id": cid,
+        "unified_msg_origin": umo,
+        "event_id": "event-a",
+    }
+    result = asyncio.run(
+        history.save_agent_history(
+            req=SimpleNamespace(conversation=SimpleNamespace(cid=cid)),
+            llm_response=DummyLLMResponse("MODEL"),
+            all_messages=[Message("assistant", "MODEL")],
+            runner_stats=None,
+            commit=None,
+            writer=SimpleNamespace(umo=umo),
+        )
+    )
+    assert result == "MERGED"
+    second.terminate()
+    assert history.save_agent_history is fake_save_agent_history
+    assert session.save_agent_history is fake_save_agent_history
+
+
+@pytest.mark.parametrize("save_first", [True, False], ids=["journal-replay", "live-reader"])
+def test_only_sent_final_output_can_correct_sqlite_history(tmp_path, save_first):
+    if not gsc.GroupSenderConcurrencySessionModule.probe():
+        pytest.skip("旧宿主没有原生回合呈现入口")
+    from astrbot.core.agent.conversation_events import ConversationEventWriter
+    from astrbot.core.agent.events import MessageCompleted, TurnFinished, TurnResult
+    from astrbot.core.agent.message import Message as HostMessage
+    from astrbot.core.agent.output import PlainOutput
+    from astrbot.core.agent.runtime import AgentInput, AgentPermissions, AgentTurn
+    from astrbot.core.agent_output import present_turn
+    from astrbot.core.astr_agent_runtime import history
+    from astrbot.core.db.sqlite import SQLiteDatabase
+    from astrbot.core.message.components import Plain as HostPlain
+    from astrbot.core.message.message_event_result import MessageEventResult, ResultContentType
+    from astrbot.core.platform.agent_wakeup_event import AgentWakeupEvent
+    from astrbot.core.platform.message_session import MessageSession
+    from astrbot.core.platform.platform_metadata import PlatformMetadata
+    from astrbot.core.provider.entities import LLMResponse
+
+    async def scenario():
+        module = LongReplyContextModule(logger=DummyLogger())
+        db = SQLiteDatabase(str(tmp_path / "present.db"))
+        await db.initialize()
+        module.install()
+        try:
+            umo = "test:GroupMessage:room"
+            store = db.conversation_store
+            cid = (await store.create(umo=umo, platform_id="test")).conversation_id
+            writer = ConversationEventWriter(store, await store.read(cid))
+            event = AgentWakeupEvent(context=SimpleNamespace(), session=MessageSession.from_str(umo),
+                                     platform_meta=PlatformMetadata("test", "test", "test"), prompt="q", source="plugin")
+            req = SimpleNamespace(conversation=SimpleNamespace(cid=cid), tool_calls_result=None)
+            module.bind_request_event(event, req)
+            event.set_extra("provider_request", req)
+            turn = AgentTurn(SimpleNamespace(id=cid, runtime_name="astrbot"), AgentInput(event=event, permissions=AgentPermissions()))
+            # 故意让两个输出同文，且最终保存的正文需规范化并换 ID。
+            model = " MODEL "
+            await writer.start_turn({"kind": "agent"})
+            await writer.append_message({"role": "assistant", "content": model}, event_id="raw-model")
+            async def save():
+                assert await history.save_agent_history(req=req, llm_response=LLMResponse(role="assistant", completion_text=model),
+                    all_messages=[HostMessage(role="assistant", content=model)], runner_stats=None, commit=None, writer=writer)
+            for identity in ("intermediate", "final"):
+                turn.emit(MessageCompleted(message_id=identity, content=(PlainOutput(text=model),)))
+            turn.emit(TurnFinished(result=TurnResult()))
+            if save_first:
+                await save()
+            count = 0
+            async for chain in present_turn(turn, streaming=False):
+                count += 1
+                event.set_result(MessageEventResult(chain=chain.chain, result_content_type=ResultContentType.LLM_RESULT))
+                event.get_result().chain = [HostPlain(text=f"display-{count}")]
+                await module.optimize_before_respond(event)
+                tracker = SendTracker()
+                tracker.succeeded = 1
+                module.record_send_result(event, tracker)
+                if count == 1:
+                    if not save_first:
+                        await save()
+                    await asyncio.gather(*module._settle_tasks)
+                    assert (await store.read(cid)).messages[-1]["content"] == "MODEL"
+            await asyncio.gather(*module._settle_tasks)
+            snap = await store.read(cid)
+            assert count == 2 and snap.entries[-1]["id"] != "raw-model"
+            assert snap.messages[-1]["content"] == "display-2"
+        finally:
+            module.terminate()
+            await db.engine.dispose()
+
+    run(scenario())
+
+
+class _StaleLongReplyStore:
+    def __init__(self, proxy, snapshot, before_append=None):
+        self.proxy = proxy
+        self.snapshot = snapshot
+        self.before_append = before_append
+        self.first_read = True
+
+    async def read(self, *_args, **_kwargs):
+        if self.first_read:
+            self.first_read = False
+            return self.snapshot
+        return await self.proxy.read(self.snapshot.conversation.conversation_id)
+
+    async def append(self, *args, **kwargs):
+        if self.before_append is not None:
+            callback, self.before_append = self.before_append, None
+            await callback()
+        return await self.proxy.append(*args, **kwargs)
+
+    async def append_exact(self, *args, **kwargs):
+        if self.before_append is not None:
+            callback, self.before_append = self.before_append, None
+            await callback()
+        return await self.proxy.append_exact(*args, **kwargs)
+
+
+def test_real_deferred_settlement_preserves_other_final_and_reset(tmp_path):
+    import importlib.util
+
+    if importlib.util.find_spec("astrbot.core.astr_agent_runtime") is None:
+        pytest.skip("旧宿主没有 4.30 的 conversation event 运行时")
+    from astrbot.core.agent.conversation_events import ConversationEventWriter
+    from astrbot.core.conversation_mgr import ConversationManager
+    from astrbot.core.db.sqlite import SQLiteDatabase
+
+    async def scenario():
+        db = SQLiteDatabase(str(tmp_path / "deferred-concurrent.db"))
+        await db.initialize()
+        try:
+            store = db.conversation_store
+            umo = "aiocqhttp:GroupMessage:g1"
+            conv = await store.create(umo=umo, platform_id="aiocqhttp")
+            cid = conv.conversation_id
+            seed = ConversationEventWriter(store, await store.read(cid))
+            await seed.start_turn({"kind": "agent"}, event_id="seed")
+            for event_id, role, text in (
+                ("a-q", "user", "A-Q"),
+                ("a-model", "assistant", "A-MODEL"),
+                ("b-q", "user", "B-Q"),
+                ("b-model", "assistant", "B-MODEL"),
+            ):
+                await seed.consume(
+                    SimpleNamespace(
+                        type="message.appended",
+                        data={
+                            "message": {
+                                "role": role,
+                                "content": [{"type": "text", "text": text}],
+                            }
+                        },
+                        event_id=event_id,
+                    )
+                )
+            await seed.finish_turn("completed")
+
+            snapshot = await store.read(cid)
+            writer_a = ConversationEventWriter(store, snapshot)
+            writer_b = ConversationEventWriter(store, snapshot)
+            module = LongReplyContextModule(logger=DummyLogger())
+            gsc_module = gsc.GroupSenderConcurrencySessionModule()
+            gsc_module.wrap_writer(writer_a, buffered=False)
+            gsc_module.wrap_writer(writer_b, buffered=False)
+            # 目标 assistant 是各自回合新增的消息，不属于回合前基线。
+            writer_a._astrna_base_entries = []
+            writer_b._astrna_base_entries = []
+            for identity, assistant_id, event_id in (
+                ("event-a", "a-model", "client-a"),
+                ("event-b", "b-model", "client-b"),
+            ):
+                module._deferred_history[f"{cid}#{identity}"] = {
+                    "cid": cid,
+                    "assistant_id": assistant_id,
+                    "umo": umo,
+                    "store": _StaleLongReplyStore(writer_a.store, snapshot)
+                    if identity == "event-a"
+                    else _StaleLongReplyStore(writer_b.store, snapshot),
+                }
+
+            await asyncio.gather(
+                module._settle_history(
+                    f"{cid}#event-a", cid, "a-model", "A-FINAL"
+                ),
+                module._settle_history(
+                    f"{cid}#event-b", cid, "b-model", "B-FINAL"
+                ),
+            )
+            final = {
+                entry["id"]: entry["message"]["content"][0]["text"]
+                for entry in (await store.read(cid)).entries
+            }
+            assert final["a-model"] == "A-FINAL"
+            assert final["b-model"] == "B-FINAL"
+
+            before_reset = await store.read(cid)
+            writer_reset = ConversationEventWriter(store, before_reset)
+            gsc_module.wrap_writer(writer_reset, buffered=False)
+            writer_reset._astrna_base_entries = []
+            manager = ConversationManager(db)
+
+            async def clear_history():
+                await manager.update_conversation(umo, cid, history=[])
+
+            module._deferred_history[f"{cid}#event-reset"] = {
+                "cid": cid,
+                "assistant_id": "b-model",
+                "umo": umo,
+                "store": _StaleLongReplyStore(
+                    writer_reset.store, before_reset, clear_history
+                ),
+            }
+            await module._settle_history(
+                f"{cid}#event-reset", cid, "b-model", "RESURRECTED"
+            )
+            assert (await store.read(cid)).entries == []
+        finally:
+            await db.engine.dispose()
+
+    asyncio.run(scenario())

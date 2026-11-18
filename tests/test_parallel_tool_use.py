@@ -1876,7 +1876,10 @@ def test_real_astrbot_manager_executor_runner_and_permission_contract():
         from astrbot.core.agent.run_context import ContextWrapper
         from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
         from astrbot.core.agent.tool import FunctionTool
-        from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
+        try:
+            from astrbot.core.astr_agent_runtime.tool_executor import FunctionToolExecutor
+        except ModuleNotFoundError:
+            from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
         from astrbot.core.provider.func_tool_manager import FunctionToolManager
         from astrna.modules import parallel_tool_use as ptu
 
@@ -2063,7 +2066,10 @@ def test_real_astrbot_generation_reinstall_and_outer_cancellation():
         from astrbot.core.agent.run_context import ContextWrapper
         from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
         from astrbot.core.agent.tool import FunctionTool
-        from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
+        try:
+            from astrbot.core.astr_agent_runtime.tool_executor import FunctionToolExecutor
+        except ModuleNotFoundError:
+            from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
         from astrbot.core.provider.func_tool_manager import FunctionToolManager
 
         real_sp_get = sp.get
@@ -2136,6 +2142,8 @@ def test_real_astrbot_generation_reinstall_and_outer_cancellation():
             runner.read_tool = None
             runner._tool_result_token_counter = None
             runner.stats = SimpleNamespace(end_time=None)
+            # AstrBot 4.30 的 Runner 在工具结果路径上读取运行时事件流。
+            runner._events = SimpleNamespace(active=False)
             return runner
 
         async def try_batch(manager, event, value):

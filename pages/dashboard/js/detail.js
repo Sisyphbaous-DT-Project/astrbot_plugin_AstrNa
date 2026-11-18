@@ -112,17 +112,27 @@ export function openDetail({ overlay, feature, reducedMotion, onOpenSettings = n
   }
   const subconfigSection = window_.querySelector("[data-subconfig]");
   const detailsList = window_.querySelector(".details-list");
-  const updateDetails = (details) => {
+  const updateDetails = (details, capability) => {
     detailsList.innerHTML = "";
     const detailEntries = Object.entries(details || {});
-    subconfigSection.hidden = detailEntries.length === 0;
+    subconfigSection.hidden = detailEntries.length === 0 && !capability;
     for (const [key, value] of detailEntries) {
       const li = document.createElement("li");
       li.textContent = formatDetail(key, value);
       detailsList.appendChild(li);
     }
+    if (capability && typeof capability.available === "boolean") {
+      const li = document.createElement("li");
+      const backend = capability.backend ? `（${capability.backend}）` : "";
+      const status = capability.available
+        ? (capability.effective ? "宿主可用，已实际生效" : "宿主可用，但尚未生效")
+        : "当前宿主不支持";
+      const reason = capability.reason ? `：${capability.reason}` : "";
+      li.textContent = `宿主能力${backend}：${status}${reason}`;
+      detailsList.appendChild(li);
+    }
   };
-  updateDetails(feature.details);
+  updateDetails(feature.details, feature.capability);
 
   // 有子配置的功能提供「打开功能设置」入口；与设置窗口共用同一遮罩，不嵌套。
   const openSettingsBtn = window_.querySelector("[data-open-settings]");

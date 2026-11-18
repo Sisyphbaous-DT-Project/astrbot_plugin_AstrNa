@@ -34,10 +34,15 @@ from astrbot.core.agent.message import TextPart
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
 from astrbot.core.agent.tool import FunctionTool, ToolSet
-from astrbot.core.astr_agent_run_util import run_agent
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 from astrbot.core.provider.provider import Provider
+
+try:
+    # AstrBot 4.30 起 run_agent 迁入 astr_agent_runtime，旧模块被删除。
+    from astrbot.core.astr_agent_run_util import run_agent
+except ImportError:
+    from astrbot.core.astr_agent_runtime.runner import run_agent
 
 if not callable(getattr(ToolLoopAgentRunner, "_resolve_tool_exec", None)):
     pytest.skip("该用例需要 AstrBot skills_like 二次询问入口", allow_module_level=True)

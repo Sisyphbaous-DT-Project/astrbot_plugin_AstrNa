@@ -91,6 +91,31 @@ def test_feature_copy_is_complete():
     assert confirm == experimental
 
 
+def test_build_state_includes_capability_only_when_provided():
+    capability = {
+        "backend": "session",
+        "available": True,
+        "effective": False,
+        "reason": "尚未安装",
+    }
+    state = build_state(
+        {"unlock_group_sender_concurrency": True},
+        capabilities={"unlock_group_sender_concurrency": capability},
+    )
+    feature = next(
+        f for f in state["features"] if f["key"] == "unlock_group_sender_concurrency"
+    )
+    # 用户配置开启，但能力状态单独表达真实安装结果。
+    assert feature["enabled"] is True
+    assert feature["capability"] == capability
+
+    without = build_state({"unlock_group_sender_concurrency": True})
+    plain = next(
+        f for f in without["features"] if f["key"] == "unlock_group_sender_concurrency"
+    )
+    assert "capability" not in plain
+
+
 def test_build_state_defaults_all_disabled():
     state = build_state({})
     assert len(state["features"]) == 23

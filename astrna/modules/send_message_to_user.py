@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
+from ..utils import host_compat
 from ..utils.patching import (
     is_wrapper_active,
     mark_wrapper_active,
@@ -110,6 +111,8 @@ class SendMessageToUserModule:
         if event is None:
             return
         if self._is_live_or_proactive_event(event):
+            return
+        if host_compat.is_internal_result_context(event=event):
             return
         if safe_call(getattr(event, "get_extra", None), "provider_request") is not None:
             return
@@ -229,6 +232,13 @@ class SendMessageToUserModule:
             return True
         if self._is_live_or_proactive_event(event):
             return True
+        if host_compat.is_internal_result_context(
+            host_compat.runner_context(runner),
+            event,
+        ):
+            # 禁止自动投递、子代理/委派执行与调用方登记的内部结果都由调用方自行
+            # 处理输出，不能把工具调用改写成聊天最终回复。
+            return True
 
         req = getattr(runner, "req", None)
         if not is_normal_chat_request(event, req):
@@ -240,7 +250,9 @@ class SendMessageToUserModule:
     def _is_live_or_proactive_event(self, event: Any) -> bool:
         if safe_call(getattr(event, "get_extra", None), "action_type") == "live":
             return True
-        return event.__class__.__name__ == "CronMessageEvent"
+        # 定时任务、后台任务与插件唤醒都不是普通聊天入站消息：旧版用平台名 cron
+        # 表示，新版 AgentWakeupEvent 保留真实平台名并用 source 区分来源。
+        return not host_compat.is_user_input_event(event)
 
     def _load_runner_cls(self) -> type | None:
         try:

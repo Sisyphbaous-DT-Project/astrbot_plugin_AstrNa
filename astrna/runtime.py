@@ -19,6 +19,9 @@ from .modules.group_identity_tools import GroupIdentityToolsModule
 from .modules.group_chat_context_optimizer import GroupChatContextOptimizerModule
 from .modules.dashboard_settings import SETTING_KEYS as _DASHBOARD_SETTING_KEY_TUPLE
 from .modules.group_sender_concurrency import GroupSenderConcurrencyModule
+from .modules.group_sender_concurrency_session import (
+    GroupSenderConcurrencySessionModule,
+)
 from .modules.gemini_request_headers import GeminiRequestHeadersModule
 from .modules.group_wake_suppression import GroupWakeSuppressionModule
 from .modules.identity_metadata import IdentityMetadataModule
@@ -199,6 +202,9 @@ class AstrNaRuntime:
             allowlist=self.config.get("parallel_tool_use_allowlist", []),
         )
         self.group_sender_concurrency = GroupSenderConcurrencyModule(logger=logger)
+        self.group_sender_concurrency_session = GroupSenderConcurrencySessionModule(
+            logger=logger
+        )
         self.gemini_request_headers = GeminiRequestHeadersModule(logger=logger)
         self.provider_session_headers = ProviderSessionHeadersModule(
             logger=logger,
@@ -285,7 +291,7 @@ class AstrNaRuntime:
         if self.config.get("optimize_long_reply_context", False):
             self.long_reply_context.install()
         if self.config.get("unlock_group_sender_concurrency", False):
-            self.group_sender_concurrency.install()
+            self._install_group_sender_concurrency()
         self._sync_gemini_request_headers()
         self._configure_group_chat_context_optimizer()
         self._configure_waking_check_chain()
@@ -315,9 +321,9 @@ class AstrNaRuntime:
             if self._closed:
                 return
             if value:
-                self.group_sender_concurrency.install()
+                self._install_group_sender_concurrency()
             else:
-                self.group_sender_concurrency.terminate()
+                self._terminate_group_sender_concurrency()
             self._sync_gemini_request_headers()
         elif key == "optimize_group_chat_context":
             self._configure_group_chat_context_optimizer()
@@ -340,12 +346,77 @@ class AstrNaRuntime:
         else:
             self.quoted_image_input.terminate()
 
+    def _install_group_sender_concurrency(self) -> bool:
+        """按宿主能力选择新版 AgentSession 后端或旧版包装后端。
+
+        新版宿主优先使用按发送者分区的 Session 后端；旧宿主没有
+        ``AgentSession`` 时退回旧包装。两个后端互斥，避免同一方法被两层
+        包装争抢所有权。
+        """
+        if self.group_sender_concurrency_session.probe():
+            self.group_sender_concurrency.terminate()
+            return self.group_sender_concurrency_session.install()
+        self.group_sender_concurrency_session.terminate()
+        return self.group_sender_concurrency.install()
+
+    def _terminate_group_sender_concurrency(self, *, preserve_state: bool = False) -> None:
+        """卸载两个后端；preserve_state 保留在途回合与发送锁。"""
+        self.group_sender_concurrency_session.terminate(
+            preserve_state=preserve_state
+        )
+        self.group_sender_concurrency.terminate(preserve_state=preserve_state)
+
+    def _group_sender_concurrency_installed(self) -> bool:
+        """群发送者并发的真实安装状态，与用户配置开关区分。"""
+        return bool(
+            getattr(self.group_sender_concurrency_session, "_installed", False)
+            or getattr(self.group_sender_concurrency, "_installed", False)
+        )
+
+    def group_sender_concurrency_capability(self) -> dict[str, Any]:
+        """向控制台报告群聊并发的可用后端与真实安装结果。
+
+        ``enabled`` 只代表用户配置；这里区分宿主是否具备入口（available）
+        以及补丁是否真的装上（effective），避免「显示已开启但实际未生效」。
+        """
+        from .utils import host_compat
+
+        session_backend = bool(self.group_sender_concurrency_session.probe())
+        legacy_backend = False
+        if not session_backend:
+            internal = host_compat.load_class(
+                "astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal",
+                "InternalAgentSubStage",
+            )
+            follow_up = host_compat.load_module(
+                "astrbot.core.pipeline.process_stage.follow_up"
+            )
+            legacy_backend = bool(
+                internal is not None
+                and follow_up is not None
+                and callable(getattr(internal, "_save_to_history", None))
+                and callable(getattr(follow_up, "register_active_runner", None))
+            )
+        effective = self._group_sender_concurrency_installed()
+        capability: dict[str, Any] = {
+            "backend": (
+                "session" if session_backend else ("legacy" if legacy_backend else "none")
+            ),
+            "available": bool(session_backend or legacy_backend),
+            "effective": effective,
+        }
+        if not capability["available"]:
+            capability["reason"] = "当前 AstrBot 版本没有可用的群聊并发入口"
+        elif not effective and self.config.get("unlock_group_sender_concurrency", False):
+            capability["reason"] = "功能已开启，但并发补丁尚未安装成功"
+        return capability
+
     def _sync_gemini_request_headers(self) -> None:
         """让 Gemini 请求级 CID 适配跟随群并发的真实安装结果。"""
         enabled = (
             not self._closed
             and self.config.get("unlock_group_sender_concurrency", False)
-            and bool(getattr(self.group_sender_concurrency, "_installed", False))
+            and self._group_sender_concurrency_installed()
         )
         if enabled:
             self.gemini_request_headers.install()
@@ -444,6 +515,8 @@ class AstrNaRuntime:
             self.config.get("optimize_reply_target_history", False),
         )
         self.reply_target_history.install()
+        if self.config.get("optimize_long_reply_context", False):
+            self.long_reply_context.bind_request_event(event, req)
         image_history_enabled = bool(
             self.config.get("optimize_image_history_context", False)
         )
@@ -456,8 +529,11 @@ class AstrNaRuntime:
         group_concurrency_enabled = bool(
             self.config.get("unlock_group_sender_concurrency", False)
         )
-        if group_concurrency_enabled:
-            # 必须在图片/工具历史清理和回复目标等模块改写请求前捕获数据库原稿。
+        if group_concurrency_enabled and bool(
+            getattr(self.group_sender_concurrency, "_installed", False)
+        ):
+            # 旧版包装必须在图片/工具历史清理和回复目标等模块改写请求前
+            # 捕获数据库原稿；新版由每回合 Writer 自己保存创建时的基线。
             self.group_sender_concurrency.capture_base_snapshot(event, req)
         image_history_will_change = (
             bool(getattr(self.image_history_context, "_installed", False))
@@ -528,7 +604,7 @@ class AstrNaRuntime:
             != output_length_limit_enabled
         )
         if send_message_to_user_will_change or output_length_limit_will_change:
-            self.group_sender_concurrency.terminate(
+            self._terminate_group_sender_concurrency(
                 preserve_state=group_concurrency_enabled,
             )
             if output_length_limit_enabled and (
@@ -598,7 +674,7 @@ class AstrNaRuntime:
             != long_reply_enabled
         )
         if forward_nodes_will_change or long_reply_will_change:
-            self.group_sender_concurrency.terminate(
+            self._terminate_group_sender_concurrency(
                 preserve_state=group_concurrency_enabled,
             )
             self.long_reply_context.terminate(
@@ -611,9 +687,9 @@ class AstrNaRuntime:
                 self.long_reply_context.install()
 
         if group_concurrency_enabled:
-            self.group_sender_concurrency.install()
+            self._install_group_sender_concurrency()
         else:
-            self.group_sender_concurrency.terminate()
+            self._terminate_group_sender_concurrency()
         self._sync_gemini_request_headers()
 
         if self.config.get("provide_group_identity_tools", False):
@@ -788,7 +864,7 @@ class AstrNaRuntime:
         """在历史清理开关变化时重建共享保存 wrapper 的外层顺序。"""
 
         # 先拆掉共享外层，再重新按 group -> long reply -> history cleaners 安装。
-        self.group_sender_concurrency.terminate(
+        self._terminate_group_sender_concurrency(
             preserve_state=group_concurrency_enabled,
         )
         self.long_reply_context.terminate(
@@ -804,7 +880,7 @@ class AstrNaRuntime:
         if long_reply_enabled:
             self.long_reply_context.install()
         if group_concurrency_enabled:
-            self.group_sender_concurrency.install()
+            self._install_group_sender_concurrency()
         self._sync_gemini_request_headers()
 
     def _configure_auto_cache_cleanup(self) -> None:
@@ -960,7 +1036,7 @@ class AstrNaRuntime:
         # 群聊优化必须在首个 await 前停用，避免卸载期间继续收集新增消息。
         self.group_chat_context_optimizer.terminate()
         self.gemini_request_headers.terminate()
-        self.group_sender_concurrency.terminate()
+        self._terminate_group_sender_concurrency()
         await self.issue_assistant.terminate()
         self.long_reply_context.terminate()
         self.forward_nodes.terminate()

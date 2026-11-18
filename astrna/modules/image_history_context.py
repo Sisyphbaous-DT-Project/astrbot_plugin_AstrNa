@@ -20,6 +20,11 @@ IMAGE_HISTORY_PLACEHOLDER = "[历史图片：已省略原始图像，仅保留�
 class ImageHistoryContextModule:
     """清理历史上下文中的 base64 图片，避免旧图反复撑爆 prompt。"""
 
+    _agent_history_module: Any = None
+    _agent_history_original: Any = None
+    _agent_history_wrapper: Any = None
+    _agent_session_module: Any = None
+    _agent_session_original: Any = None
     _internal_stage_cls: type | None = None
     _original_save_to_history: Any = None
     _save_history_wrapper: Any = None
@@ -30,17 +35,101 @@ class ImageHistoryContextModule:
         self._installed = False
         self._missing_stage_warned = False
         self._missing_method_warned = False
+        self._missing_session_warned = False
 
     def install(self) -> bool:
         module_cls = type(self)
         if self._installed and module_cls._active_module is self:
             return True
 
-        internal_stage_cls = load_internal_stage_cls()
-        if internal_stage_cls is None:
+        installed = self._install_agent_history()
+        if not installed:
+            installed = self._install_legacy_history()
+        if not installed:
             if not self._missing_stage_warned:
                 self._log("warning", "AstrNa 未找到历史保存入口，跳过优化图片历史上下文。")
                 self._missing_stage_warned = True
+            return False
+
+        module_cls._active_module = self
+        self._installed = True
+        return True
+
+    def _install_agent_history(self) -> bool:
+        """优先包装新版唯一的原生历史提交入口。"""
+
+        module_cls = type(self)
+        history_module = load_agent_history_module()
+        original = getattr(history_module, "save_agent_history", None)
+        if not callable(original):
+            return False
+
+        if (
+            module_cls._agent_history_module is not None
+            and module_cls._agent_history_module is not history_module
+        ):
+            module_cls.restore_patch()
+
+        if module_cls._agent_history_original is None:
+            module_cls._agent_history_module = history_module
+            module_cls._agent_history_original = original
+            original_save_agent_history = original
+
+            async def astrna_save_agent_history(*args: Any, **kwargs: Any) -> Any:
+                active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_save_agent_history):
+                    active_module = None
+                if active_module is not None:
+                    try:
+                        args, kwargs = active_module.optimize_save_history_call(
+                            original_save_agent_history,
+                            args,
+                            kwargs,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        active_module._log(
+                            "warning",
+                            "AstrNa 清理保存图片历史上下文失败: %s",
+                            exc,
+                        )
+                return await original_save_agent_history(*args, **kwargs)
+
+            astrna_save_agent_history._astrna_image_history_context_patch = True
+            mark_wrapper_active(astrna_save_agent_history, original_save_agent_history)
+            module_cls._agent_history_wrapper = astrna_save_agent_history
+            history_module.save_agent_history = astrna_save_agent_history
+            self._bind_session_mirror(
+                astrna_save_agent_history,
+                original_save_agent_history,
+            )
+
+        return True
+
+    def _bind_session_mirror(self, wrapper: Any, previous: Any) -> None:
+        """同步会话模块顶部 from-import 拿到的那份同名引用。"""
+
+        module_cls = type(self)
+        session_module = load_agent_session_module()
+        bound = getattr(session_module, "save_agent_history", None)
+        if session_module is not None and same_callable(bound, previous):
+            module_cls._agent_session_module = session_module
+            module_cls._agent_session_original = bound
+            session_module.save_agent_history = wrapper
+            return
+
+        if not self._missing_session_warned:
+            self._log(
+                "debug",
+                "AstrNa 未同步会话模块的历史保存引用，保存阶段清理可能不生效。",
+            )
+            self._missing_session_warned = True
+
+    def _install_legacy_history(self) -> bool:
+        """旧版宿主仍以 InternalAgentSubStage._save_to_history 提交历史。"""
+
+        module_cls = type(self)
+        internal_stage_cls = load_internal_stage_cls()
+        if internal_stage_cls is None:
             return False
 
         original = getattr(internal_stage_cls, "_save_to_history", None)
@@ -85,8 +174,6 @@ class ImageHistoryContextModule:
             module_cls._save_history_wrapper = astrna_save_to_history
             internal_stage_cls._save_to_history = astrna_save_to_history
 
-        module_cls._active_module = self
-        self._installed = True
         return True
 
     def terminate(self) -> None:
@@ -97,6 +184,7 @@ class ImageHistoryContextModule:
 
     @classmethod
     def restore_patch(cls) -> None:
+        cls._restore_agent_history()
         mark_wrapper_inactive(cls._save_history_wrapper)
         if cls._internal_stage_cls is not None and cls._original_save_to_history is not None:
             current = getattr(cls._internal_stage_cls, "_save_to_history", None)
@@ -108,6 +196,27 @@ class ImageHistoryContextModule:
         cls._original_save_to_history = None
         cls._save_history_wrapper = None
         cls._active_module = None
+
+    @classmethod
+    def _restore_agent_history(cls) -> None:
+        wrapper = cls._agent_history_wrapper
+        if wrapper is None:
+            return
+        mark_wrapper_inactive(wrapper)
+        for module, previous in (
+            (cls._agent_history_module, cls._agent_history_original),
+            (cls._agent_session_module, cls._agent_session_original),
+        ):
+            if module is None or previous is None:
+                continue
+            current = getattr(module, "save_agent_history", None)
+            if same_callable(current, wrapper):
+                module.save_agent_history = unwrap_inactive_wrapper(previous)
+        cls._agent_history_module = None
+        cls._agent_history_original = None
+        cls._agent_history_wrapper = None
+        cls._agent_session_module = None
+        cls._agent_session_original = None
 
     def sanitize_request(self, req: Any) -> None:
         if req is None:
@@ -142,6 +251,12 @@ class ImageHistoryContextModule:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """把清理后的副本当作 all_messages 传入原生保存入口。
+
+        新旧入口都以 all_messages 表示本轮完整历史：新版 save_agent_history
+        原样保留自己的空回复、临时内容与写入策略，只改它看到的这份副本。
+        """
+
         parsed = parse_save_history_call(original_method, args, kwargs)
         if parsed is None:
             return args, kwargs
@@ -404,3 +519,23 @@ def load_internal_stage_cls() -> type | None:
         return InternalAgentSubStage
     except Exception:  # noqa: BLE001
         return None
+
+
+def load_agent_history_module() -> Any | None:
+    """导入新版历史提交模块，旧宿主没有该模块时返回 None。"""
+
+    try:
+        from astrbot.core.astr_agent_runtime import history
+    except Exception:  # noqa: BLE001
+        return None
+    return history
+
+
+def load_agent_session_module() -> Any | None:
+    """导入新版会话模块，用于同步它顶部 from-import 的同名引用。"""
+
+    try:
+        from astrbot.core.astr_agent_runtime import session
+    except Exception:  # noqa: BLE001
+        return None
+    return session

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import inspect
 import json
 import re
-from dataclasses import replace
+import weakref
+from dataclasses import dataclass, replace
 from functools import wraps
 from typing import Any
 
@@ -31,6 +33,21 @@ ASTRNA_MARKER_PATTERN = re.compile(
     r".*?</astrna_(?:reply_target|quoted_sender|quoted_reply_target)>",
     flags=re.DOTALL,
 )
+_REQUEST_EVENT_ATTR = "_astrna_reply_target_event_ref"
+# AstrBot 4.30 起历史保存迁到 astr_agent_runtime.history，session 以
+# from-import 另行绑定同一函数。
+_SAVE_HISTORY_MODULES = (
+    "astrbot.core.astr_agent_runtime.history",
+    "astrbot.core.astr_agent_runtime.session",
+)
+
+
+@dataclass
+class _PatchTarget:
+    owner: Any
+    attribute: str
+    original: Any
+    wrapper: Any = None
 
 
 class ReplyTargetHistoryModule:
@@ -49,6 +66,11 @@ class ReplyTargetHistoryModule:
     _quote_message_wrapper: Any = None
     _quote_internal_module: Any = None
     _original_internal_quote: Any = None
+    # AstrBot 4.30 入口：agent_media 承载引用消息，astr_agent_runtime 承载历史保存。
+    _save_targets: list[_PatchTarget] = []
+    _agent_media: Any = None
+    _original_append_quoted_content: Any = None
+    _append_quoted_wrapper: Any = None
     _active_module: ReplyTargetHistoryModule | None = None
 
     def __init__(
@@ -70,9 +92,15 @@ class ReplyTargetHistoryModule:
         if self._installed and type(self)._active_module is self:
             return True
         save_installed = self._install_save_history_patch()
+        agent_history_installed = self._install_agent_history_patch()
         response_installed = self._install_response_patch()
         quote_installed = self._install_quote_message_patch()
-        if not save_installed and not response_installed and not quote_installed:
+        if (
+            not save_installed
+            and not agent_history_installed
+            and not response_installed
+            and not quote_installed
+        ):
             return False
 
         type(self)._active_module = self
@@ -96,6 +124,26 @@ class ReplyTargetHistoryModule:
         mark_wrapper_inactive(cls._response_wrapper)
         mark_wrapper_inactive(cls._response_stream_wrapper)
         mark_wrapper_inactive(cls._quote_message_wrapper)
+        mark_wrapper_inactive(cls._append_quoted_wrapper)
+        for target in cls._save_targets:
+            mark_wrapper_inactive(target.wrapper)
+            if same_callable(
+                getattr(target.owner, target.attribute, None), target.wrapper
+            ):
+                setattr(
+                    target.owner,
+                    target.attribute,
+                    unwrap_inactive_wrapper(target.original),
+                )
+        if cls._agent_media is not None:
+            current_append = getattr(cls._agent_media, "append_quoted_content", None)
+            if (
+                cls._original_append_quoted_content is not None
+                and same_callable(current_append, cls._append_quoted_wrapper)
+            ):
+                cls._agent_media.append_quoted_content = unwrap_inactive_wrapper(
+                    cls._original_append_quoted_content
+                )
         if (
             cls._internal_stage_cls is not None
             and cls._original_save_to_history is not None
@@ -139,6 +187,10 @@ class ReplyTargetHistoryModule:
                 )
         cls._quote_internal_module = None
         cls._original_internal_quote = None
+        cls._save_targets = []
+        cls._agent_media = None
+        cls._original_append_quoted_content = None
+        cls._append_quoted_wrapper = None
         cls._internal_stage_cls = None
         cls._original_save_to_history = None
         cls._runner_cls = None
@@ -158,6 +210,8 @@ class ReplyTargetHistoryModule:
         req: Any,
         all_messages: list[Any],
     ) -> list[Any]:
+        # AstrBot 4.30 的历史保存入口只有 req，事件在引用收集阶段挂到请求上。
+        event = resolve_history_event(event, req)
         copied_messages = list(all_messages or [])
         changed = False
         for index, message in enumerate(copied_messages):
@@ -167,7 +221,7 @@ class ReplyTargetHistoryModule:
                 changed = True
                 continue
 
-        if self.semantic_enabled:
+        if self.semantic_enabled and event is not None:
             marker_metadata = build_reply_target_metadata(event)
             if marker_metadata:
                 target_index = find_last_persistable_assistant_message_index(
@@ -290,6 +344,40 @@ class ReplyTargetHistoryModule:
         if quote is None:
             return result
 
+        await self._append_reply_direction_hint(event, req, quote)
+        return result
+
+    async def optimize_append_quoted(
+        self,
+        original_append_quoted_content: Any,
+        signature: inspect.Signature | None,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        """AstrBot 4.30 的引用消息入口：补回复指向并记录本轮事件。"""
+        event, req = parse_append_quoted_call(signature, args, kwargs)
+        result = await original_append_quoted_content(*args, **kwargs)
+        if event is None or req is None:
+            return result
+
+        # 历史保存入口拿不到事件，这里把本轮来源挂到请求上供其读取。
+        remember_request_event(req, event)
+        if not self.semantic_enabled:
+            return result
+
+        quote = find_reply_component(event)
+        if quote is None:
+            return result
+
+        await self._append_reply_direction_hint(event, req, quote)
+        return result
+
+    async def _append_reply_direction_hint(
+        self,
+        event: Any,
+        req: Any,
+        quote: Any,
+    ) -> None:
         quoted_reply_target = None
         if is_quote_from_self(event, quote):
             quoted_text = normalize_match_text(
@@ -307,9 +395,9 @@ class ReplyTargetHistoryModule:
         if hint:
             append_temp_text_part(req, hint)
 
-        return result
-
     def _install_save_history_patch(self) -> bool:
+        if self._install_agent_history_patch():
+            return True
         internal_stage_cls = load_internal_stage_cls()
         if internal_stage_cls is None:
             self._log("debug", "AstrNa 未找到历史保存入口，跳过优化回复历史标记。")
@@ -350,6 +438,74 @@ class ReplyTargetHistoryModule:
             internal_stage_cls._save_to_history = astrna_save_to_history
 
         return True
+
+    def _install_agent_history_patch(self) -> bool:
+        """AstrBot 4.30 的历史保存入口：包装 save_agent_history 及其绑定。"""
+        targets: list[_PatchTarget] = []
+        for module_path in _SAVE_HISTORY_MODULES:
+            owner = load_owner_module(module_path)
+            if owner is None:
+                continue
+            original = getattr(owner, "save_agent_history", None)
+            if not callable(original):
+                continue
+            targets.append(_PatchTarget(owner, "save_agent_history", original))
+        if not targets:
+            return False
+
+        module_cls = type(self)
+        if module_cls._save_targets:
+            installed = all(
+                same_callable(
+                    getattr(target.owner, target.attribute, None), target.wrapper
+                )
+                for target in module_cls._save_targets
+            )
+            if installed and module_cls._active_module is not None:
+                return True
+            module_cls.restore_patch()
+            for target in targets:
+                target.original = unwrap_inactive_wrapper(
+                    getattr(target.owner, target.attribute)
+                )
+
+        wrappers: list[tuple[Any, Any]] = []
+        for target in targets:
+            wrapper = next(
+                (
+                    existing_wrapper
+                    for original, existing_wrapper in wrappers
+                    if same_callable(original, target.original)
+                ),
+                None,
+            )
+            if wrapper is None:
+                wrapper = self._build_save_agent_history_wrapper(target.original)
+                wrappers.append((target.original, wrapper))
+            target.wrapper = wrapper
+            setattr(target.owner, target.attribute, wrapper)
+
+        module_cls._save_targets = targets
+        return True
+
+    def _build_save_agent_history_wrapper(self, original_save_agent_history: Any) -> Any:
+        module_cls = type(self)
+
+        async def astrna_save_agent_history(*args: Any, **kwargs: Any) -> Any:
+            active_module = module_cls._active_module
+            if not is_wrapper_active(astrna_save_agent_history):
+                active_module = None
+            if active_module is not None:
+                args, kwargs = await active_module.optimize_save_history_call(
+                    original_save_agent_history,
+                    args,
+                    kwargs,
+                )
+            return await original_save_agent_history(*args, **kwargs)
+
+        astrna_save_agent_history._astrna_reply_target_history_patch = True  # type: ignore[attr-defined]
+        mark_wrapper_active(astrna_save_agent_history, original_save_agent_history)
+        return astrna_save_agent_history
 
     def _install_response_patch(self) -> bool:
         runner_cls = load_tool_loop_runner_cls()
@@ -430,6 +586,9 @@ class ReplyTargetHistoryModule:
     def _install_quote_message_patch(self) -> bool:
         astr_main_agent = load_astr_main_agent()
         if astr_main_agent is None:
+            agent_media = load_agent_media()
+            if agent_media is not None:
+                return self._install_append_quoted_patch(agent_media)
             self._log("debug", "AstrNa 未找到主对话模块，跳过引用消息历史标记。")
             return False
 
@@ -481,6 +640,56 @@ class ReplyTargetHistoryModule:
                 module_cls._quote_internal_module = internal
                 module_cls._original_internal_quote = original
                 internal._process_quote_message = astrna_process_quote_message
+
+        return True
+
+    def _install_append_quoted_patch(self, agent_media: Any) -> bool:
+        """AstrBot 4.30：引用消息入口改为 agent_media.append_quoted_content。"""
+        original = getattr(agent_media, "append_quoted_content", None)
+        if not callable(original):
+            self._log("debug", "AstrNa 未找到引用消息入口，跳过引用消息历史标记。")
+            return False
+
+        module_cls = type(self)
+        if (
+            module_cls._agent_media is not None
+            and module_cls._agent_media is not agent_media
+        ):
+            module_cls.restore_patch()
+
+        if module_cls._original_append_quoted_content is None:
+            try:
+                signature = inspect.signature(original)
+            except (TypeError, ValueError):
+                signature = None
+            module_cls._agent_media = agent_media
+            module_cls._original_append_quoted_content = original
+            original_append_quoted_content = original
+
+            # 保留宿主签名：外层图像转述层需要据此解析真实参数。
+            @wraps(original_append_quoted_content)
+            async def astrna_append_quoted_content(
+                *args: Any, **kwargs: Any
+            ) -> Any:
+                active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_append_quoted_content):
+                    active_module = None
+                if active_module is None:
+                    return await original_append_quoted_content(*args, **kwargs)
+                return await active_module.optimize_append_quoted(
+                    original_append_quoted_content,
+                    signature,
+                    args,
+                    kwargs,
+                )
+
+            astrna_append_quoted_content._astrna_reply_target_history_patch = True
+            mark_wrapper_active(
+                astrna_append_quoted_content,
+                original_append_quoted_content,
+            )
+            module_cls._append_quoted_wrapper = astrna_append_quoted_content
+            agent_media.append_quoted_content = astrna_append_quoted_content
 
         return True
 
@@ -1522,3 +1731,66 @@ def load_astr_main_agent() -> Any | None:
     except Exception:
         return None
     return astr_main_agent
+
+
+def load_agent_media() -> Any | None:
+    """加载 AstrBot 4.30 的图片与引用消息模块；旧版返回 None。"""
+    try:
+        from astrbot.core import agent_media
+    except Exception:
+        return None
+    return agent_media
+
+
+def load_owner_module(module_path: str) -> Any | None:
+    """按路径加载宿主模块；该版本不存在或导入失败时返回 None。"""
+    try:
+        return importlib.import_module(module_path)
+    except Exception:  # noqa: BLE001 - 能力探测不得把导入错误抛给宿主
+        return None
+
+
+def remember_request_event(req: Any, event: Any) -> None:
+    """把本轮事件挂到请求上，供没有事件参数的历史保存入口读取。"""
+    try:
+        setattr(req, _REQUEST_EVENT_ATTR, weakref.ref(event))
+    except Exception:  # noqa: BLE001 - 只读请求对象允许放弃记录
+        pass
+
+
+def resolve_history_event(event: Any, req: Any) -> Any | None:
+    """优先使用显式事件，其次读取请求上登记的事件。"""
+    if event is not None:
+        return event
+    ref = getattr(req, _REQUEST_EVENT_ATTR, None)
+    if ref is None:
+        return None
+    try:
+        return ref()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def parse_append_quoted_call(
+    signature: inspect.Signature | None,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[Any, Any]:
+    """按宿主真实签名取出事件与请求，缺失时返回 (None, None)。"""
+    event = kwargs.get("event")
+    req = kwargs.get("req")
+    if signature is not None:
+        try:
+            bound = signature.bind_partial(*args, **kwargs)
+        except Exception:  # noqa: BLE001
+            bound = None
+        if bound is not None:
+            event = bound.arguments.get("event", event)
+            req = bound.arguments.get("req", req)
+    if event is None and args:
+        event = args[0]
+    if req is None and len(args) > 1:
+        req = args[1]
+    if event is None or req is None:
+        return None, None
+    return event, req

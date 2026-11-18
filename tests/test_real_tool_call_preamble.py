@@ -4,10 +4,15 @@
 模型选择与二次询问均使用模拟 Provider，不请求真实模型；
 工具执行使用记录型 Executor 或真实 FunctionToolExecutor（不访问网络）。
 
+宿主能力探测：
+- AstrBot 4.30+ 用 ``execute_native_loop`` + ``present_turn`` 驱动原生 Runner，
+  断言的是最终投递到消息平台上的文字；
+- 4.29 及更早用 ``astr_agent_run_util.run_agent``（该模块在新版已删除）。
+
 覆盖：过场白 + 工具 + 最终回答（skills_like 线上同款与 full 原生模式）、
 两轮工具、skills_like 二次询问退回（两段/空回答）、buffer_intermediate_messages、
 工具执行中 stop、第二次请求报错、真实 FunctionToolExecutor + 返回 None 的
-直接发送工具；并断言对话历史里仍保留过场白。
+直接发送工具、流式透传；并断言对话历史里仍保留过场白。
 """
 
 # ruff: noqa: E402  # 需先把 ASTRBOT_SOURCE_PATH 插入 sys.path 才能导入真实源码
@@ -16,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,19 +39,40 @@ from astrbot.core.agent.message import TextPart
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
 from astrbot.core.agent.tool import FunctionTool, ToolSet
-from astrbot.core.astr_agent_run_util import run_agent
-from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
 from astrbot.core.message.message_event_result import MessageEventResult
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 from astrbot.core.provider.provider import Provider
 
 from astrna.modules.tool_call_preamble import ToolCallPreambleModule
 
+try:  # AstrBot 4.29 及更早
+    from astrbot.core.astr_agent_run_util import run_agent as _legacy_run_agent
+except Exception:  # noqa: BLE001 - 新版删除了该模块
+    _legacy_run_agent = None
+
+try:  # AstrBot 4.30+
+    from astrbot.core.agent.events import TurnFinished
+    from astrbot.core.agent_output import present_turn
+    from astrbot.core.astr_agent_runtime.execution import execute_native_loop
+except Exception:  # noqa: BLE001 - 旧版没有原生事件流
+    TurnFinished = None
+    present_turn = None
+    execute_native_loop = None
+
+try:
+    from astrbot.core.astr_agent_runtime.tool_executor import FunctionToolExecutor
+except Exception:  # noqa: BLE001 - 旧版路径
+    from astrbot.core.astr_agent_tool_exec import (  # type: ignore[no-redef]
+        FunctionToolExecutor,
+    )
+
+HAS_NATIVE_EVENT_STREAM = execute_native_loop is not None and present_turn is not None
 HAS_SKILLS_LIKE = callable(getattr(ToolLoopAgentRunner, "_resolve_tool_exec", None))
 
 EVENT_UMO = "test:GroupMessage:preamble"
 PREAMBLE = "我翻翻群里的生日簿"
 FINAL_ANSWER = "最近生日的是小明。"
+MAX_STEPS = 10
 
 
 class DummyLogger:
@@ -84,6 +111,14 @@ class ScriptedProvider(Provider):
         self.calls.append(kwargs)
         return self.responses[len(self.calls) - 1]
 
+    async def text_chat_stream(self, **kwargs):
+        response = await self.text_chat(**kwargs)
+        for char in response.completion_text or "":
+            yield LLMResponse(
+                role="assistant", completion_text=char, is_chunk=True
+            )
+        yield response
+
 
 class FakeHooks(BaseAgentRunHooks):
     async def on_agent_begin(self, run_context):
@@ -102,16 +137,21 @@ class FakeHooks(BaseAgentRunHooks):
 class RecordingToolExecutor:
     """记录实际收到的工具名与参数，并返回固定工具结果。"""
 
-    def __init__(self, on_execute=None):
+    def __init__(self, on_execute=None, yield_none=False):
         self.executed = []
         self.on_execute = on_execute
+        self.yield_none = yield_none
+        self.holder = {}
 
     def execute(self, tool, run_context, **tool_args):
         self.executed.append((tool.name, dict(tool_args)))
         if self.on_execute is not None:
-            self.on_execute()
+            self.on_execute(self.holder.get("runner"))
 
         async def generator():
+            if self.yield_none:
+                yield None
+                return
             from mcp.types import CallToolResult, TextContent
 
             yield CallToolResult(
@@ -162,8 +202,28 @@ class FakeEvent:
 
 
 class FakeAgentContext:
-    def __init__(self, event):
+    def __init__(self, event, send_to_user=True):
         self.event = event
+        self.send_to_user = send_to_user
+
+
+class FakeTurn:
+    """最小化 AgentTurn 替身：只做事件日志与只读回放。"""
+
+    def __init__(self, event):
+        self.id = "preamble-turn"
+        self.input = SimpleNamespace(event=event)
+        self.cancellation_requested = False
+        self._journal = []
+
+    def emit(self, payload):
+        self._journal.append(
+            SimpleNamespace(payload=payload, created_at=datetime.now(timezone.utc))
+        )
+
+    async def events(self):
+        for item in list(self._journal):
+            yield item
 
 
 @pytest.fixture
@@ -185,12 +245,12 @@ def preamble_factory():
     ToolCallPreambleModule.restore_patch()
 
 
-def build_tool_set():
+def build_tool_set(handler=None):
     tool = FunctionTool(
         name="query_birthdays",
         description="查询群友生日",
         parameters={"type": "object", "properties": {"query": {"type": "string"}}},
-        handler=None,
+        handler=handler,
     )
     return ToolSet(tools=[tool])
 
@@ -219,10 +279,10 @@ def final_response(text=FINAL_ANSWER):
     return LLMResponse(role="assistant", completion_text=text)
 
 
-async def drive_runner(provider, event, executor=None, *, tool_schema_mode="full", **run_kwargs):
+async def new_runner(provider, event, executor, tool_set, *, streaming=False, mode="full"):
     req = ProviderRequest(
         prompt="哪个群友生日最近",
-        func_tool=build_tool_set(),
+        func_tool=tool_set,
         contexts=[],
     )
     run_context = ContextWrapper(context=FakeAgentContext(event))
@@ -231,13 +291,73 @@ async def drive_runner(provider, event, executor=None, *, tool_schema_mode="full
         provider=provider,
         request=req,
         run_context=run_context,
-        tool_executor=executor or RecordingToolExecutor(),
+        tool_executor=executor,
         agent_hooks=FakeHooks(),
-        tool_schema_mode=tool_schema_mode,
-        streaming=False,
+        tool_schema_mode=mode,
+        streaming=streaming,
     )
-    chains = [chain async for chain in run_agent(runner, **run_kwargs)]
-    return runner, chains
+    return runner
+
+
+async def deliver(runner, event, *, streaming=False, buffer_intermediate_messages=False):
+    """按宿主版本驱动 Runner，返回实际投递出去的纯文本列表。"""
+    if HAS_NATIVE_EVENT_STREAM:
+        turn = FakeTurn(event)
+        result = await execute_native_loop(runner, turn, MAX_STEPS)
+        turn.emit(TurnFinished(result=result))
+        chains = [
+            chain
+            async for chain in present_turn(
+                turn,
+                streaming=streaming,
+                show_tool_use=True,
+                show_tool_call_result=False,
+                show_reasoning=False,
+                buffer_intermediate_messages=buffer_intermediate_messages,
+                context=None,
+            )
+        ]
+    else:
+        assert _legacy_run_agent is not None
+        chains = [
+            chain
+            async for chain in _legacy_run_agent(
+                runner,
+                buffer_intermediate_messages=buffer_intermediate_messages,
+            )
+        ]
+    texts = [chain.get_plain_text() for chain in chains if chain is not None]
+    texts.extend(
+        chain.get_plain_text() for chain in event.sent if chain is not None
+    )
+    return texts
+
+
+async def drive(
+    provider,
+    event,
+    executor=None,
+    *,
+    tool_set=None,
+    mode="full",
+    streaming=False,
+    buffer_intermediate_messages=False,
+):
+    runner = await new_runner(
+        provider,
+        event,
+        executor or RecordingToolExecutor(),
+        tool_set or build_tool_set(),
+        streaming=streaming,
+        mode=mode,
+    )
+    texts = await deliver(
+        runner,
+        event,
+        streaming=streaming,
+        buffer_intermediate_messages=buffer_intermediate_messages,
+    )
+    return runner, texts
 
 
 def history_text_parts(runner):
@@ -245,15 +365,9 @@ def history_text_parts(runner):
         part.text
         for message in runner.run_context.messages
         if message.role == "assistant"
-        for part in message.content
+        for part in (message.content or ())
         if isinstance(part, TextPart)
     ]
-
-
-def all_output_texts(chains, event):
-    texts = [chain.get_plain_text() for chain in chains if chain is not None]
-    texts.extend(chain.get_plain_text() for chain in event.sent)
-    return texts
 
 
 skills_like_required = pytest.mark.skipif(
@@ -261,43 +375,50 @@ skills_like_required = pytest.mark.skipif(
     reason="该用例需要 AstrBot skills_like 二次询问入口",
 )
 
+native_stream_required = pytest.mark.skipif(
+    not HAS_NATIVE_EVENT_STREAM,
+    reason="流式断言依赖 AstrBot 4.30+ 原生事件流",
+)
 
-@skills_like_required
-def test_skills_like_preamble_suppressed_but_kept_in_history(preamble_factory):
-    """线上同款：skills_like 选择工具前的过场白不发送，最终回答照常发送。"""
+
+def test_feature_on_suppresses_preamble_in_both_modes(preamble_factory):
+    """full 与 skills_like 两种模式：过场白不投递，最终回答照常投递。"""
 
     async def exercise():
-        provider = ScriptedProvider(
-            [tool_selection_response(), requery_tool_response(), final_response()]
-        )
-        event = FakeEvent()
-        executor = RecordingToolExecutor()
+        scripts = {
+            # full 模式直接执行首轮工具调用；skills_like 先二次询问再执行。
+            "full": (
+                [tool_selection_response(), final_response()],
+                [("query_birthdays", {})],
+            ),
+            "skills_like": (
+                [tool_selection_response(), requery_tool_response(), final_response()],
+                [("query_birthdays", {"query": "生日"})],
+            ),
+        }
         module = preamble_factory()
         assert module.install() is True
         try:
-            runner, chains = await drive_runner(
-                provider, event, executor, tool_schema_mode="skills_like"
-            )
+            for mode, (responses, expected_calls) in scripts.items():
+                provider = ScriptedProvider(responses)
+                event = FakeEvent()
+                executor = RecordingToolExecutor()
+                runner, texts = await drive(provider, event, executor, mode=mode)
+                assert any(FINAL_ANSWER in text for text in texts), mode
+                # 最终回答只投递一次，宿主收尾兜底不得重复。
+                assert sum(FINAL_ANSWER in text for text in texts) == 1, mode
+                assert all(PREAMBLE not in text for text in texts), mode
+                # 对话历史里仍保留过场白，模型上下文不受影响。
+                assert PREAMBLE in history_text_parts(runner), mode
+                assert FINAL_ANSWER in history_text_parts(runner), mode
+                assert executor.executed == expected_calls, mode
         finally:
             module.terminate()
-
-        assert len(provider.calls) == 3
-        assert executor.executed == [("query_birthdays", {"query": "生日"})]
-
-        outputs = all_output_texts(chains, event)
-        assert any(FINAL_ANSWER in text for text in outputs)
-        assert all(PREAMBLE not in text for text in outputs)
-
-        # 对话历史里仍保留过场白，模型上下文不受影响。
-        history_texts = history_text_parts(runner)
-        assert PREAMBLE in history_texts
-        assert FINAL_ANSWER in history_texts
 
     asyncio.run(exercise())
 
 
-@skills_like_required
-def test_skills_like_preamble_sent_when_feature_off(preamble_factory):
+def test_feature_off_sends_preamble(preamble_factory):
     """对照组：不安装门卫时，原生行为会把过场白发出去。"""
 
     async def exercise():
@@ -305,43 +426,8 @@ def test_skills_like_preamble_sent_when_feature_off(preamble_factory):
             [tool_selection_response(), requery_tool_response(), final_response()]
         )
         event = FakeEvent()
-        runner, chains = await drive_runner(
-            provider, event, RecordingToolExecutor(), tool_schema_mode="skills_like"
-        )
-        outputs = all_output_texts(chains, event)
-        assert any(PREAMBLE in text for text in outputs)
-        assert PREAMBLE in history_text_parts(runner)
-
-    asyncio.run(exercise())
-
-
-def test_full_mode_preamble_suppressed(preamble_factory):
-    """原生 function calling 模式：文字后带工具调用，过场白同样不发送。"""
-
-    async def exercise():
-        provider = ScriptedProvider(
-            [
-                LLMResponse(
-                    role="assistant",
-                    completion_text=PREAMBLE,
-                    tools_call_name=["query_birthdays"],
-                    tools_call_args=[{"query": "生日"}],
-                    tools_call_ids=["call-1"],
-                ),
-                final_response(),
-            ]
-        )
-        event = FakeEvent()
-        module = preamble_factory()
-        assert module.install() is True
-        try:
-            runner, chains = await drive_runner(provider, event)
-        finally:
-            module.terminate()
-
-        outputs = all_output_texts(chains, event)
-        assert any(FINAL_ANSWER in text for text in outputs)
-        assert all(PREAMBLE not in text for text in outputs)
+        runner, texts = await drive(provider, event, mode="skills_like")
+        assert any(PREAMBLE in text for text in texts)
         assert PREAMBLE in history_text_parts(runner)
 
     asyncio.run(exercise())
@@ -349,7 +435,7 @@ def test_full_mode_preamble_suppressed(preamble_factory):
 
 @skills_like_required
 def test_two_tool_rounds_suppress_every_preamble(preamble_factory):
-    """多轮工具调用：每一轮的过场白都不发送。"""
+    """多轮工具调用：每一轮的过场白都不投递。"""
 
     async def exercise():
         second_preamble = "我再确认一次"
@@ -367,17 +453,16 @@ def test_two_tool_rounds_suppress_every_preamble(preamble_factory):
         module = preamble_factory()
         assert module.install() is True
         try:
-            runner, chains = await drive_runner(
-                provider, event, executor, tool_schema_mode="skills_like"
+            runner, texts = await drive(
+                provider, event, executor, mode="skills_like"
             )
         finally:
             module.terminate()
 
         assert len(executor.executed) == 2
-        outputs = all_output_texts(chains, event)
-        assert any(FINAL_ANSWER in text for text in outputs)
-        assert all(PREAMBLE not in text for text in outputs)
-        assert all(second_preamble not in text for text in outputs)
+        assert any(FINAL_ANSWER in text for text in texts)
+        assert all(PREAMBLE not in text for text in texts)
+        assert all(second_preamble not in text for text in texts)
 
     asyncio.run(exercise())
 
@@ -398,17 +483,14 @@ def test_skills_like_fallback_two_segments_release_last(preamble_factory):
         module = preamble_factory()
         assert module.install() is True
         try:
-            runner, chains = await drive_runner(
-                provider, event, tool_schema_mode="skills_like"
-            )
+            _, texts = await drive(provider, event, mode="skills_like")
         finally:
             module.terminate()
 
-        outputs = all_output_texts(chains, event)
-        assert any(fallback_text in text for text in outputs)
-        assert all(PREAMBLE not in text for text in outputs)
-        # 退回回答在同一步内只放行一次。
-        assert sum(fallback_text in text for text in outputs) == 1
+        assert any(fallback_text in text for text in texts)
+        assert all(PREAMBLE not in text for text in texts)
+        # 退回回答只投递一次。
+        assert sum(fallback_text in text for text in texts) == 1
 
     asyncio.run(exercise())
 
@@ -429,14 +511,11 @@ def test_skills_like_fallback_empty_answer_releases_preamble(preamble_factory):
         module = preamble_factory()
         assert module.install() is True
         try:
-            runner, chains = await drive_runner(
-                provider, event, tool_schema_mode="skills_like"
-            )
+            _, texts = await drive(provider, event, mode="skills_like")
         finally:
             module.terminate()
 
-        outputs = all_output_texts(chains, event)
-        assert sum(PREAMBLE in text for text in outputs) == 1
+        assert sum(PREAMBLE in text for text in texts) == 1
 
     asyncio.run(exercise())
 
@@ -453,32 +532,32 @@ def test_buffer_intermediate_messages_still_suppresses_preamble(preamble_factory
         module = preamble_factory()
         assert module.install() is True
         try:
-            runner, chains = await drive_runner(
+            _, texts = await drive(
                 provider,
                 event,
-                RecordingToolExecutor(),
-                tool_schema_mode="skills_like",
+                mode="skills_like",
                 buffer_intermediate_messages=True,
             )
         finally:
             module.terminate()
 
-        outputs = all_output_texts(chains, event)
-        assert any(FINAL_ANSWER in text for text in outputs)
-        assert all(PREAMBLE not in text for text in outputs)
+        assert any(FINAL_ANSWER in text for text in texts)
+        assert all(PREAMBLE not in text for text in texts)
 
     asyncio.run(exercise())
 
 
 @skills_like_required
 def test_stop_during_tool_execution_drops_preamble(preamble_factory):
-    """工具执行中收到 stop：过场白随 aborted 一起丢弃，不再补发。"""
+    """工具执行中收到 stop：过场白随中止一起丢弃，不再补发。"""
 
     async def exercise():
         event = FakeEvent()
 
-        def stop_when_executed():
+        def stop_when_executed(runner):
             event.stopped = True
+            if runner is not None:
+                runner.request_stop()
 
         provider = ScriptedProvider(
             [tool_selection_response(), requery_tool_response(), final_response()]
@@ -487,14 +566,15 @@ def test_stop_during_tool_execution_drops_preamble(preamble_factory):
         module = preamble_factory()
         assert module.install() is True
         try:
-            runner, chains = await drive_runner(
-                provider, event, executor, tool_schema_mode="skills_like"
+            runner = await new_runner(
+                provider, event, executor, build_tool_set(), mode="skills_like"
             )
+            executor.holder["runner"] = runner
+            texts = await deliver(runner, event)
         finally:
             module.terminate()
 
-        outputs = all_output_texts(chains, event)
-        assert all(PREAMBLE not in text for text in outputs)
+        assert all(PREAMBLE not in text for text in texts)
         assert runner.was_aborted() is True
 
     asyncio.run(exercise())
@@ -502,7 +582,7 @@ def test_stop_during_tool_execution_drops_preamble(preamble_factory):
 
 @skills_like_required
 def test_llm_error_drops_preamble(preamble_factory):
-    """工具结果回传后第二次请求报错：err 信号丢弃扣住的文字。"""
+    """工具结果回传后第二次请求报错：扣住的文字丢弃。"""
 
     async def exercise():
         provider = ScriptedProvider(
@@ -516,24 +596,22 @@ def test_llm_error_drops_preamble(preamble_factory):
         module = preamble_factory()
         assert module.install() is True
         try:
-            runner, chains = await drive_runner(
-                provider, event, RecordingToolExecutor(), tool_schema_mode="skills_like"
-            )
+            _, texts = await drive(provider, event, mode="skills_like")
         finally:
             module.terminate()
 
-        outputs = all_output_texts(chains, event)
-        assert all(PREAMBLE not in text for text in outputs)
+        assert all(PREAMBLE not in text for text in texts)
+        # 模型错误信息本身照常交给用户，不受门卫影响。
+        assert any("模型接口炸了" in text for text in texts)
 
     asyncio.run(exercise())
 
 
-@skills_like_required
 def test_real_executor_direct_send_tool_drops_preamble(preamble_factory):
     """真实 FunctionToolExecutor + 返回 None 的直接发送工具。
 
     工具内 yield event.plain_result(...) 时 runner 在本步内置 DONE；
-    「见 tool_call 即清空」保证过场白不会排在工具直接发送的结果后面补发。
+    「见工具决策即清空」保证过场白不会排在工具直接发送的结果后面补发。
     """
 
     async def exercise():
@@ -543,45 +621,54 @@ def test_real_executor_direct_send_tool_drops_preamble(preamble_factory):
         async def handler(tool_event, **kwargs):
             yield tool_event.plain_result(direct_text)
 
-        tool = FunctionTool(
-            name="query_birthdays",
-            description="查询群友生日",
-            parameters={"type": "object", "properties": {"query": {"type": "string"}}},
-            handler=handler,
-        )
-        req = ProviderRequest(
-            prompt="哪个群友生日最近",
-            func_tool=ToolSet(tools=[tool]),
-            contexts=[],
-        )
         provider = ScriptedProvider(
             [tool_selection_response(), requery_tool_response()]
         )
-        run_context = ContextWrapper(context=FakeAgentContext(event))
-        runner = ToolLoopAgentRunner()
         module = preamble_factory()
         assert module.install() is True
         try:
-            await runner.reset(
-                provider=provider,
-                request=req,
-                run_context=run_context,
-                tool_executor=FunctionToolExecutor(),
-                agent_hooks=FakeHooks(),
-                tool_schema_mode="skills_like",
-                streaming=False,
+            runner = await new_runner(
+                provider,
+                event,
+                FunctionToolExecutor(),
+                build_tool_set(handler=handler),
+                mode="skills_like",
             )
-            chains = [chain async for chain in run_agent(runner)]
+            texts = await deliver(runner, event)
         finally:
             module.terminate()
 
-        outputs = all_output_texts(chains, event)
-        # 工具直接发送的结果照常发出（真实 Executor 经 event.send 直接发送）。
-        assert any(direct_text in text for text in outputs)
+        # 工具直接发送的结果照常发出。
+        assert any(direct_text in text for text in texts)
         # 过场白绝不允许排在直接发送结果后面补发。
-        assert all(PREAMBLE not in text for text in outputs)
+        assert all(PREAMBLE not in text for text in texts)
         # runner 确实走了「工具返回 None」的本步 DONE 路径。
         assert runner.done() is True
+
+    asyncio.run(exercise())
+
+
+@native_stream_required
+def test_streaming_keeps_preamble_visible(preamble_factory):
+    """流式文字边生成边发送，无法收回：维持原生行为，过场白照常可见。"""
+
+    async def exercise():
+        provider = ScriptedProvider(
+            [tool_selection_response(), requery_tool_response(), final_response()]
+        )
+        event = FakeEvent()
+        module = preamble_factory()
+        assert module.install() is True
+        try:
+            _, texts = await drive(
+                provider, event, mode="skills_like", streaming=True
+            )
+        finally:
+            module.terminate()
+
+        combined = "".join(texts)
+        assert PREAMBLE in combined
+        assert FINAL_ANSWER in combined
 
     asyncio.run(exercise())
 
@@ -591,23 +678,13 @@ def test_inactive_module_passes_through(preamble_factory):
 
     async def exercise():
         provider = ScriptedProvider(
-            [
-                LLMResponse(
-                    role="assistant",
-                    completion_text=PREAMBLE,
-                    tools_call_name=["query_birthdays"],
-                    tools_call_args=[{"query": "生日"}],
-                    tools_call_ids=["call-1"],
-                ),
-                final_response(),
-            ]
+            [tool_selection_response(), requery_tool_response(), final_response()]
         )
         event = FakeEvent()
         module = preamble_factory()
         assert module.install() is True
         module.terminate()
-        runner, chains = await drive_runner(provider, event)
-        outputs = all_output_texts(chains, event)
-        assert any(PREAMBLE in text for text in outputs)
+        _, texts = await drive(provider, event, mode="skills_like")
+        assert any(PREAMBLE in text for text in texts)
 
     asyncio.run(exercise())

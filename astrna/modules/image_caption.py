@@ -68,7 +68,12 @@ class QuoteMessageCall:
 
 
 class ImageCaptionModule:
-    """让 AstrBot 图片转述模型看到用户当前问题和引用文本。"""
+    """让 AstrBot 图片转述模型看到用户当前问题和引用文本。
+
+    旧版宿主经 ``astr_main_agent`` 的 ``_ensure_img_caption`` 与
+    ``_process_quote_message`` 生效；AstrBot 4.30 起改由 ``agent_media`` 的
+    ``caption_request_images`` 与 ``append_quoted_content`` 承担同样职责。
+    """
 
     _astr_main_agent: Any = None
     _original_ensure_img_caption: Any = None
@@ -82,6 +87,15 @@ class ImageCaptionModule:
     # 绕过包装；需同步替换 internal 命名空间中的引用，旧版无此引用时跳过。
     _internal_stage_module: Any = None
     _original_internal_process_quote_message: Any = None
+    # AstrBot 4.30 删除 astr_main_agent，图片转述迁到 agent_media；两条宿主路径
+    # 互斥，优先旧版以保持既有语义。
+    _agent_media: Any = None
+    _original_caption_request_images: Any = None
+    _original_append_quoted_content: Any = None
+    _caption_request_images_wrapper: Any = None
+    _append_quoted_content_wrapper: Any = None
+    # 提供 Reply、引用文字解析与动画提示的宿主模块。
+    _text_context_source: Any = None
 
     def __init__(self, logger: Any):
         self.logger = logger
@@ -90,10 +104,17 @@ class ImageCaptionModule:
 
     def install(self) -> bool:
         astr_main_agent = self._load_astr_main_agent()
-        if astr_main_agent is None:
-            self._log("warning", "AstrNa 未找到 AstrBot 主对话模块，跳过更好的图像转述。")
-            return False
+        if astr_main_agent is not None:
+            return self._install_legacy(astr_main_agent)
 
+        agent_media = self._load_agent_media()
+        if agent_media is not None:
+            return self._install_agent_media(agent_media)
+
+        self._log("warning", "AstrNa 未找到 AstrBot 主对话模块，跳过更好的图像转述。")
+        return False
+
+    def _install_legacy(self, astr_main_agent: Any) -> bool:
         if not callable(getattr(astr_main_agent, "_ensure_img_caption", None)):
             self._log("warning", "AstrNa 未找到图片转述入口，跳过更好的图像转述。")
             return False
@@ -102,6 +123,8 @@ class ImageCaptionModule:
             return False
 
         module_cls = type(self)
+        if module_cls._agent_media is not None:
+            module_cls.restore_patch()
         if (
             module_cls._astr_main_agent is not None
             and module_cls._astr_main_agent is not astr_main_agent
@@ -122,6 +145,7 @@ class ImageCaptionModule:
         if module_cls._original_ensure_img_caption is None:
             internal_stage = self._load_internal_stage_module()
             module_cls._astr_main_agent = astr_main_agent
+            module_cls._text_context_source = astr_main_agent
             module_cls._original_ensure_img_caption = astr_main_agent._ensure_img_caption
             module_cls._original_process_quote_message = (
                 astr_main_agent._process_quote_message
@@ -237,6 +261,145 @@ class ImageCaptionModule:
         self._log("info", "AstrNa 已启用更好的图像转述。")
         return True
 
+    def _install_agent_media(self, agent_media: Any) -> bool:
+        """AstrBot 4.30 起图片转述位于 agent_media，按同一语义接管两个入口。"""
+        if not callable(getattr(agent_media, "caption_request_images", None)):
+            self._log("warning", "AstrNa 未找到图片转述入口，跳过更好的图像转述。")
+            return False
+        if not callable(getattr(agent_media, "append_quoted_content", None)):
+            self._log("warning", "AstrNa 未找到引用消息转述入口，跳过更好的图像转述。")
+            return False
+
+        module_cls = type(self)
+        if module_cls._astr_main_agent is not None:
+            module_cls.restore_patch()
+        if (
+            module_cls._agent_media is not None
+            and module_cls._agent_media is not agent_media
+        ):
+            module_cls.restore_patch()
+        if module_cls._original_caption_request_images is not None and (
+            not same_callable(
+                agent_media.caption_request_images,
+                module_cls._caption_request_images_wrapper,
+            )
+            or not same_callable(
+                agent_media.append_quoted_content,
+                module_cls._append_quoted_content_wrapper,
+            )
+        ):
+            module_cls.restore_patch()
+
+        if module_cls._original_caption_request_images is None:
+            module_cls._agent_media = agent_media
+            module_cls._text_context_source = agent_media
+            module_cls._original_caption_request_images = (
+                agent_media.caption_request_images
+            )
+            module_cls._original_append_quoted_content = (
+                agent_media.append_quoted_content
+            )
+            original_caption_request_images = (
+                module_cls._original_caption_request_images
+            )
+            original_append_quoted_content = module_cls._original_append_quoted_content
+            try:
+                original_append_signature = inspect.signature(
+                    original_append_quoted_content
+                )
+            except (TypeError, ValueError):
+                original_append_signature = None
+
+            @wraps(original_caption_request_images)
+            async def astrna_caption_request_images(
+                event: Any,
+                req: Any,
+                cfg: dict,
+                plugin_context: Any,
+                image_caption_provider: str,
+                *extra_args: Any,
+                **extra_kwargs: Any,
+            ) -> Any:
+                active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_caption_request_images):
+                    active_module = None
+                if active_module is None:
+                    return await original_caption_request_images(
+                        event,
+                        req,
+                        cfg,
+                        plugin_context,
+                        image_caption_provider,
+                        *extra_args,
+                        **extra_kwargs,
+                    )
+
+                generation = active_module._generation
+                optimized_cfg = await active_module.build_image_caption_config(
+                    event,
+                    req,
+                    cfg,
+                )
+                if (
+                    not is_wrapper_active(astrna_caption_request_images)
+                    or not active_module._installed
+                    or module_cls._active_module is not active_module
+                    or active_module._generation is not generation
+                ):
+                    optimized_cfg = cfg
+                return await original_caption_request_images(
+                    event,
+                    req,
+                    optimized_cfg,
+                    plugin_context,
+                    image_caption_provider,
+                    *extra_args,
+                    **extra_kwargs,
+                )
+
+            @wraps(original_append_quoted_content)
+            async def astrna_append_quoted_content(
+                *args: Any, **kwargs: Any
+            ) -> Any:
+                active_module = module_cls._active_module
+                if not is_wrapper_active(astrna_append_quoted_content):
+                    active_module = None
+                call = parse_quote_message_call(
+                    args,
+                    kwargs,
+                    signature=original_append_signature,
+                    allowed_names=_APPEND_QUOTED_KNOWN_PARAMS,
+                )
+                if active_module is None or call is None:
+                    return await original_append_quoted_content(*args, **kwargs)
+
+                return await active_module.run_append_quoted_with_context(
+                    original_append_quoted_content,
+                    call,
+                )
+
+            astrna_caption_request_images._astrna_image_caption_patch = True
+            astrna_append_quoted_content._astrna_image_caption_patch = True
+            mark_wrapper_active(
+                astrna_caption_request_images,
+                original_caption_request_images,
+            )
+            mark_wrapper_active(
+                astrna_append_quoted_content,
+                original_append_quoted_content,
+            )
+            module_cls._caption_request_images_wrapper = (
+                astrna_caption_request_images
+            )
+            module_cls._append_quoted_content_wrapper = astrna_append_quoted_content
+            agent_media.caption_request_images = astrna_caption_request_images
+            agent_media.append_quoted_content = astrna_append_quoted_content
+
+        module_cls._active_module = self
+        self._installed = True
+        self._log("info", "AstrNa 已启用更好的图像转述。")
+        return True
+
     def terminate(self) -> None:
         module_cls = type(self)
         if self._installed and module_cls._active_module is self:
@@ -250,6 +413,31 @@ class ImageCaptionModule:
             cls._active_module._installed = False
         mark_wrapper_inactive(cls._ensure_img_caption_wrapper)
         mark_wrapper_inactive(cls._process_quote_message_wrapper)
+        mark_wrapper_inactive(cls._caption_request_images_wrapper)
+        mark_wrapper_inactive(cls._append_quoted_content_wrapper)
+        if cls._agent_media is not None:
+            current_caption = getattr(
+                cls._agent_media, "caption_request_images", None
+            )
+            if (
+                cls._original_caption_request_images is not None
+                and same_callable(
+                    current_caption, cls._caption_request_images_wrapper
+                )
+            ):
+                cls._agent_media.caption_request_images = unwrap_inactive_wrapper(
+                    cls._original_caption_request_images
+                )
+            current_append = getattr(cls._agent_media, "append_quoted_content", None)
+            if (
+                cls._original_append_quoted_content is not None
+                and same_callable(
+                    current_append, cls._append_quoted_content_wrapper
+                )
+            ):
+                cls._agent_media.append_quoted_content = unwrap_inactive_wrapper(
+                    cls._original_append_quoted_content
+                )
         if cls._astr_main_agent is not None:
             current_ensure = getattr(cls._astr_main_agent, "_ensure_img_caption", None)
             if (
@@ -288,11 +476,17 @@ class ImageCaptionModule:
             cls._restore_provider_patch(provider_id, force=True)
         cls._astr_main_agent = None
         cls._internal_stage_module = None
+        cls._agent_media = None
+        cls._text_context_source = None
         cls._original_ensure_img_caption = None
         cls._original_process_quote_message = None
         cls._original_internal_process_quote_message = None
+        cls._original_caption_request_images = None
+        cls._original_append_quoted_content = None
         cls._ensure_img_caption_wrapper = None
         cls._process_quote_message_wrapper = None
+        cls._caption_request_images_wrapper = None
+        cls._append_quoted_content_wrapper = None
         cls._active_module = None
 
     async def build_image_caption_config(
@@ -389,6 +583,77 @@ class ImageCaptionModule:
             _QUOTE_PROMPT_CONTEXT.reset(token)
             prompt_context.restore()
 
+    async def run_append_quoted_with_context(
+        self,
+        original_append_quoted_content: Any,
+        call: QuoteMessageCall,
+    ) -> Any:
+        """在 agent_media 引用转述时把本轮文字上下文带进转述提示词。"""
+        if (
+            call.skip_quote_image_caption
+            or call.main_provider_supports_image
+            or not call.img_cap_prov_id
+        ):
+            return await call_original_quote_message(
+                original_append_quoted_content,
+                call,
+            )
+
+        generation = self._generation
+        quoted_text = await self.collect_quoted_text(
+            call.event,
+            quoted_message_settings=call.quoted_message_settings,
+        )
+        # 收集引用文字可能等待平台接口；等待结束后确认包装仍属于当前模块。
+        if (
+            type(self)._active_module is not self
+            or not self._installed
+            or self._generation is not generation
+        ):
+            return await call_original_quote_message(
+                original_append_quoted_content,
+                call,
+            )
+
+        base_prompt = QUOTE_IMAGE_CAPTION_PROMPT
+        optimized_prompt = build_image_caption_prompt(
+            base_prompt,
+            user_prompt=getattr(call.req, "prompt", None),
+            quoted_text=quoted_text,
+        )
+        if optimized_prompt == base_prompt:
+            return await call_original_quote_message(
+                original_append_quoted_content,
+                call,
+            )
+
+        prompt_context = _ImageCaptionContextProxy(call.plugin_context, self)
+        native_prompt = QUOTE_IMAGE_CAPTION_PROMPT
+        animation_notice = getattr(
+            type(self)._text_context_source, "ANIMATION_CAPTION_NOTICE", None
+        )
+        if call.image_is_montage and isinstance(animation_notice, str):
+            native_prompt += animation_notice.format(indices="1")
+        token = _QUOTE_PROMPT_CONTEXT.set(
+            _QuoteCaptionPromptContext(
+                base_prompt=base_prompt,
+                user_prompt=getattr(call.req, "prompt", None),
+                quoted_text=quoted_text,
+                native_prompt=native_prompt,
+                module=self,
+                generation=generation,
+            )
+        )
+        try:
+            return await call_original_quote_message(
+                original_append_quoted_content,
+                call,
+                plugin_context=prompt_context,
+            )
+        finally:
+            _QUOTE_PROMPT_CONTEXT.reset(token)
+            prompt_context.restore()
+
     async def collect_quoted_text(
         self,
         event: Any,
@@ -397,24 +662,24 @@ class ImageCaptionModule:
         quoted_message_settings: Any = None,
         config: Any | None = None,
     ) -> str:
-        astr_main_agent = type(self)._astr_main_agent
-        if astr_main_agent is None:
+        source = type(self)._text_context_source
+        if source is None:
             return ""
 
-        quote = find_reply_component(event, astr_main_agent)
+        quote = find_reply_component(event, source)
         if quote is None:
             return ""
 
         if quoted_message_settings is None or quoted_message_settings is _MISSING:
             quoted_message_settings = build_quoted_message_settings(
-                astr_main_agent,
+                source,
                 cfg=cfg,
                 config=config,
             )
 
         message_text = ""
         extract_quoted_message_text = getattr(
-            astr_main_agent,
+            source,
             "extract_quoted_message_text",
             None,
         )
@@ -517,6 +782,14 @@ class ImageCaptionModule:
         except Exception:
             return None
         return astr_main_agent
+
+    def _load_agent_media(self) -> Any | None:
+        """加载 AstrBot 4.30 的图片转述模块；旧版无该模块时返回 None。"""
+        try:
+            from astrbot.core import agent_media
+        except Exception:
+            return None
+        return agent_media
 
     def _load_internal_stage_module(self) -> Any | None:
         """加载 internal stage 模块；旧版无该模块或极简环境下返回 None。"""
@@ -667,6 +940,10 @@ _QUOTE_MESSAGE_KNOWN_PARAMS = frozenset(
         "image_is_montage",
     }
 )
+# AstrBot 4.30 的 agent_media.append_quoted_content 去掉了 config 参数。
+_APPEND_QUOTED_KNOWN_PARAMS = frozenset(
+    _QUOTE_MESSAGE_KNOWN_PARAMS - {"config"}
+)
 
 
 def parse_quote_message_call(
@@ -674,6 +951,7 @@ def parse_quote_message_call(
     kwargs: dict[str, Any],
     *,
     signature: inspect.Signature | None,
+    allowed_names: frozenset[str] = _QUOTE_MESSAGE_KNOWN_PARAMS,
 ) -> QuoteMessageCall | None:
     """按安装时捕获的真实函数签名解析调用，避免混用新旧参数位置。"""
     if signature is None:
@@ -686,7 +964,7 @@ def parse_quote_message_call(
             inspect.Parameter.VAR_KEYWORD,
         ):
             return None
-        if parameter.name not in _QUOTE_MESSAGE_KNOWN_PARAMS:
+        if parameter.name not in allowed_names:
             return None
 
     try:
@@ -756,12 +1034,12 @@ def find_reply_component(event: Any, astr_main_agent: Any) -> Any | None:
 
 
 def build_quoted_message_settings(
-    astr_main_agent: Any,
+    source: Any,
     *,
     cfg: dict | None = None,
     config: Any | None = None,
 ) -> Any:
-    get_settings = getattr(astr_main_agent, "_get_quoted_message_parser_settings", None)
+    get_settings = getattr(source, "_get_quoted_message_parser_settings", None)
     if callable(get_settings):
         try:
             if cfg is not None:
@@ -770,7 +1048,17 @@ def build_quoted_message_settings(
                 return get_settings(getattr(config, "provider_settings", None))
         except Exception:
             pass
-    return getattr(astr_main_agent, "DEFAULT_QUOTED_MESSAGE_SETTINGS", None)
+    # AstrBot 4.30 的 agent_media 用 provider_settings 字典构造解析设置。
+    media_settings = getattr(source, "get_quoted_message_settings", None)
+    if callable(media_settings):
+        try:
+            if cfg is not None:
+                return media_settings(cfg)
+            if config is not None:
+                return media_settings(getattr(config, "provider_settings", None))
+        except Exception:
+            pass
+    return getattr(source, "DEFAULT_QUOTED_MESSAGE_SETTINGS", None)
 
 
 def get_quote_caption_base_prompt(config: Any | None) -> Any:

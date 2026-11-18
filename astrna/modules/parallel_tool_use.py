@@ -39,14 +39,7 @@ except Exception:  # pragma: no cover - 极简测试环境无 AstrBot Runner
     class _ToolExecutionInterrupted(Exception):
         pass
 
-try:
-    from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
-    from astrbot.core.tools.computer_tools.shell import ShellSessionTool
-except Exception:  # pragma: no cover - 旧版或极简测试环境兜底
-    FunctionToolExecutor = None  # type: ignore[assignment]
-    ShellSessionTool = None  # type: ignore[assignment]
-
-
+from ..utils.host_compat import load_class
 from ..utils.patching import (
     is_wrapper_active,
     mark_wrapper_active,
@@ -54,6 +47,38 @@ from ..utils.patching import (
     same_callable,
     unwrap_inactive_wrapper,
 )
+
+
+def _load_tool_runtime_types() -> tuple[Any, Any]:
+    """分两路探测工具执行器与 Shell 会话类型，先新版、后旧版。
+
+    AstrBot 4.30 把执行器迁到 ``astr_agent_runtime.tool_executor``、Shell 工具
+    迁到 ``astr_agent_runtime.tools.computer_tools.shell``。两路互不依赖：任一
+    版本导入成功即保留对应能力；都失败时返回 None，调用方分别退回无外层预算
+    补丁、无 Shell 等待扩时的旧行为。
+    """
+    executor_cls = load_class(
+        "astrbot.core.astr_agent_runtime.tool_executor",
+        "FunctionToolExecutor",
+    )
+    if executor_cls is None:
+        executor_cls = load_class(
+            "astrbot.core.astr_agent_tool_exec",
+            "FunctionToolExecutor",
+        )
+    shell_cls = load_class(
+        "astrbot.core.astr_agent_runtime.tools.computer_tools.shell",
+        "ShellSessionTool",
+    )
+    if shell_cls is None:
+        shell_cls = load_class(
+            "astrbot.core.tools.computer_tools.shell",
+            "ShellSessionTool",
+        )
+    return executor_cls, shell_cls
+
+
+FunctionToolExecutor, ShellSessionTool = _load_tool_runtime_types()
 
 
 class _ToolPermissionChanged(Exception):
@@ -1195,13 +1220,31 @@ def _shell_wait_timeout(
     return max(base_timeout, yield_time_ms / 1000 + 5)
 
 
+def _tool_execution_timeout(tool: Any) -> float | None:
+    """读取工具自带的单次执行预算。
+
+    AstrBot 4.30 为 ``FunctionTool`` 新增 ``execution_timeout``，原生执行器按
+    ``tool_call_timeout or execution_timeout or run_context.tool_call_timeout``
+    取实际预算。旧版没有该字段，读取结果为 None，行为保持不变。
+    """
+    value = getattr(tool, "execution_timeout", None)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if value > 0 else None
+
+
 def _tool_timeout(
     run_context: Any, tool: Any | None = None, params: dict[str, Any] | None = None
 ) -> float:
-    base_timeout = _base_tool_timeout(run_context)
+    """计算 AstrNa 单工具外层预算，覆盖宿主基础值与工具自带预算。
+
+    Shell 会话工具的等待动作会按原生口径继续扩时；这里只做放大，原生
+    ``asyncio.wait_for`` 仍按自己的优先级截断，因此不会放宽宿主的限制。
+    """
+    timeout = max(_base_tool_timeout(run_context), _tool_execution_timeout(tool) or 0.0)
     if tool is None or params is None:
-        return base_timeout
-    return _shell_wait_timeout(base_timeout, tool, params) or base_timeout
+        return timeout
+    return _shell_wait_timeout(timeout, tool, params) or timeout
 
 
 async def _parallel_batch_timeout(
@@ -1238,11 +1281,9 @@ async def _parallel_batch_timeout(
         if target is None or not _tool_is_active(target) or blocked_tool_reason(target):
             continue
         filtered = _filter_tool_parameters(target, parameters)
-        timeout = _shell_wait_timeout(
-            base_timeout, _execution_tool(binding, target), filtered
+        budgets.append(
+            _tool_timeout(run_context, _execution_tool(binding, target), filtered)
         )
-        if timeout is not None:
-            budgets.append(timeout)
     if binding.closed or ParallelToolUseModule._active_module is not binding.module:
         return None
     max_budget = max(budgets, default=base_timeout)

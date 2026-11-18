@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import inspect
 import os
 import weakref
@@ -110,6 +111,18 @@ _collection_capture: ContextVar[_CollectionCapture | None] = ContextVar(
 _REQUEST_IMAGES_ATTR = "_astrna_quoted_input_images"
 _NO_PREPARED_RESULT = object()
 
+# AstrBot 4.30 起的首次图片准备入口：agent_input 实际调用，builder 以
+# from-import 另行持有同一函数。
+_NEW_PREPARE_ENTRY_MODULES = (
+    "astrbot.core.agent_input",
+    "astrbot.core.astr_agent_runtime.main_agent.builder",
+)
+# AstrBot 4.30 起的请求收集入口：main_session 以 from-import 提前绑定。
+_NEW_COLLECT_ENTRY_MODULES = (
+    "astrbot.core.astr_agent_runtime.main_agent.request",
+    "astrbot.core.astr_agent_runtime.main_session",
+)
+
 
 class QuotedImageInputModule:
     """为第三方自建 ProviderRequest 补齐当前 Reply 引用图片。
@@ -135,21 +148,9 @@ class QuotedImageInputModule:
         self._generation = object()
 
     def install(self) -> bool:
-        main_agent = _load_astr_main_agent()
-        internal_stage = _load_internal_stage_module()
-        prepare_targets: list[_PatchTarget] = []
-        collect_targets: list[_PatchTarget] = []
-        for owner in (main_agent, internal_stage):
-            if owner is None:
-                continue
-            for attribute, targets in (
-                ("prepare_request_images", prepare_targets),
-                ("collect_initial_request", collect_targets),
-            ):
-                original = getattr(owner, attribute, None)
-                if not callable(original):
-                    continue
-                targets.append(_PatchTarget(owner, attribute, original, None))
+        prepare_targets, collect_targets = self._collect_legacy_targets()
+        if not prepare_targets:
+            prepare_targets, collect_targets = self._collect_host_targets()
 
         if not prepare_targets:
             # 旧版 AstrBot 无图片准备入口，optimize() 路径继续兜底。
@@ -194,6 +195,37 @@ class QuotedImageInputModule:
         module_cls._active_module = self
         self._installed = True
         return True
+
+    def _collect_legacy_targets(
+        self,
+    ) -> tuple[list[_PatchTarget], list[_PatchTarget]]:
+        """收集旧版宿主持有的入口（AstrBot 4.29 及更早）。"""
+        prepare_targets: list[_PatchTarget] = []
+        collect_targets: list[_PatchTarget] = []
+        for owner in (_load_astr_main_agent(), _load_internal_stage_module()):
+            _collect_entry_target(owner, "prepare_request_images", prepare_targets)
+            _collect_entry_target(owner, "collect_initial_request", collect_targets)
+        return prepare_targets, collect_targets
+
+    def _collect_host_targets(
+        self,
+    ) -> tuple[list[_PatchTarget], list[_PatchTarget]]:
+        """收集 AstrBot 4.30 起的入口；同一函数在多个模块绑定只登记一次。"""
+        prepare_targets: list[_PatchTarget] = []
+        collect_targets: list[_PatchTarget] = []
+        for module_path in _NEW_PREPARE_ENTRY_MODULES:
+            _collect_entry_target(
+                _load_owner_module(module_path),
+                "prepare_request_images",
+                prepare_targets,
+            )
+        for module_path in _NEW_COLLECT_ENTRY_MODULES:
+            _collect_entry_target(
+                _load_owner_module(module_path),
+                "collect_initial_request",
+                collect_targets,
+            )
+        return prepare_targets, collect_targets
 
     def _build_prepare_wrapper(self, original_prepare_request_images: Any) -> Any:
         module_cls = type(self)
@@ -756,6 +788,14 @@ class QuotedImageInputModule:
             log(*args)
 
 
+def _load_owner_module(module_path: str) -> Any | None:
+    """按路径加载宿主模块；该版本不存在或导入失败时返回 None。"""
+    try:
+        return importlib.import_module(module_path)
+    except Exception:  # noqa: BLE001 - 能力探测不得把导入错误抛给宿主
+        return None
+
+
 def _load_internal_stage_module() -> Any | None:
     """加载 internal stage 模块；旧版无该模块或极简环境下返回 None。"""
     try:
@@ -768,12 +808,28 @@ def _load_internal_stage_module() -> Any | None:
 
 
 def _load_astr_main_agent() -> Any | None:
-    """加载主 Agent 构建模块；极简测试环境缺失时返回 None。"""
+    """加载主 Agent 构建模块；AstrBot 4.30 移除后返回 None。"""
     try:
         from astrbot.core import astr_main_agent
     except Exception:
         return None
     return astr_main_agent
+
+
+def _collect_entry_target(
+    owner: Any | None,
+    attribute: str,
+    targets: list[_PatchTarget],
+) -> None:
+    """登记宿主模块持有的入口；同一函数对象只登记一次。"""
+    if owner is None:
+        return
+    original = getattr(owner, attribute, None)
+    if not callable(original):
+        return
+    if any(target.owner is owner for target in targets if target.attribute == attribute):
+        return
+    targets.append(_PatchTarget(owner, attribute, original, None))
 
 
 def image_ref_key(ref: str) -> str:

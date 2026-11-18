@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import copy
 import datetime
+import importlib
 import inspect
 import json
+import uuid
+import weakref
 from collections import OrderedDict
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,6 +26,7 @@ from ..utils.patching import (
 MAX_LONG_REPLY_CONTEXT_LENGTH = 20000
 MAX_PENDING_REPLIES = 200
 TRUNCATED_SUFFIX = "\n\n[AstrNa: 超长回复已截断，只保留前 20000 字。]"
+_PRESENTING = contextvars.ContextVar("astrna_long_reply_presenting", default=None)
 
 
 @dataclass
@@ -46,6 +53,7 @@ class LongReplyContextModule:
     _save_history_wrapper: Any = None
     _respond_wrapper: Any = None
     _set_result_wrapper: Any = None
+    _save_targets: list[tuple[Any, str, Any, Any]] = []
     _active_module: LongReplyContextModule | None = None
 
     def __init__(self, logger: Any):
@@ -53,6 +61,8 @@ class LongReplyContextModule:
         self._installed = False
         self._pending: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self.group_context_persist_callback: Any = None
+        self._deferred_history: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._settle_tasks: set[asyncio.Task[Any]] = set()
 
     def install(self) -> bool:
         if self._installed and type(self)._active_module is self:
@@ -60,8 +70,14 @@ class LongReplyContextModule:
 
         set_result_installed = self._install_set_result_patch()
         save_installed = self._install_save_history_patch()
+        agent_history_installed = self._install_agent_history_patch()
         respond_installed = self._install_respond_patch()
-        if not set_result_installed and not save_installed and not respond_installed:
+        if (
+            not set_result_installed
+            and not save_installed
+            and not agent_history_installed
+            and not respond_installed
+        ):
             return False
 
         type(self)._active_module = self
@@ -77,12 +93,20 @@ class LongReplyContextModule:
         if not preserve_state:
             self._pending.clear()
             self.group_context_persist_callback = None
+            self._deferred_history.clear()
+            for task in list(self._settle_tasks):
+                task.cancel()
+            self._settle_tasks.clear()
 
     @classmethod
     def restore_patch(cls) -> None:
         mark_wrapper_inactive(cls._save_history_wrapper)
         mark_wrapper_inactive(cls._respond_wrapper)
         mark_wrapper_inactive(cls._set_result_wrapper)
+        for owner, attribute, original, wrapper in cls._save_targets:
+            mark_wrapper_inactive(wrapper)
+            if same_callable(getattr(owner, attribute, None), wrapper):
+                setattr(owner, attribute, unwrap_inactive_wrapper(original))
         if cls._event_cls is not None and cls._original_set_result is not None:
             current = getattr(cls._event_cls, "set_result", None)
             if same_callable(current, cls._set_result_wrapper):
@@ -111,6 +135,7 @@ class LongReplyContextModule:
         cls._respond_wrapper = None
         cls._set_result_wrapper = None
         cls._active_module = None
+        cls._save_targets = []
 
     def _install_set_result_patch(self) -> bool:
         event_cls = load_astr_message_event_cls()
@@ -200,6 +225,203 @@ class LongReplyContextModule:
             internal_stage_cls._save_to_history = astrna_save_to_history
 
         return True
+
+    def _install_agent_history_patch(self) -> bool:
+        """AstrBot 4.30 的历史保存入口：save_agent_history 及其绑定。"""
+        module_cls = type(self)
+        targets: list[tuple[Any, str, Any]] = []
+        for module_path in (
+            "astrbot.core.astr_agent_runtime.history",
+            "astrbot.core.astr_agent_runtime.session",
+        ):
+            owner = load_owner_module(module_path)
+            if owner is None:
+                continue
+            original = getattr(owner, "save_agent_history", None)
+            if not callable(original):
+                continue
+            targets.append((owner, "save_agent_history", original))
+        if not targets:
+            return False
+        if module_cls._save_targets:
+            installed = all(
+                same_callable(getattr(owner, attribute, None), wrapper)
+                for owner, attribute, _original, wrapper in module_cls._save_targets
+            )
+            if installed and module_cls._active_module is not None:
+                return True
+            module_cls.restore_patch()
+            targets = [
+                (
+                    owner,
+                    attribute,
+                    unwrap_inactive_wrapper(getattr(owner, attribute)),
+                )
+                for owner, attribute, _original in targets
+            ]
+
+        wrappers: dict[int, Any] = {}
+        installed_targets: list[tuple[Any, str, Any, Any]] = []
+        for owner, attribute, original in targets:
+            wrapper = wrappers.get(id(original))
+            if wrapper is None:
+                wrapper = self._build_agent_history_wrapper(original)
+                wrappers[id(original)] = wrapper
+            setattr(owner, attribute, wrapper)
+            installed_targets.append((owner, attribute, original, wrapper))
+        runtime = load_owner_module("astrbot.core.agent.runtime")
+        turn_cls = getattr(runtime, "AgentTurn", None)
+        if turn_cls is not None:
+            original_events = turn_cls.events
+
+            async def events(turn):
+                async with aclosing(original_events(turn)) as journal:
+                    async for item in journal:
+                        if not is_wrapper_active(events):
+                            yield item
+                            continue
+                        token = _PRESENTING.set((turn, item.payload))
+                        try:
+                            yield item
+                        finally:
+                            try:
+                                _PRESENTING.reset(token)
+                            except ValueError:
+                                pass
+
+            mark_wrapper_active(events, original_events)
+            turn_cls.events = events
+            installed_targets.append((turn_cls, "events", original_events, events))
+        module_cls._save_targets = installed_targets
+        return True
+
+    def _build_agent_history_wrapper(self, original: Any) -> Any:
+        module_cls = type(self)
+
+        async def astrna_save_agent_history(*args: Any, **kwargs: Any) -> Any:
+            active_module = module_cls._active_module
+            if not is_wrapper_active(astrna_save_agent_history):
+                active_module = None
+            if active_module is not None:
+                try:
+                    args, kwargs = await active_module.optimize_agent_history_call(
+                        args,
+                        kwargs,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    active_module._log(
+                        "warning",
+                        "AstrNa 新版保存超长回复上下文失败: %s",
+                        exc,
+                    )
+            saved = await original(*args, **kwargs)
+            writer, req = kwargs.get("writer"), kwargs.get("req")
+            if (saved and active_module is module_cls._active_module and active_module is not None
+                    and is_wrapper_active(astrna_save_agent_history)
+                    and getattr(writer, "store", None) is not None
+                    and is_assistant_llm_response(kwargs.get("llm_response"))):
+                message = find_last_assistant_message(kwargs.get("all_messages") or [])
+                if message is not None and not has_tool_calls(message) and not getattr(message, "_no_save", False):
+                    key, pending = active_module._find_pending_for_request(req, writer)
+                    # 保存及内层投影均已完成，包括规范化导致的稳定 ID 替换。
+                    active_module._remember_deferred_history(writer, req, pending)
+                    if pending and active_module._finish_delivery(pending):
+                        active_module._pending.pop(key, None)
+            return saved
+
+        astrna_save_agent_history._astrna_long_reply_context_patch = True
+        mark_wrapper_active(astrna_save_agent_history, original)
+        return astrna_save_agent_history
+
+    async def optimize_agent_history_call(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """新版：只替换本回合最后一条 assistant 的正文，不新建消息。"""
+        req = kwargs.get("req")
+        all_messages = kwargs.get("all_messages")
+        llm_response = kwargs.get("llm_response")
+        if not isinstance(all_messages, list):
+            return args, kwargs
+        pending_key, pending = self._find_pending_for_request(
+            req, kwargs.get("writer")
+        )
+        if pending is None and not is_assistant_llm_response(llm_response):
+            return args, kwargs
+
+        assistant_message = find_last_assistant_message(all_messages)
+        if (
+            assistant_message is None
+            or getattr(assistant_message, "tool_calls", None)
+            or bool(getattr(assistant_message, "_no_save", False))
+        ):
+            if pending_key:
+                self._pending.pop(str(pending_key), None)
+            return args, kwargs
+
+        durable = getattr(kwargs.get("writer"), "store", None) is not None
+        text = "" if durable else str((pending or {}).get("final_text") or "")
+        text = text or extract_llm_response_text(llm_response)
+        if not text:
+            text = join_text_content(get_message_content(assistant_message))
+        if not text:
+            return args, kwargs
+
+        optimized_messages, found, changed = replace_last_assistant_message_text(
+            all_messages,
+            clamp_context_text(text),
+        )
+        if pending_key and not durable:
+            self._pending.pop(pending_key, None)
+        if not found or not changed:
+            return args, kwargs
+
+        # 新版没有旧 event 对象，Bot 群上下文补充只在旧保存入口完成；
+        # 完整正文仍写回本回合的历史副本，不影响其他回合。
+        if (pending or {}).get("append_group_context"):
+            self._log(
+                "debug",
+                "AstrNa 新版历史入口暂不补充 Bot 群上下文记录（缺少事件身份）。",
+            )
+        updated = dict(kwargs)
+        updated["all_messages"] = optimized_messages
+        return args, updated
+
+    def bind_request_event(self, event: Any, req: Any) -> None:
+        """在请求 hook 阶段绑定本轮事件，供新版保存入口精确查找 pending。"""
+        if event is None or req is None:
+            return
+        try:
+            setattr(req, "_astrna_long_reply_event_ref", weakref.ref(event))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _find_pending_for_request(
+        self, req: Any, writer: Any = None
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        ref = getattr(req, "_astrna_long_reply_event_ref", None)
+        if callable(ref):
+            event = ref()
+            if event is None:
+                return None, None
+            return self._find_pending_for_event(event)
+
+        conversation = getattr(req, "conversation", None)
+        cid = sanitize_key_part(getattr(conversation, "cid", None))
+        umo = sanitize_key_part(getattr(writer, "umo", None))
+        candidates: list[tuple[str, dict[str, Any]]] = []
+        for key, pending in self._pending.items():
+            if not isinstance(pending, dict):
+                continue
+            if cid and pending.get("conversation_id") == cid:
+                candidates.append((key, pending))
+            elif not cid and umo and pending.get("unified_msg_origin") == umo:
+                candidates.append((key, pending))
+        # 无法取得事件身份时只允许唯一候选；共享 cid 的并发 pending 不猜。
+        if len(candidates) == 1:
+            return candidates[0]
+        return None, None
 
     def _install_respond_patch(self) -> bool:
         respond_stage_cls = load_respond_stage_cls()
@@ -299,12 +521,21 @@ class LongReplyContextModule:
         conversation_id = ""
         if isinstance(old_pending, dict):
             conversation_id = sanitize_key_part(old_pending.get("conversation_id"))
+        if not conversation_id:
+            request = get_event_extra(event, "provider_request")
+            conversation = getattr(request, "conversation", None)
+            conversation_id = sanitize_key_part(getattr(conversation, "cid", None))
         pending = {
             "text": clamp_context_text(text),
             "conversation_id": conversation_id,
             "unified_msg_origin": umo,
             "event_id": str(id(event)),
         }
+        presenting = _PRESENTING.get()
+        if presenting and presenting[0].input.event is event:
+            turn, payload = presenting
+            pending["turn"] = weakref.ref(turn)
+            pending["output"] = (payload.type, getattr(payload, "message_id", None))
         self._pending[session_key] = pending
         set_event_extra(event, "_astrna_long_reply_pending_key", session_key)
         self._pending.move_to_end(session_key)
@@ -422,6 +653,165 @@ class LongReplyContextModule:
             self._pending[pending_key] = pending
             self._pending.move_to_end(pending_key)
 
+    def _remember_deferred_history(
+        self,
+        writer: Any,
+        req: Any,
+        pending: dict[str, Any] | None,
+    ) -> None:
+        """记录本回合 assistant 的持久事件 ID，供发送后定点修正。"""
+        entries = getattr(writer, "_entries", None)
+        if writer is None or not isinstance(entries, list):
+            return
+        base_ids = {
+            entry.get("id")
+            for entry in getattr(writer, "_astrna_base_entries", [])
+            if isinstance(entry, dict)
+        }
+        assistant_id = None
+        for entry in reversed(entries):
+            if not isinstance(entry, dict) or entry.get("id") in base_ids:
+                continue
+            message = entry.get("message")
+            if isinstance(message, dict) and message.get("role") == "assistant" and not message.get("tool_calls"):
+                assistant_id = entry.get("id")
+                break
+        if not assistant_id:
+            return
+        conversation = getattr(req, "conversation", None)
+        cid = sanitize_key_part(getattr(conversation, "cid", None))
+        store = getattr(writer, "store", None)
+        if not cid or store is None:
+            return
+        event_id = sanitize_key_part((pending or {}).get("event_id"))
+        if not event_id:
+            ref = getattr(req, "_astrna_long_reply_event_ref", None)
+            event = ref() if callable(ref) else None
+            event_id = str(id(event)) if event is not None else ""
+        identity = self._deferred_history_key(cid, {"event_id": event_id})
+        if not identity:
+            return
+        self._deferred_history[identity] = {
+            "cid": cid,
+            "assistant_id": assistant_id,
+            "umo": sanitize_key_part(getattr(writer, "umo", None)),
+            "store": store,
+        }
+        self._deferred_history.move_to_end(identity)
+        while len(self._deferred_history) > MAX_PENDING_REPLIES:
+            self._deferred_history.popitem(last=False)
+
+    @staticmethod
+    def _deferred_history_key(cid: str, pending: dict[str, Any]) -> str:
+        event_id = sanitize_key_part(pending.get("event_id"))
+        return f"{cid}#{event_id}" if cid and event_id else ""
+
+    def _schedule_deferred_settlement(self, pending: dict[str, Any]) -> None:
+        final_text = str(pending.get("final_text") or "")
+        if not final_text:
+            return
+        if not (pending.get("send_succeeded") and not pending.get("send_failed")):
+            return
+        cid = sanitize_key_part(pending.get("conversation_id"))
+        identity = self._deferred_history_key(cid, pending)
+        deferred = self._deferred_history.get(identity)
+        if not deferred:
+            return
+        try:
+            task = asyncio.create_task(
+                self._settle_history(
+                    identity,
+                    cid,
+                    str(deferred["assistant_id"]),
+                    final_text,
+                )
+            )
+        except RuntimeError:
+            return
+        self._settle_tasks.add(task)
+        task.add_done_callback(self._settle_tasks.discard)
+
+    async def _settle_history(
+        self,
+        identity: str,
+        cid: str,
+        assistant_id: str,
+        text: str,
+    ) -> None:
+        deferred = self._deferred_history.pop(identity, None)
+        if deferred is None or deferred.get("cid") != cid:
+            return
+        store = deferred.get("store")
+        if store is None:
+            return
+        event_id = uuid.uuid4().hex
+        for attempt in range(3):
+            try:
+                snapshot = await store.read(cid)
+                entries = list(getattr(snapshot, "entries", []))
+                if not any(entry.get("id") == assistant_id for entry in entries):
+                    # 消息已被 reset、删除或压缩移除，不再追加回来。
+                    return
+                merged: list[dict] = []
+                for entry in entries:
+                    if entry.get("id") != assistant_id:
+                        merged.append(entry)
+                        continue
+                    message = dict(entry.get("message") or {})
+                    message["content"] = replace_content_text(message.get("content"), text)
+                    merged.append({"id": assistant_id, "message": message})
+                revision = getattr(snapshot, "revision", None)
+                expected_leaf = getattr(revision, "leaf_event_id", None)
+                if not expected_leaf:
+                    return
+                append = getattr(store, "append_exact", None)
+                if not callable(append):
+                    append = store.append
+                await append(
+                    cid,
+                    [
+                        {
+                            "type": "context.rebased",
+                            "payload": {
+                                "messages": merged,
+                                "reason": "legacy_replace",
+                                "origin": "system",
+                            },
+                            "event_id": event_id,
+                        }
+                    ],
+                    expected_leaf=expected_leaf,
+                )
+                return
+            except Exception as exc:  # noqa: BLE001
+                if type(exc).__name__ == "ConversationConflictError" and attempt < 2:
+                    continue
+                self._log("warning", "AstrNa 长回复历史修正失败: %s", exc)
+                return
+
+    def _finish_delivery(self, pending: dict) -> bool:
+        identity = self._deferred_history_key(pending.get("conversation_id", ""), pending)
+        if identity not in self._deferred_history or "send_succeeded" not in pending:
+            return False
+        if "turn" in pending:
+            turn = pending["turn"]()
+            if turn is None:
+                return False
+            kind, message_id = pending["output"]
+            # 输出 ID 与持久化的请求 ID 不同。保存完成后，日志中最后一条
+            # message.completed 才是最终回复；合并呈现用 turn.finished。
+            if kind != "turn.finished" and (
+                kind != "message.completed" or message_id != next(
+                    (e.payload.message_id for e in reversed(turn._events) if e.type == "message.completed"), None
+                )
+            ):
+                return False
+        if pending.get("final_text") and pending["send_succeeded"] and not pending.get("send_failed"):
+            self._schedule_deferred_settlement(pending)
+        else:
+            self._deferred_history.pop(identity, None)
+        return True
+
     def record_send_result(self, event: Any, tracker: SendTracker) -> None:
         pending_key, pending = self._find_pending_for_event(event)
         if not pending_key or pending is None:
@@ -432,8 +822,16 @@ class LongReplyContextModule:
         unresolved_failures = max(0, tracker.failed - recovered_failures)
         pending["send_succeeded"] = tracker.succeeded > 0
         pending["send_failed"] = unresolved_failures > 0
+        if not pending.get("conversation_id"):
+            request = get_event_extra(event, "provider_request")
+            conversation = getattr(request, "conversation", None)
+            cid = sanitize_key_part(getattr(conversation, "cid", None))
+            if cid:
+                pending["conversation_id"] = cid
         self._pending[pending_key] = pending
         self._pending.move_to_end(pending_key)
+        if self._finish_delivery(pending):
+            self._pending.pop(pending_key, None)
 
     async def append_group_context_record(
         self,
@@ -510,7 +908,14 @@ class LongReplyContextModule:
                 and pending.get("event_id") == str(id(event))
             ):
                 return event_key, pending
-        return None, None
+        matches = [
+            (key, pending)
+            for key, pending in self._pending.items()
+            if isinstance(pending, dict)
+            and pending.get("unified_msg_origin") == umo
+            and pending.get("event_id") == str(id(event))
+        ]
+        return matches[0] if len(matches) == 1 else (None, None)
 
     def _log(self, level: str, *args: Any) -> None:
         log = getattr(self.logger, level, None)
@@ -1120,6 +1525,14 @@ def safe_call(func: Any, *args: Any, **kwargs: Any) -> Any:
         return None
     try:
         return func(*args, **kwargs)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def load_owner_module(module_path: str) -> Any | None:
+    """按路径加载宿主模块；旧版本不存在时返回 None。"""
+    try:
+        return importlib.import_module(module_path)
     except Exception:  # noqa: BLE001
         return None
 

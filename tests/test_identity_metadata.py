@@ -1206,7 +1206,14 @@ def test_identity_metadata_no_save_part_is_filtered_from_saved_history(monkeypat
         content=[{"type": "text", "text": "hello"}, create_text_part("runtime only")],
     )
 
-    dumped = message_module.dump_messages_with_checkpoints([message])
+    dump_with_checkpoints = getattr(
+        message_module, "dump_messages_with_checkpoints", None
+    )
+    if callable(dump_with_checkpoints):
+        dumped = dump_with_checkpoints([message])
+    else:
+        # AstrBot 4.30 删除检查点序列化，dump_messages 同样过滤 _no_save 片段。
+        dumped = message_module.dump_messages([message])
 
     assert dumped == [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
 

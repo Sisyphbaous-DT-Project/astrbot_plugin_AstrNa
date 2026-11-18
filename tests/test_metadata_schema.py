@@ -14,7 +14,7 @@ def test_metadata_has_required_fields():
     assert metadata["display_name"] == "AstrNa"
     assert "short_desc" not in metadata
     assert metadata["desc"] == "AstrNa是一款AstrBot优化插件"
-    assert metadata["version"] == "1.7.3"
+    assert metadata["version"] == "1.8.0-alpha1"
     assert metadata["author"] == "C₂₂H₂₅NO₆"
     assert (
         metadata["repo"]
@@ -516,6 +516,7 @@ def test_changelog_contains_release_notes():
     assert "## 1.7.1" in changelog
     assert "## 1.7.2" in changelog
     assert "## 1.7.3" in changelog
+    assert "## 1.8.0-alpha1" in changelog
     assert "## 1.2.5" in changelog
     assert "## 1.2.4" in changelog
 
@@ -527,4 +528,6 @@ def test_readme_current_version_matches_metadata():
     version = str(metadata["version"])
     label = "当前测试版" if "beta" in version else "当前正式版"
     assert f"{label}：`{version}`" in readme
-    assert "当前已测试兼容 AstrBot 版本：`4.29.4`" in readme
+    assert (
+        "当前已测试兼容 AstrBot 版本：`4.30.0-alpha.1`、`4.29.4`" in readme
+    )

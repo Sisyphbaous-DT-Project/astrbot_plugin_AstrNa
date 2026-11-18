@@ -1014,22 +1014,24 @@ class GroupChatContextOptimizerModule:
             config = get_context_config(context, event)
             if config is None:
                 continue
-            # AstrBot 4.28 起，上下文轮次配置迁移到 agent_runner.config.compression
-            compression = get_config_value(
-                get_config_value(
-                    get_config_value(config, "agent_runner", None),
-                    "config",
+            # AstrBot 4.30 起主 Agent 配置迁移到 agent.config.compression，
+            # 4.28/4.29 位于 agent_runner.config.compression，再早位于 provider_settings。
+            for section_key in ("agent", "agent_runner"):
+                compression = get_config_value(
+                    get_config_value(
+                        get_config_value(config, section_key, None),
+                        "config",
+                        None,
+                    ),
+                    "compression",
                     None,
-                ),
-                "compression",
-                None,
-            )
-            truncation = parse_context_truncation_values(
-                get_config_value(compression, "max_turns", None),
-                get_config_value(compression, "trim_turns", 1),
-            )
-            if truncation is not None:
-                return truncation
+                )
+                truncation = parse_context_truncation_values(
+                    get_config_value(compression, "max_turns", None),
+                    get_config_value(compression, "trim_turns", 1),
+                )
+                if truncation is not None:
+                    return truncation
             # 旧版 AstrBot 的轮次配置位于 provider_settings
             truncation = parse_context_truncation_settings(
                 get_config_value(config, "provider_settings", None),

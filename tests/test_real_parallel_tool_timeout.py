@@ -19,9 +19,27 @@ if str(ASTRBOT_SOURCE) not in sys.path:
     sys.path.insert(0, str(ASTRBOT_SOURCE))
 
 from astrbot.core.agent.run_context import ContextWrapper
-from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
 from astrbot.core.provider.func_tool_manager import FunctionToolManager
-from astrbot.core.tools.computer_tools.shell import ShellSessionTool
+
+
+def _import_tool_runtime():
+    """按先新版、后旧版的顺序导入执行器与 Shell 会话工具。"""
+    try:
+        from astrbot.core.astr_agent_runtime.tool_executor import (
+            FunctionToolExecutor,
+        )
+    except ModuleNotFoundError:
+        from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
+    try:
+        from astrbot.core.astr_agent_runtime.tools.computer_tools.shell import (
+            ShellSessionTool,
+        )
+    except ModuleNotFoundError:
+        from astrbot.core.tools.computer_tools.shell import ShellSessionTool
+    return FunctionToolExecutor, ShellSessionTool
+
+
+FunctionToolExecutor, ShellSessionTool = _import_tool_runtime()
 
 from astrna.modules import parallel_tool_use as ptu
 from astrna.modules.parallel_tool_use import ParallelToolUseModule, ParallelToolUseTool
@@ -96,11 +114,11 @@ def _shell_tool(name: str, delay: float) -> ShellSessionTool:
     return tool
 
 
-def _runtime_parts():
+def _runtime_parts(extra_tools=(), allowlist=("shell_a", "shell_b")):
     manager = Manager()
     first = _shell_tool("shell_a", 1.2)
     second = _shell_tool("shell_b", 1.2)
-    manager.func_list.extend([first, second])
+    manager.func_list.extend([first, second, *extra_tools])
     parallel_tool = ParallelToolUseTool()
     manager.func_list.append(parallel_tool)
     event = Event()
@@ -110,7 +128,7 @@ def _runtime_parts():
     module = ParallelToolUseModule(
         plugin_context,
         DummyLogger(),
-        allowlist=["shell_a", "shell_b"],
+        allowlist=list(allowlist),
     )
     module._installed = True
     module._registered_manager = manager
@@ -124,7 +142,7 @@ def _runtime_parts():
         executor=FunctionToolExecutor(),
         hooks=Hooks(),
         tool_manager=manager,
-        allowlist=frozenset({"shell_a", "shell_b"}),
+        allowlist=frozenset(allowlist),
         module=module,
     )
     return module, binding.tool_set.get_tool(ptu.PARALLEL_TOOL_NAME), run_context, binding
@@ -156,6 +174,22 @@ def native_shell_wait_supported(monkeypatch):
         return bool(budgets) and budgets[0] >= 6
 
     return asyncio.run(probe())
+
+
+def _supports_execution_timeout() -> bool:
+    """探测宿主 FunctionTool 是否带 execution_timeout（AstrBot 4.30 新增）。"""
+    from astrbot.core.agent.tool import FunctionTool
+
+    async def probe(event):
+        return "probe"
+
+    tool = FunctionTool(
+        name="execution_timeout_probe",
+        description="probe",
+        parameters={"type": "object", "properties": {}},
+        handler=probe,
+    )
+    return hasattr(tool, "execution_timeout")
 
 
 def test_real_executor_shell_children_and_outer_batch_both_get_wait_budget(
@@ -348,3 +382,143 @@ def test_shell_wait_action_budget_uses_real_type_and_valid_parameters(action):
     assert ptu._tool_timeout(
         context, same_name_plugin, {"action": action, "yield_time_ms": 300000}
     ) == 1
+
+def test_tool_execution_timeout_overrides_outer_base_budget():
+    """工具自带 execution_timeout 时，AstrNa 外层预算不得按基础值提前截断。"""
+    if not _supports_execution_timeout():
+        pytest.skip("宿主 FunctionTool 尚未支持 execution_timeout")
+
+    async def scenario():
+        from astrbot.core.agent.tool import FunctionTool
+
+        async def slow_handler(event):
+            await asyncio.sleep(1.2)
+            return "slow-done"
+
+        def make_tool(name, execution_timeout=None):
+            return FunctionTool(
+                name=name,
+                description="slow",
+                parameters={"type": "object", "properties": {}},
+                handler=slow_handler,
+                execution_timeout=execution_timeout,
+            )
+
+        plain = make_tool("slow_plain")
+        budgeted = make_tool("slow_budgeted", 3)
+        module, _parallel_tool, run_context, binding = _runtime_parts(
+            [plain, budgeted],
+            allowlist=("slow_plain", "slow_budgeted"),
+        )
+        token = ptu._CURRENT_EXECUTION.set(binding)
+        try:
+            timed_out = await ptu.run_parallel_tool_calls(
+                run_context,
+                [{"recipient_name": "slow_plain", "parameters": {}}],
+            )
+            allowed = await ptu.run_parallel_tool_calls(
+                run_context,
+                [{"recipient_name": "slow_budgeted", "parameters": {}}],
+            )
+        finally:
+            ptu._CURRENT_EXECUTION.reset(token)
+
+        timed_out_payload = json.loads(timed_out.content[0].text)
+        assert timed_out_payload["results"][0]["ok"] is False
+        allowed_payload = json.loads(allowed.content[0].text)
+        assert allowed_payload["results"][0]["ok"] is True
+        assert allowed_payload["results"][0]["result"] == "slow-done"
+        assert run_context.tool_call_timeout == 1
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=10))
+
+
+def test_real_executor_batch_budget_covers_child_execution_timeout():
+    """外层执行器预算必须覆盖子工具自带 execution_timeout。"""
+    if not _supports_execution_timeout():
+        pytest.skip("宿主 FunctionTool 尚未支持 execution_timeout")
+
+    async def scenario():
+        from astrbot.core.agent.tool import FunctionTool
+
+        async def slow_handler(event):
+            await asyncio.sleep(1.2)
+            return "slow-done"
+
+        slow = FunctionTool(
+            name="slow_budgeted",
+            description="slow",
+            parameters={"type": "object", "properties": {}},
+            handler=slow_handler,
+            execution_timeout=3,
+        )
+        module, parallel_tool, run_context, binding = _runtime_parts(
+            [slow],
+            allowlist=("slow_budgeted",),
+        )
+        token = ptu._CURRENT_EXECUTION.set(binding)
+        try:
+            results = [
+                item
+                async for item in FunctionToolExecutor.execute(
+                    tool=parallel_tool,
+                    run_context=run_context,
+                    tool_uses=[
+                        {"recipient_name": "slow_budgeted", "parameters": {}}
+                    ],
+                )
+            ]
+        finally:
+            ptu._CURRENT_EXECUTION.reset(token)
+        payload = json.loads(results[-1].content[0].text)
+        assert payload["results"][0]["ok"] is True
+        assert payload["results"][0]["result"] == "slow-done"
+        assert run_context.tool_call_timeout == 1
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=10))
+
+def test_real_executor_runs_two_fake_tools_concurrently():
+    """真实宿主执行器下，两个假工具子调用必须并发完成。"""
+
+    async def scenario():
+        from astrbot.core.agent.tool import FunctionTool
+
+        async def slow_handler(event):
+            await asyncio.sleep(0.6)
+            return "ok"
+
+        def make_tool(name):
+            return FunctionTool(
+                name=name,
+                description="slow",
+                parameters={"type": "object", "properties": {}},
+                handler=slow_handler,
+            )
+
+        module, parallel_tool, run_context, binding = _runtime_parts(
+            [make_tool("fake_a"), make_tool("fake_b")],
+            allowlist=("fake_a", "fake_b"),
+        )
+        token = ptu._CURRENT_EXECUTION.set(binding)
+        started = asyncio.get_running_loop().time()
+        try:
+            results = [
+                item
+                async for item in FunctionToolExecutor.execute(
+                    tool=parallel_tool,
+                    run_context=run_context,
+                    tool_uses=[
+                        {"recipient_name": "fake_a", "parameters": {}},
+                        {"recipient_name": "fake_b", "parameters": {}},
+                    ],
+                )
+            ]
+        finally:
+            ptu._CURRENT_EXECUTION.reset(token)
+        elapsed = asyncio.get_running_loop().time() - started
+        payload = json.loads(results[-1].content[0].text)
+        assert [item["ok"] for item in payload["results"]] == [True, True]
+        assert elapsed < 1.15
+        assert run_context.tool_call_timeout == 1
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=8))

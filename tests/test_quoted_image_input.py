@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-from types import SimpleNamespace
+import importlib.util
+import os
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -1441,3 +1444,392 @@ def test_collection_ownership_captured_before_native_request_publication(
         assert state.native_quote_handling
 
     run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# AstrBot 4.30：prepare_request_images 与 collect_initial_request 迁移
+# ---------------------------------------------------------------------------
+
+
+def _ref_usable(ref) -> bool:
+    return isinstance(ref, str) and (
+        ref.startswith(("http://", "https://", "base64://", "data:image/"))
+        or os.path.exists(ref)
+    )
+
+
+def _has_430_agent_runtime() -> bool:
+    """AstrBot 4.29 及更早没有 agent_media/astr_agent_runtime 入口。"""
+    try:
+        return (
+            importlib.util.find_spec("astrbot.core.astr_agent_runtime") is not None
+        )
+    except (ImportError, ValueError, AttributeError):
+        return False
+
+
+@pytest.fixture
+def host_430(monkeypatch):
+    """模拟 AstrBot 4.30 的输入准备与请求收集入口。"""
+    if not _has_430_agent_runtime():
+        pytest.skip("当前宿主没有 agent_media/astr_agent_runtime 入口")
+    import os as _os
+
+    calls = []
+
+    class Image:
+        def __init__(self, url=None, file=None, path=None):
+            self.type = "Image"
+            self.url = url
+            self.file = file
+            self.path = path
+
+        async def convert_to_file_path(self):
+            await asyncio.sleep(0)
+            ref = self.path or self.file or self.url or ""
+            if ref.startswith(("http://", "https://")):
+                return ref
+            if _os.path.exists(ref):
+                return ref
+            raise FileNotFoundError(ref)
+
+    original_convert = Image.convert_to_file_path
+
+    async def prepare_request_images(
+        req,
+        event,
+        *,
+        max_size=0,
+        output_dir=None,
+        prepared,
+        quote_image_ref=None,
+        quoted_refs=None,
+        captioned_refs=None,
+        finalize=True,
+        supports_image=True,
+    ):
+        calls.append({"finalize": finalize, "req": req})
+        refs = list(req.image_urls or [])
+        if quote_image_ref:
+            refs.append(quote_image_ref)
+        for ref in dict.fromkeys(refs):
+            if ref in prepared:
+                continue
+            usable = _ref_usable(ref)
+            result = {
+                "path": ref if usable else None,
+                "original_path": ref,
+                "quoted": ref == quote_image_ref or ref in (quoted_refs or ()),
+                "montage": False,
+                "status": None if usable else "unavailable",
+                "temporary": False,
+                "notices": [],
+            }
+            prepared[ref] = result
+            if result["path"]:
+                prepared[result["path"]] = result
+        req.image_urls = [
+            prepared[ref]["path"] for ref in (req.image_urls or []) if prepared[ref]["path"]
+        ]
+
+    async def collect_initial_request(
+        event,
+        plugin_context,
+        config,
+        req=None,
+        *,
+        quoted_image_refs=None,
+        materialized_paths=None,
+    ):
+        calls.append({"collect": True, "req": req})
+        if quoted_image_refs is None:
+            quoted_image_refs = set()
+        if req is not None:
+            return req, None
+        req = DummyRequest(image_urls=[])
+        quote_ref = None
+        for comp in event.message_obj.message:
+            if comp.__class__.__name__ != "Reply":
+                continue
+            chain = getattr(comp, "chain", None) or []
+            image = None
+            for part in chain:
+                if part.__class__.__name__ != "Image":
+                    continue
+                image = image or part
+                try:
+                    path = await part.convert_to_file_path()
+                except Exception:  # noqa: BLE001 - 与宿主一致：失败的引用图直接跳过
+                    continue
+                req.image_urls.append(path)
+                quoted_image_refs.add(path)
+            if image is not None:
+                quote_ref = image.url or image.file or image.path
+        return req, quote_ref
+
+    root = ModuleType("astrbot")
+    core = ModuleType("astrbot.core")
+    message = ModuleType("astrbot.core.message")
+    components = ModuleType("astrbot.core.message.components")
+    components.Image = Image
+    components.Reply = Reply
+    message.components = components
+    core.message = message
+
+    agent_input = ModuleType("astrbot.core.agent_input")
+    agent_input.prepare_request_images = prepare_request_images
+    agent_input.prepare_input_content = lambda *a, **k: None
+
+    runtime = ModuleType("astrbot.core.astr_agent_runtime")
+    main_agent = ModuleType("astrbot.core.astr_agent_runtime.main_agent")
+    builder = ModuleType("astrbot.core.astr_agent_runtime.main_agent.builder")
+    builder.prepare_request_images = prepare_request_images
+    request_mod = ModuleType("astrbot.core.astr_agent_runtime.main_agent.request")
+    request_mod.collect_initial_request = collect_initial_request
+    main_session = ModuleType("astrbot.core.astr_agent_runtime.main_session")
+    main_session.collect_initial_request = collect_initial_request
+    main_agent.builder = builder
+    main_agent.request = request_mod
+    runtime.main_agent = main_agent
+    runtime.main_session = main_session
+    core.astr_agent_runtime = runtime
+
+    modules = {
+        "astrbot": root,
+        "astrbot.core": core,
+        "astrbot.core.message": message,
+        "astrbot.core.message.components": components,
+        "astrbot.core.agent_input": agent_input,
+        "astrbot.core.astr_agent_runtime": runtime,
+        "astrbot.core.astr_agent_runtime.main_agent": main_agent,
+        "astrbot.core.astr_agent_runtime.main_agent.builder": builder,
+        "astrbot.core.astr_agent_runtime.main_agent.request": request_mod,
+        "astrbot.core.astr_agent_runtime.main_session": main_session,
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    return SimpleNamespace(
+        agent_input=agent_input,
+        builder=builder,
+        request=request_mod,
+        main_session=main_session,
+        Image=Image,
+        HostImage=Image,
+        original_prepare=prepare_request_images,
+        original_collect=collect_initial_request,
+        original_convert=original_convert,
+        calls=calls,
+    )
+
+
+class RecordingBot:
+    def __init__(self, refs):
+        self.refs = refs
+        self.calls = []
+        self.before_call = None
+
+    async def call_action(self, action, **params):
+        self.calls.append((action, params))
+        if self.before_call is not None:
+            await self.before_call(action, params)
+        if action == "get_msg":
+            return {
+                "message": [
+                    {"type": "image", "data": {"url": ref}} for ref in self.refs
+                ]
+            }
+        return {}
+
+
+def test_430_dead_quoted_image_recovered_before_caption(host_430, tmp_path):
+    good = tmp_path / "recovered.png"
+    good.write_bytes(b"png")
+    dead = str(tmp_path / "dead.png")
+    bot = RecordingBot([str(good)])
+    event = DummyEvent(
+        [Reply("r1", chain=[host_430.HostImage(file=dead)])], bot=bot
+    )
+    module = QuotedImageInputModule(DummyLogger())
+    assert module.install()
+
+    async def scenario():
+        req, quote_ref = await host_430.request.collect_initial_request(
+            event, None, None
+        )
+        prepared = {}
+        await host_430.agent_input.prepare_request_images(
+            req,
+            event,
+            prepared=prepared,
+            quote_image_ref=quote_ref,
+            quoted_refs=set(),
+            finalize=False,
+        )
+        return req, quote_ref, prepared
+
+    req, quote_ref, prepared = run(scenario())
+
+    assert quote_ref == dead
+    assert prepared[dead]["path"] == str(good)
+    assert prepared[str(good)] is prepared[dead]
+    assert req.image_urls == [str(good)]
+    assert [item for item in host_430.calls if "finalize" in item] != []
+    assert sum(1 for item in host_430.calls if "finalize" in item) == 2
+
+
+def test_430_healthy_quoted_image_is_not_recovered(host_430, tmp_path):
+    good = tmp_path / "healthy.png"
+    good.write_bytes(b"png")
+    bot = RecordingBot([str(tmp_path / "unrelated.png")])
+    event = DummyEvent([Reply("r2", chain=[host_430.HostImage(file=str(good))])], bot=bot)
+    module = QuotedImageInputModule(DummyLogger())
+    assert module.install()
+
+    async def scenario():
+        req, quote_ref = await host_430.request.collect_initial_request(
+            event, None, None
+        )
+        prepared = {}
+        await host_430.agent_input.prepare_request_images(
+            req, event, prepared=prepared, quote_image_ref=quote_ref, finalize=False
+        )
+        return req, prepared
+
+    req, prepared = run(scenario())
+
+    assert bot.calls == []
+    assert req.image_urls == [str(good)]
+    assert sum(1 for item in host_430.calls if "finalize" in item) == 1
+
+
+@pytest.mark.parametrize("status", ["oversized", "captioned"])
+def test_430_limited_or_captioned_quote_is_not_recovered(host_430, tmp_path, status):
+    dead = str(tmp_path / "dead.png")
+    bot = RecordingBot([str(tmp_path / "should-not.png")])
+    event = DummyEvent([Reply("r3", chain=[host_430.HostImage(file=dead)])], bot=bot)
+    module = QuotedImageInputModule(DummyLogger())
+    assert module.install()
+
+    async def scenario():
+        req, quote_ref = await host_430.request.collect_initial_request(
+            event, None, None
+        )
+        prepared = {
+            dead: {
+                "path": None if status == "oversized" else dead,
+                "original_path": dead,
+                "quoted": True,
+                "montage": False,
+                "status": status,
+                "temporary": False,
+                "notices": [],
+            }
+        }
+        await host_430.agent_input.prepare_request_images(
+            req, event, prepared=prepared, quote_image_ref=quote_ref, finalize=False
+        )
+        return req, prepared
+
+    req, prepared = run(scenario())
+
+    assert bot.calls == []
+    assert prepared[dead]["status"] == status
+
+
+@pytest.mark.parametrize("interruption", ["stop", "unload"])
+def test_430_interruption_during_recovery_discards_result(
+    host_430, tmp_path, interruption
+):
+    good = tmp_path / "late.png"
+    good.write_bytes(b"png")
+    dead = str(tmp_path / "dead.png")
+    bot = RecordingBot([str(good)])
+    event = DummyEvent([Reply("r4", chain=[host_430.HostImage(file=dead)])], bot=bot)
+    module = QuotedImageInputModule(DummyLogger())
+    assert module.install()
+
+    async def interrupt(action, params):
+        if interruption == "stop":
+            event.agent_stop_requested = True
+        else:
+            module.terminate()
+
+    bot.before_call = interrupt
+
+    async def scenario():
+        req, quote_ref = await host_430.request.collect_initial_request(
+            event, None, None
+        )
+        prepared = {}
+        await host_430.agent_input.prepare_request_images(
+            req, event, prepared=prepared, quote_image_ref=quote_ref, finalize=False
+        )
+        return req, prepared
+
+    req, prepared = run(scenario())
+
+    assert req.image_urls == []
+    assert prepared[dead]["path"] is None
+
+
+def test_430_explicit_request_is_not_native_quote_handling(host_430):
+    from astrna.modules import quoted_image_input as images
+
+    event = DummyEvent([Reply("r6")])
+    module = QuotedImageInputModule(DummyLogger())
+    assert module.install()
+    supplied = DummyRequest(image_urls=[])
+
+    async def scenario():
+        return await host_430.request.collect_initial_request(
+            event, None, None, req=supplied
+        )
+
+    req, _ = run(scenario())
+
+    state = images.request_image_state(req, event)
+    assert state is not None
+    assert state.native_quote_handling is False
+
+
+def test_real_430_entry_bindings_are_wrapped():
+    """真实 AstrBot 4.30 宿主：四个绑定与 Image 转换入口都应被接管并还原。"""
+    try:
+        from astrbot.core import agent_input
+        from astrbot.core.astr_agent_runtime import main_session
+        from astrbot.core.astr_agent_runtime.main_agent import builder, request
+        from astrbot.core.message.components import Image as HostImage
+        from astrbot.core.utils import image_input
+    except Exception:  # noqa: BLE001
+        pytest.skip("当前环境没有 AstrBot 4.30 输入准备入口")
+    if not hasattr(agent_input, "prepare_request_images"):
+        pytest.skip("当前 AstrBot 版本没有 agent_input 准备入口")
+
+    originals = {
+        "agent_input": agent_input.prepare_request_images,
+        "builder": builder.prepare_request_images,
+        "request": request.collect_initial_request,
+        "main_session": main_session.collect_initial_request,
+        "convert": HostImage.convert_to_file_path,
+        "module_prepare": image_input.prepare_request_images,
+    }
+    module = QuotedImageInputModule(DummyLogger())
+    try:
+        assert module.install() is True
+        assert agent_input.prepare_request_images is builder.prepare_request_images
+        assert agent_input.prepare_request_images is not originals["agent_input"]
+        assert request.collect_initial_request is main_session.collect_initial_request
+        assert request.collect_initial_request is not originals["request"]
+        assert HostImage.convert_to_file_path is not originals["convert"]
+        # 定义模块本身不参与包装：没有调用点直接读取它。
+        assert image_input.prepare_request_images is originals["module_prepare"]
+    finally:
+        module.terminate()
+        QuotedImageInputModule.restore_patch()
+
+    assert agent_input.prepare_request_images is originals["agent_input"]
+    assert builder.prepare_request_images is originals["builder"]
+    assert request.collect_initial_request is originals["request"]
+    assert main_session.collect_initial_request is originals["main_session"]
+    assert HostImage.convert_to_file_path is originals["convert"]

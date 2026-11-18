@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import sys
 from functools import wraps
 from types import ModuleType, SimpleNamespace
@@ -988,3 +989,300 @@ def test_sanitize_caption_context_text_handles_risky_text():
     assert ">" not in sanitized
     assert "＜tag＞" in sanitized
     assert len(sanitized) == 512
+
+
+# ---------------------------------------------------------------------------
+# AstrBot 4.30：图片转述迁到 agent_media
+# ---------------------------------------------------------------------------
+
+
+ANIMATION_NOTICE = "\n<system_notice>animations at {indices}</system_notice>"
+
+
+def _has_430_agent_runtime() -> bool:
+    """AstrBot 4.29 及更早没有 agent_media/astr_agent_runtime 入口。"""
+    try:
+        return (
+            importlib.util.find_spec("astrbot.core.astr_agent_runtime") is not None
+        )
+    except (ImportError, ValueError, AttributeError):
+        return False
+
+
+@pytest.fixture
+def agent_media(monkeypatch):
+    """模拟 AstrBot 4.30：只有 agent_media，没有 astr_main_agent。"""
+    if not _has_430_agent_runtime():
+        pytest.skip("当前宿主没有 agent_media/astr_agent_runtime 入口")
+    root = ModuleType("astrbot")
+    core = ModuleType("astrbot.core")
+    module = ModuleType("astrbot.core.agent_media")
+    calls = []
+
+    async def caption_request_images(
+        event,
+        req,
+        cfg,
+        plugin_context,
+        image_caption_provider,
+        montage_refs=None,
+    ):
+        calls.append(("caption", cfg, montage_refs))
+        provider = plugin_context.get_provider_by_id(image_caption_provider)
+        prompt = cfg.get("image_caption_prompt", "Please describe the image.")
+        await provider.text_chat(prompt=prompt, image_urls=list(req.image_urls))
+        return set(req.image_urls)
+
+    async def append_quoted_content(
+        event,
+        req,
+        img_cap_prov_id,
+        plugin_context,
+        quoted_message_settings=None,
+        main_provider_supports_image=False,
+        skip_quote_image_caption=False,
+        image_ref=None,
+        image_is_montage=False,
+    ):
+        calls.append(
+            (
+                "append",
+                image_ref,
+                image_is_montage,
+                quoted_message_settings,
+            )
+        )
+        if skip_quote_image_caption or main_provider_supports_image or not img_cap_prov_id:
+            return None
+        provider = plugin_context.get_provider_by_id(img_cap_prov_id)
+        if provider is None:
+            provider = await plugin_context.get_using_provider_async(
+                getattr(event, "unified_msg_origin", None)
+            )
+        prompt = "Please describe the image content."
+        if image_is_montage:
+            prompt += ANIMATION_NOTICE.format(indices="1")
+        await provider.text_chat(prompt=prompt, image_urls=[image_ref])
+        return image_ref
+
+    async def extract_quoted_message_text(event, quote, settings=None):
+        return getattr(quote, "message_str", "")
+
+    module.Reply = Reply
+    module.ANIMATION_CAPTION_NOTICE = ANIMATION_NOTICE
+    module.DEFAULT_QUOTED_MESSAGE_SETTINGS = object()
+    module.caption_request_images = caption_request_images
+    module.append_quoted_content = append_quoted_content
+    module.extract_quoted_message_text = extract_quoted_message_text
+    module.get_quoted_message_settings = lambda settings: {
+        "from_settings": settings
+    }
+    module.calls = calls
+    core.agent_media = module
+
+    monkeypatch.setitem(sys.modules, "astrbot", root)
+    monkeypatch.setitem(sys.modules, "astrbot.core", core)
+    monkeypatch.setitem(sys.modules, "astrbot.core.agent_media", module)
+    return module
+
+
+def test_agent_media_repeated_install_does_not_stack(agent_media):
+    module = ImageCaptionModule(logger=DummyLogger())
+    assert module.install()
+    first_caption = agent_media.caption_request_images
+    first_append = agent_media.append_quoted_content
+
+    assert module.install()
+
+    assert agent_media.caption_request_images is first_caption
+    assert agent_media.append_quoted_content is first_append
+
+
+def test_agent_media_quote_caption_prompt_includes_context(agent_media):
+    provider = DummyProvider()
+    module = ImageCaptionModule(logger=DummyLogger())
+    module.install()
+    event = DummyEvent([Reply(message_str="引用里说这是一张照片")])
+    req = DummyRequest(prompt="帮我看看这张引用图里的东西")
+
+    result = run(
+        agent_media.append_quoted_content(
+            event,
+            req,
+            "caption-provider",
+            DummyContext(provider),
+            {"legacy": True},
+            False,
+            False,
+            "quoted-image://1",
+            False,
+        )
+    )
+
+    assert result == "quoted-image://1"
+    assert "text_chat" not in provider.__dict__
+    assert provider.text_chat.__func__ is DummyProvider.text_chat
+    prompt = provider.prompts[0]
+    assert prompt.startswith("Please describe the image content.")
+    assert "帮我看看这张引用图里的东西" in prompt
+    assert "引用里说这是一张照片" in prompt
+    assert agent_media.calls[0][0] == "append"
+    assert agent_media.calls[0][3] == {"legacy": True}
+
+
+def test_agent_media_quote_caption_without_context_keeps_native_prompt(agent_media):
+    provider = DummyProvider()
+    module = ImageCaptionModule(logger=DummyLogger())
+    module.install()
+
+    run(
+        agent_media.append_quoted_content(
+            DummyEvent(),
+            DummyRequest(prompt=""),
+            "caption-provider",
+            DummyContext(provider),
+            None,
+            False,
+            False,
+            "quoted-image://1",
+            False,
+        )
+    )
+
+    assert provider.prompts == ["Please describe the image content."]
+
+
+@pytest.mark.parametrize("flag", ["skip", "main_image", "no_provider"])
+def test_agent_media_quote_caption_keeps_skip_flags(agent_media, flag):
+    provider = DummyProvider()
+    module = ImageCaptionModule(logger=DummyLogger())
+    module.install()
+
+    run(
+        agent_media.append_quoted_content(
+            DummyEvent([Reply(message_str="引用文本")]),
+            DummyRequest(prompt="问题文本"),
+            "" if flag == "no_provider" else "caption-provider",
+            DummyContext(provider),
+            None,
+            flag == "main_image",
+            flag == "skip",
+            "quoted-image://1",
+            False,
+        )
+    )
+
+    assert provider.prompts == []
+
+
+def test_agent_media_quote_caption_montage_notice_is_rewritten(agent_media):
+    provider = DummyProvider()
+    module = ImageCaptionModule(logger=DummyLogger())
+    module.install()
+
+    run(
+        agent_media.append_quoted_content(
+            DummyEvent([Reply(message_str="动图")]),
+            DummyRequest(prompt="这是动图吗"),
+            "caption-provider",
+            DummyContext(provider),
+            None,
+            False,
+            False,
+            "quoted-image://1",
+            True,
+        )
+    )
+
+    prompt = provider.prompts[0]
+    assert "animations at 1" in prompt
+    assert "这是动图吗" in prompt
+
+
+def test_agent_media_caption_request_images_includes_context(agent_media):
+    provider = DummyProvider()
+    module = ImageCaptionModule(logger=DummyLogger())
+    module.install()
+    event = DummyEvent([Reply(message_str="被引用的说明")])
+    req = DummyRequest(prompt="图里有什么")
+    cfg = {"image_caption_prompt": "请描述图片。"}
+
+    run(
+        agent_media.caption_request_images(
+            event,
+            req,
+            cfg,
+            DummyContext(provider),
+            "caption-provider",
+            montage_refs={"image://1"},
+        )
+    )
+
+    prompt = provider.prompts[0]
+    assert prompt.startswith("请描述图片。")
+    assert "图里有什么" in prompt
+    assert "被引用的说明" in prompt
+    assert agent_media.calls[0][1] is not cfg
+    assert agent_media.calls[0][1]["image_caption_prompt"].startswith("请描述图片。")
+    assert agent_media.calls[0][2] == {"image://1"}
+
+
+def test_agent_media_stale_wrapper_after_terminate_passes_through(agent_media):
+    provider = DummyProvider()
+    module = ImageCaptionModule(logger=DummyLogger())
+    module.install()
+    stale_append = agent_media.append_quoted_content
+    module.terminate()
+
+    run(
+        stale_append(
+            DummyEvent([Reply(message_str="引用文本")]),
+            DummyRequest(prompt="问题文本"),
+            "caption-provider",
+            DummyContext(provider),
+            None,
+            False,
+            False,
+            "quoted-image://1",
+            False,
+        )
+    )
+
+    assert provider.prompts == ["Please describe the image content."]
+
+
+def test_agent_media_restore_keeps_foreign_replacement(agent_media):
+    module = ImageCaptionModule(logger=DummyLogger())
+    module.install()
+
+    async def foreign(event, req, cfg, plugin_context, provider_id, *args, **kwargs):
+        return set()
+
+    agent_media.append_quoted_content = foreign
+    module.terminate()
+
+    assert agent_media.append_quoted_content is foreign
+
+
+def test_real_agent_media_entries_are_patched():
+    """真实 AstrBot 4.30 宿主：确认两个入口都被接管并可完整还原。"""
+    try:
+        from astrbot.core import agent_media
+    except Exception:  # noqa: BLE001
+        pytest.skip("当前环境没有 AstrBot agent_media")
+    if not hasattr(agent_media, "append_quoted_content"):
+        pytest.skip("当前 AstrBot 版本没有引用消息转述入口")
+
+    original_caption = agent_media.caption_request_images
+    original_append = agent_media.append_quoted_content
+    module = ImageCaptionModule(logger=DummyLogger())
+    try:
+        assert module.install() is True
+        assert agent_media.caption_request_images is not original_caption
+        assert agent_media.append_quoted_content is not original_append
+    finally:
+        module.terminate()
+        ImageCaptionModule.restore_patch()
+
+    assert agent_media.caption_request_images is original_caption
+    assert agent_media.append_quoted_content is original_append

@@ -6,6 +6,7 @@ import re
 import uuid
 from typing import Any
 
+from ..utils import host_compat
 from ..utils.event_stop import (
     STOP_AWARE_COMPLETED,
     STOP_AWARE_EVENT_STOPPED,
@@ -338,6 +339,7 @@ class OutputLengthLimiterModule:
             or self.is_event_whitelisted(event)
             or is_live_event(event)
             or is_cron_event(event)
+            or host_compat.is_internal_result_context(event=event)
         ):
             return
         setter = getattr(event, "set_extra", None)
@@ -405,6 +407,13 @@ class OutputLengthLimiterModule:
         if event is None or self.is_event_whitelisted(event):
             return False
         if is_live_event(event) or is_cron_event(event):
+            return False
+        if host_compat.is_internal_result_context(
+            host_compat.runner_context(runner),
+            event,
+        ):
+            # 显式禁止自动投递、子代理/委派执行，以及调用方登记的内部结果，
+            # 其最终文字不是聊天回复，限制字数只会损坏内容。
             return False
         if getattr(llm_response, "is_chunk", False):
             return False
@@ -784,21 +793,17 @@ def is_live_event(event: Any) -> bool:
 
 
 def is_cron_event(event: Any) -> bool:
-    """定时任务事件不做限制。
+    """是否为旧版用平台名 cron 表示的合成事件。
 
-    AstrBot 定时任务及后台任务完成后唤醒主 Agent 时使用平台名为 cron 的合成事件，
-    要发给用户的内容通过工具发送，最终文字只写入历史备注；
-    AstrHe 夜间复盘的各个 Agent 沿用该事件的子类，最终文字是交给插件的报告。
-    两者的最终文字都不是聊天回复，限制字数只会损坏内容。
+    AstrBot 4.29 及更早的定时/后台唤醒使用平台名为 cron 的合成事件，要发给用户的
+    内容通过工具发送，最终文字只写入历史备注；AstrHe 夜间复盘沿用该事件的子类，
+    最终文字是交给插件的报告。两者的最终文字都不是聊天回复，限制字数只会损坏内容。
+
+    4.30 起宿主改用 ``AgentWakeupEvent``：保留真实平台名并用 ``source`` 表示来源，
+    最终回复会正常投递，因此不能按来源整体跳过，只有这里能确认的旧版合成事件
+    仍然放行。
     """
-    getter = getattr(event, "get_platform_name", None)
-    if not callable(getter):
-        return False
-    try:
-        platform_name = getter()
-    except Exception:  # noqa: BLE001
-        return False
-    return isinstance(platform_name, str) and platform_name.lower() == "cron"
+    return host_compat.is_legacy_cron_event(event)
 
 
 def safe_event_extra(event: Any, key: str, default: Any = None) -> Any:

@@ -5,6 +5,7 @@ import importlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -23,6 +24,9 @@ from astrna.modules.tool_history_context import (
 
 
 BASE64_IMAGE = "data:image/png;base64," + "a" * 64
+AGENT_HISTORY_MODULE = "astrbot.core.astr_agent_runtime.history"
+AGENT_SESSION_MODULE = "astrbot.core.astr_agent_runtime.session"
+AGENT_RUNTIME_PACKAGE = "astrbot.core.astr_agent_runtime"
 
 
 class DummyLogger:
@@ -107,6 +111,86 @@ def run(coro):
     return asyncio.run(coro)
 
 
+class DummyAgentHistorySaver:
+    """模拟新版宿主唯一的原生历史提交入口。"""
+
+    calls: list[dict] = []
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.calls = []
+
+
+def make_agent_history_modules(monkeypatch) -> SimpleNamespace:
+    """造一套新版宿主的 history/session 模块，两者持有同一个保存函数。"""
+
+    package = ModuleType(AGENT_RUNTIME_PACKAGE)
+    package.__path__ = []
+
+    async def save_agent_history(
+        *,
+        req,
+        llm_response,
+        all_messages,
+        runner_stats,
+        commit,
+        user_aborted=False,
+        writer=None,
+    ):
+        DummyAgentHistorySaver.calls.append(
+            {
+                "req": req,
+                "llm_response": llm_response,
+                "all_messages": all_messages,
+                "runner_stats": runner_stats,
+                "commit": commit,
+                "user_aborted": user_aborted,
+                "writer": writer,
+            }
+        )
+        return True
+
+    history_module = ModuleType(AGENT_HISTORY_MODULE)
+    history_module.save_agent_history = save_agent_history
+    session_module = ModuleType(AGENT_SESSION_MODULE)
+    session_module.save_agent_history = save_agent_history
+
+    monkeypatch.setitem(sys.modules, "astrbot", ModuleType("astrbot"))
+    monkeypatch.setitem(sys.modules, "astrbot.core", ModuleType("astrbot.core"))
+    monkeypatch.setitem(sys.modules, AGENT_RUNTIME_PACKAGE, package)
+    monkeypatch.setitem(sys.modules, AGENT_HISTORY_MODULE, history_module)
+    monkeypatch.setitem(sys.modules, AGENT_SESSION_MODULE, session_module)
+    return SimpleNamespace(
+        history=history_module,
+        session=session_module,
+        original=save_agent_history,
+    )
+
+
+def mask_agent_history_modules(monkeypatch) -> None:
+    """遮蔽新版入口，模拟 4.29.x 宿主的模块布局。"""
+
+    monkeypatch.setitem(
+        sys.modules,
+        AGENT_RUNTIME_PACKAGE,
+        ModuleType(AGENT_RUNTIME_PACKAGE),
+    )
+    monkeypatch.delitem(sys.modules, AGENT_HISTORY_MODULE, raising=False)
+    monkeypatch.delitem(sys.modules, AGENT_SESSION_MODULE, raising=False)
+
+
+def stub_legacy_internal_stage(monkeypatch) -> None:
+    internal_module = ModuleType(
+        "astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal",
+    )
+    internal_module.InternalAgentSubStage = DummyInternalAgentSubStage
+    monkeypatch.setitem(
+        sys.modules,
+        "astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal",
+        internal_module,
+    )
+
+
 def completed_dict_history(*, result_a="A" * 1000, result_b="B" * 1000):
     return [
         {"role": "user", "content": "查资料"},
@@ -189,14 +273,22 @@ def restore_history_patches(monkeypatch):
     ToolHistoryContextModule.restore_patch()
     ImageHistoryContextModule.restore_patch()
     DummyInternalAgentSubStage.saved = []
+    DummyAgentHistorySaver.reset()
     yield
     ToolHistoryContextModule.restore_patch()
     ImageHistoryContextModule.restore_patch()
     DummyInternalAgentSubStage.saved = []
+    DummyAgentHistorySaver.reset()
+
+
+@pytest.fixture
+def astrbot_agent_history(monkeypatch):
+    return make_agent_history_modules(monkeypatch)
 
 
 @pytest.fixture
 def astrbot_internal_module(monkeypatch):
+    mask_agent_history_modules(monkeypatch)
     internal_module = ModuleType(
         "astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal",
     )
@@ -1067,3 +1159,370 @@ def test_disabling_inner_wrapper_keeps_outer_wrapper_active(astrbot_internal_mod
 
     image_module.terminate()
     assert astrbot_internal_module.internal_cls._save_to_history is original
+
+def test_agent_history_patch_replaces_history_and_session_entries(astrbot_agent_history):
+    history_module = astrbot_agent_history.history
+    session_module = astrbot_agent_history.session
+    original = astrbot_agent_history.original
+    module = ToolHistoryContextModule(logger=DummyLogger())
+
+    assert module.install() is True
+    patched = history_module.save_agent_history
+    assert patched is not original
+    assert session_module.save_agent_history is patched
+    assert module.install() is True
+    assert history_module.save_agent_history is patched
+
+    module.terminate()
+
+    assert history_module.save_agent_history is original
+    assert session_module.save_agent_history is original
+
+
+def test_agent_history_patch_preserves_tool_pair_and_untouched_messages(
+    astrbot_agent_history,
+):
+    module = ToolHistoryContextModule(logger=DummyLogger())
+    module.install()
+    tool_call = Message("assistant", None, tool_calls=[{"id": "call-a"}])
+    tool_result = Message(
+        "tool",
+        "full result",
+        tool_call_id="call-a",
+        no_save=True,
+        metadata={"source": "kept"},
+    )
+    messages = [tool_call, tool_result, Message("assistant", "done")]
+
+    run(
+        astrbot_agent_history.session.save_agent_history(
+            req=object(),
+            llm_response=object(),
+            all_messages=messages,
+            runner_stats=object(),
+            commit=object(),
+        )
+    )
+
+    saved = DummyAgentHistorySaver.calls[-1]["all_messages"]
+    assert saved[0] is tool_call
+    assert saved[1].tool_calls is None
+    assert saved[1].tool_call_id == "call-a"
+    assert saved[1].metadata == {"source": "kept"}
+    assert saved[1]._no_save is True
+    assert tool_result.content == "full result"
+
+
+def test_agent_history_patch_keeps_incomplete_tool_chain_unchanged(
+    astrbot_agent_history,
+):
+    module = ToolHistoryContextModule(logger=DummyLogger())
+    module.install()
+    messages = [
+        Message("assistant", None, tool_calls=[{"id": "call-a"}]),
+        Message("tool", "trailing", tool_call_id="call-a"),
+    ]
+
+    run(
+        astrbot_agent_history.session.save_agent_history(
+            req=object(),
+            llm_response=object(),
+            all_messages=messages,
+            runner_stats=object(),
+            commit=object(),
+        )
+    )
+
+    assert DummyAgentHistorySaver.calls[-1]["all_messages"] is messages
+
+
+def test_agent_history_patch_keeps_original_list_when_scan_fails(
+    astrbot_agent_history,
+    monkeypatch,
+):
+    module = ToolHistoryContextModule(logger=DummyLogger())
+    module.install()
+
+    def boom(messages):
+        raise RuntimeError("scan exploded")
+
+    monkeypatch.setattr(tool_history_context, "sanitize_messages", boom)
+    messages = [
+        Message("assistant", None, tool_calls=[{"id": "call-a"}]),
+        Message("tool", "full result", tool_call_id="call-a"),
+        Message("assistant", "done"),
+    ]
+
+    run(
+        astrbot_agent_history.session.save_agent_history(
+            req=object(),
+            llm_response=object(),
+            all_messages=messages,
+            runner_stats=object(),
+            commit=object(),
+        )
+    )
+
+    assert DummyAgentHistorySaver.calls[-1]["all_messages"] is messages
+    assert module.logger.warnings
+
+
+def test_agent_history_wrapper_stays_transparent_after_terminate(astrbot_agent_history):
+    module = ToolHistoryContextModule(logger=DummyLogger())
+    module.install()
+    wrapper = astrbot_agent_history.history.save_agent_history
+    module.terminate()
+    messages = [
+        Message("assistant", None, tool_calls=[{"id": "call-a"}]),
+        Message("tool", "full result", tool_call_id="call-a"),
+        Message("assistant", "done"),
+    ]
+
+    run(
+        wrapper(
+            req=object(),
+            llm_response=object(),
+            all_messages=messages,
+            runner_stats=object(),
+            commit=object(),
+        )
+    )
+
+    assert DummyAgentHistorySaver.calls[-1]["all_messages"] is messages
+
+
+class TextPart:
+    type = "text"
+
+    def __init__(self, text):
+        self.text = text
+        self._no_save = False
+
+
+class ImageURLLikePart:
+    type = "image_url"
+
+    def __init__(self, url):
+        self.image_url = SimpleNamespace(url=url)
+        self._no_save = False
+
+
+@pytest.mark.parametrize("install_order", [("image", "tool"), ("tool", "image")])
+def test_agent_history_chain_covers_image_and_tool_in_either_order(
+    astrbot_agent_history,
+    install_order,
+):
+    original = astrbot_agent_history.original
+    image_module = ImageHistoryContextModule(logger=DummyLogger())
+    tool_module = ToolHistoryContextModule(logger=DummyLogger())
+    modules = {"image": image_module, "tool": tool_module}
+    for name in install_order:
+        assert modules[name].install() is True
+
+    messages = [
+        Message("assistant", None, tool_calls=[{"id": "call-image"}]),
+        Message("tool", "full image result", tool_call_id="call-image"),
+        Message(
+            "user",
+            [
+                TextPart("[Image from tool 'draw']"),
+                ImageURLLikePart(BASE64_IMAGE),
+            ],
+        ),
+        Message("assistant", "done"),
+    ]
+
+    run(
+        astrbot_agent_history.history.save_agent_history(
+            req=object(),
+            llm_response=object(),
+            all_messages=messages,
+            runner_stats=object(),
+            commit=object(),
+        )
+    )
+
+    saved = DummyAgentHistorySaver.calls[-1]["all_messages"]
+    assert saved[1].content == TOOL_HISTORY_PLACEHOLDER
+    serialized = json.dumps(saved[2].content, ensure_ascii=False, default=vars)
+    assert BASE64_IMAGE not in serialized
+    assert IMAGE_HISTORY_PLACEHOLDER in serialized
+
+    for name in reversed(install_order):
+        modules[name].terminate()
+    assert astrbot_agent_history.history.save_agent_history is original
+    assert astrbot_agent_history.session.save_agent_history is original
+
+
+def load_new_host_api():
+    """导入新版宿主的真实历史入口与存储，缺一不可。"""
+
+    try:
+        from astrbot.core.agent.conversation_events import ConversationEventWriter
+        from astrbot.core.agent.message import Message as HostMessage
+        from astrbot.core.agent.message import ToolCall
+        from astrbot.core.astr_agent_runtime import history, session
+        from astrbot.core.db.po import Conversation
+        from astrbot.core.db.sqlite import SQLiteDatabase
+        from astrbot.core.provider.entities import LLMResponse, ProviderRequest
+    except Exception:  # noqa: BLE001
+        return None
+    if not callable(getattr(history, "save_agent_history", None)):
+        return None
+    if not callable(getattr(session, "save_agent_history", None)):
+        return None
+    return SimpleNamespace(
+        history=history,
+        session=session,
+        ConversationEventWriter=ConversationEventWriter,
+        Message=HostMessage,
+        ToolCall=ToolCall,
+        Conversation=Conversation,
+        SQLiteDatabase=SQLiteDatabase,
+        LLMResponse=LLMResponse,
+        ProviderRequest=ProviderRequest,
+    )
+
+
+def read_conversation_messages(db_path):
+    """读回事件表里的原始消息体，保留原始内容与临时标记。"""
+
+    with sqlite3.connect(db_path) as connection:
+        rows = connection.execute(
+            "select type, payload from conversation_events order by seq",
+        ).fetchall()
+    messages = []
+    for kind, payload in rows:
+        data = json.loads(payload) if isinstance(payload, str) else payload
+        if kind == "message.appended":
+            messages.append(data.get("message") or {})
+        elif kind == "context.rebased":
+            messages.extend(
+                entry.get("message") or {} for entry in data.get("messages", [])
+            )
+    return messages
+
+
+async def run_real_sqlite_tool_history(api, tmp_path):
+    full_result = "TOOL-RESULT-" + "x" * 400
+    db_path = str(tmp_path / "tool-history.db")
+    db = api.SQLiteDatabase(db_path)
+    try:
+        umo = "qq:GroupMessage:tool-history"
+        conversation = await db.create_conversation(user_id=umo, platform_id="qq")
+        cid = conversation.conversation_id
+        snapshot = await db.conversation_store.read(cid)
+        writer = api.ConversationEventWriter(
+            db.conversation_store,
+            snapshot,
+            link_display=False,
+        )
+        await writer.start_turn({"kind": "agent", "umo": umo})
+
+        tool_call_payload = {
+            "type": "function",
+            "id": "call-a",
+            "function": {"name": "search", "arguments": '{"q":"A"}'},
+        }
+        writer.stage_history(
+            [
+                {"role": "user", "content": "查资料"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [tool_call_payload],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-a",
+                    "content": full_result,
+                },
+                {"role": "assistant", "content": "最终回答"},
+            ]
+        )
+        await writer.flush()
+
+        raw_event_payloads = read_conversation_messages(db_path)
+        assert full_result in json.dumps(raw_event_payloads, ensure_ascii=False)
+
+        messages = [
+            api.Message(role="user", content="查资料"),
+            api.Message(
+                role="assistant",
+                content=None,
+                tool_calls=[
+                    api.ToolCall(
+                        id="call-a",
+                        function=api.ToolCall.FunctionBody(
+                            name="search",
+                            arguments='{"q":"A"}',
+                        ),
+                    )
+                ],
+            ),
+            api.Message(role="tool", tool_call_id="call-a", content=full_result),
+            api.Message(role="assistant", content="最终回答"),
+        ]
+
+        async def commit(history, token_usage):
+            await db.update_conversation(
+                cid,
+                content=history,
+                token_usage=token_usage,
+            )
+
+        original_entry = api.history.save_agent_history
+        module = ToolHistoryContextModule(logger=DummyLogger())
+        assert module.install() is True
+        try:
+            saved = await api.session.save_agent_history(
+                req=api.ProviderRequest(
+                    conversation=api.Conversation(
+                        platform_id="qq",
+                        user_id=umo,
+                        cid=cid,
+                    )
+                ),
+                llm_response=api.LLMResponse(
+                    role="assistant",
+                    completion_text="最终回答",
+                ),
+                all_messages=messages,
+                runner_stats=None,
+                commit=commit,
+                writer=writer,
+            )
+            assert saved is True
+            await writer.finish_turn("completed")
+        finally:
+            module.terminate()
+
+        assert api.history.save_agent_history is original_entry
+        assert api.session.save_agent_history is original_entry
+
+        stored = await db.get_conversation_by_id(cid)
+        projected = json.dumps(stored.content, ensure_ascii=False)
+        assert full_result not in projected
+        assert TOOL_HISTORY_PLACEHOLDER in projected
+
+        tool_message = stored.content[2]
+        assert tool_message["role"] == "tool"
+        assert tool_message["tool_call_id"] == "call-a"
+        assert stored.content[1]["tool_calls"][0]["id"] == "call-a"
+        assert messages[2].content == full_result
+    finally:
+        await db.engine.dispose()
+
+
+def test_real_sqlite_keeps_raw_tool_events_and_compresses_projection(tmp_path, monkeypatch):
+    # 本文件的替身 fixture 会把 runner 模块换成桩；跑真实链路前先放回真实模块。
+    for name in (
+        "astrbot.core.agent.runners.tool_loop_agent_runner",
+        "astrbot.core.agent.runners",
+    ):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    api = load_new_host_api()
+    if api is None:
+        pytest.skip("需要 AstrBot 4.30 的 save_agent_history 事件历史入口")
+
+    run(run_real_sqlite_tool_history(api, tmp_path))

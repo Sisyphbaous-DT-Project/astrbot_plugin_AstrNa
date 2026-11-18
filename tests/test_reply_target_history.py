@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import importlib.util
 import json
 import sys
 from types import ModuleType, SimpleNamespace
@@ -13,6 +14,7 @@ from astrna.modules.reply_target_history import (
     ReplyTargetHistoryModule,
     create_temp_text_part,
     hash_reply_text,
+    resolve_history_event,
 )
 
 
@@ -279,11 +281,15 @@ class DummyContext:
 def reset_patches():
     ReplyTargetHistoryModule.restore_patch()
     ImageCaptionModule.restore_patch()
+    from astrna.modules.image_history_context import ImageHistoryContextModule
+
+    ImageHistoryContextModule.restore_patch()
     DummyInternalAgentSubStage.saved = []
     DummyToolLoopAgentRunner.completed = []
     yield
     ReplyTargetHistoryModule.restore_patch()
     ImageCaptionModule.restore_patch()
+    ImageHistoryContextModule.restore_patch()
 
 
 @pytest.fixture
@@ -312,6 +318,18 @@ def internal_module(monkeypatch):
     }
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
+    # 旧版入口用例显式屏蔽新版保存模块，保证在 4.30 上也走
+    # InternalAgentSubStage._save_to_history 分支；新入口由 host_430 覆盖。
+    # `from pkg import history` 会优先读父模块属性，必须同时摘除。
+    parent = sys.modules.get("astrbot.core.astr_agent_runtime")
+    if parent is not None:
+        for attr in ("history", "session"):
+            monkeypatch.delattr(parent, attr, raising=False)
+    for name in (
+        "astrbot.core.astr_agent_runtime.history",
+        "astrbot.core.astr_agent_runtime.session",
+    ):
+        monkeypatch.setitem(sys.modules, name, None)
     return internal
 
 
@@ -1233,3 +1251,264 @@ async def collect_runner_responses(runner):
     async for response in runner._iter_llm_responses():
         responses.append(response)
     return responses
+
+
+# ---------------------------------------------------------------------------
+# AstrBot 4.30：引用消息入口迁到 agent_media，历史保存迁到 save_agent_history
+# ---------------------------------------------------------------------------
+
+
+def _has_430_agent_runtime() -> bool:
+    """AstrBot 4.29 及更早没有 agent_media/astr_agent_runtime 入口。"""
+    try:
+        return (
+            importlib.util.find_spec("astrbot.core.astr_agent_runtime") is not None
+        )
+    except (ImportError, ValueError, AttributeError):
+        return False
+
+
+@pytest.fixture
+def host_430(monkeypatch):
+    """模拟 AstrBot 4.30：只有 agent_media 与 astr_agent_runtime。"""
+    if not _has_430_agent_runtime():
+        pytest.skip("当前宿主没有 agent_media/astr_agent_runtime 入口")
+    root = ModuleType("astrbot")
+    core = ModuleType("astrbot.core")
+    media = ModuleType("astrbot.core.agent_media")
+    calls = []
+
+    async def append_quoted_content(
+        event,
+        req,
+        img_cap_prov_id,
+        plugin_context,
+        quoted_message_settings=None,
+        main_provider_supports_image=False,
+        skip_quote_image_caption=False,
+        image_ref=None,
+        image_is_montage=False,
+    ):
+        calls.append(("append", event, req))
+        req.extra_user_content_parts.append(
+            TextPart("<Quoted Message>\n原引用内容\n</Quoted Message>")
+        )
+        return image_ref
+
+    media.append_quoted_content = append_quoted_content
+
+    runtime = ModuleType("astrbot.core.astr_agent_runtime")
+    history = ModuleType("astrbot.core.astr_agent_runtime.history")
+    saved = []
+
+    async def save_agent_history(
+        *,
+        req,
+        llm_response,
+        all_messages,
+        runner_stats,
+        commit,
+        user_aborted=False,
+        writer=None,
+    ):
+        saved.append({"req": req, "all_messages": all_messages})
+        return True
+
+    history.save_agent_history = save_agent_history
+    session = ModuleType("astrbot.core.astr_agent_runtime.session")
+    session.save_agent_history = save_agent_history
+    runtime.history = history
+    runtime.session = session
+    core.astr_agent_runtime = runtime
+
+    modules = {
+        "astrbot": root,
+        "astrbot.core": core,
+        "astrbot.core.agent_media": media,
+        "astrbot.core.astr_agent_runtime": runtime,
+        "astrbot.core.astr_agent_runtime.history": history,
+        "astrbot.core.astr_agent_runtime.session": session,
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    return SimpleNamespace(
+        media=media,
+        history=history,
+        session=session,
+        original_append=append_quoted_content,
+        original_save=save_agent_history,
+        calls=calls,
+        saved=saved,
+    )
+
+
+def test_430_install_patches_and_restores_new_entries(host_430):
+    module = ReplyTargetHistoryModule(logger=DummyLogger(), semantic_enabled=True)
+
+    assert module.install() is True
+    assert host_430.media.append_quoted_content is not host_430.original_append
+    assert host_430.history.save_agent_history is host_430.session.save_agent_history
+    assert host_430.history.save_agent_history is not host_430.original_save
+
+    module.terminate()
+
+    assert host_430.media.append_quoted_content is host_430.original_append
+    assert host_430.history.save_agent_history is host_430.original_save
+    assert host_430.session.save_agent_history is host_430.original_save
+
+
+def test_430_append_quoted_appends_reply_direction_hint(host_430):
+    module = ReplyTargetHistoryModule(logger=DummyLogger(), semantic_enabled=True)
+    module.install()
+    event = DummyEvent()
+    event.message_obj.message = [
+        Reply(sender_id="quoted-user", sender_nickname="Quoted Nick", message_str="原引用内容")
+    ]
+    req = DummyRequest()
+
+    run(host_430.media.append_quoted_content(event, req, "", DummyContext()))
+
+    text = req.extra_user_content_parts[-1].text
+    assert "AstrNa 回复指向说明：" in text
+    assert "当前发言人是GroupCard（用户 ID：user123）。" in text
+    assert getattr(req.extra_user_content_parts[-1], "_no_save", False) or getattr(
+        req.extra_user_content_parts[-1], "_is_temp", False
+    )
+
+
+def test_430_append_quoted_without_semantic_keeps_only_event(host_430):
+    module = ReplyTargetHistoryModule(logger=DummyLogger(), semantic_enabled=False)
+    module.install()
+    event = DummyEvent()
+    event.message_obj.message = [
+        Reply(sender_id="quoted-user", sender_nickname="Quoted Nick", message_str="原引用内容")
+    ]
+    req = DummyRequest()
+
+    run(host_430.media.append_quoted_content(event, req, "", DummyContext()))
+
+    assert resolve_history_event(None, req) is event
+    assert all(
+        "AstrNa 回复指向说明" not in getattr(part, "text", "")
+        for part in req.extra_user_content_parts
+    )
+
+
+def test_430_save_history_strips_markers(host_430):
+    module = ReplyTargetHistoryModule(logger=DummyLogger(), semantic_enabled=True)
+    module.install()
+    messages = [
+        Message("system", "sys"),
+        Message(
+            "assistant",
+            '<astrna_reply_target>{"scope":"group"}</astrna_reply_target>\n你好呀',
+        ),
+    ]
+
+    run(
+        host_430.history.save_agent_history(
+            req=SimpleNamespace(conversation=None),
+            llm_response=None,
+            all_messages=messages,
+            runner_stats=None,
+            commit=None,
+        )
+    )
+
+    saved = host_430.saved[-1]["all_messages"]
+    assert "astrna_reply_target" not in saved[-1].content
+    assert saved[-1].content == "你好呀"
+    assert saved is not messages
+
+
+def test_430_save_history_indexes_reply_target_with_recorded_event(host_430, fakes):
+    kv_store = fakes.KVStore()
+    module = ReplyTargetHistoryModule(
+        logger=DummyLogger(), kv_store=kv_store, semantic_enabled=True
+    )
+    module.install()
+    event = DummyEvent()
+    req = DummyRequest()
+    req.conversation = SimpleNamespace(cid="conv-1", history="[]")
+
+    run(host_430.media.append_quoted_content(event, req, "", DummyContext()))
+    run(
+        host_430.history.save_agent_history(
+            req=req,
+            llm_response=None,
+            all_messages=[Message("system", "sys"), Message("assistant", "给用户的回复")],
+            runner_stats=None,
+            commit=None,
+        )
+    )
+
+    state = kv_store.data["reply_target_history_state_v2"]
+    entries = state["sessions"]["aiocqhttp:GroupMessage:group456#conv-1"]
+    assert len(entries) == 1
+    assert entries[0]["metadata"]["user"]["user_id"] == "user123"
+
+
+def test_430_save_history_without_event_skips_index(host_430, fakes):
+    kv_store = fakes.KVStore()
+    module = ReplyTargetHistoryModule(
+        logger=DummyLogger(), kv_store=kv_store, semantic_enabled=True
+    )
+    module.install()
+    req = DummyRequest()
+    req.conversation = SimpleNamespace(cid="conv-1", history="[]")
+
+    run(
+        host_430.history.save_agent_history(
+            req=req,
+            llm_response=None,
+            all_messages=[Message("system", "sys"), Message("assistant", "回复")],
+            runner_stats=None,
+            commit=None,
+        )
+    )
+
+    assert "reply_target_history_state_v2" not in kv_store.data
+
+
+def test_430_stale_append_wrapper_after_terminate_passes_through(host_430):
+    module = ReplyTargetHistoryModule(logger=DummyLogger(), semantic_enabled=True)
+    module.install()
+    stale = host_430.media.append_quoted_content
+    module.terminate()
+    event = DummyEvent()
+    event.message_obj.message = [
+        Reply(sender_id="quoted-user", sender_nickname="Quoted Nick", message_str="原引用内容")
+    ]
+    req = DummyRequest()
+
+    run(stale(event, req, "", DummyContext()))
+
+    assert all(
+        "AstrNa 回复指向说明" not in getattr(part, "text", "")
+        for part in req.extra_user_content_parts
+    )
+
+
+def test_real_430_save_agent_history_is_patched():
+    """真实 AstrBot 4.30：历史保存入口的模块属性与 from-import 绑定都要还原。"""
+    try:
+        from astrbot.core.astr_agent_runtime import history, session
+    except Exception:  # noqa: BLE001
+        pytest.skip("当前环境没有 AstrBot 运行时会话模块")
+    if not hasattr(history, "save_agent_history"):
+        pytest.skip("当前 AstrBot 版本没有 save_agent_history")
+
+    original_history = history.save_agent_history
+    original_session = getattr(session, "save_agent_history", None)
+    module = ReplyTargetHistoryModule(logger=DummyLogger(), semantic_enabled=True)
+    try:
+        assert module.install() is True
+        assert history.save_agent_history is not original_history
+        assert history.save_agent_history is session.save_agent_history
+    finally:
+        module.terminate()
+        ReplyTargetHistoryModule.restore_patch()
+
+    assert history.save_agent_history is original_history
+    assert session.save_agent_history is original_session

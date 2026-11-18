@@ -4,6 +4,18 @@ import pytest
 
 from astrna.modules.gemini_request_headers import GeminiRequestHeadersModule
 from astrna.modules.group_sender_concurrency import GroupSenderConcurrencyModule
+from astrna.modules.group_sender_concurrency_session import (
+    GroupSenderConcurrencySessionModule,
+)
+
+
+def force_legacy_group_backend(monkeypatch):
+    """Gemini 联动测试针对旧后端，屏蔽新版 AgentSession 能力探测。"""
+    monkeypatch.setattr(
+        GroupSenderConcurrencySessionModule,
+        "probe",
+        classmethod(lambda cls: False),
+    )
 
 
 class DummyLogger:
@@ -100,6 +112,7 @@ def test_stale_wrapper_is_transparent_after_terminate(monkeypatch):
 
 
 def test_runtime_close_disables_gemini_adapter_before_async_cleanup(fakes, monkeypatch):
+    force_legacy_group_backend(monkeypatch)
     calls = []
     runtime = fakes.build_runtime({"unlock_group_sender_concurrency": False})
     monkeypatch.setattr(
@@ -110,7 +123,7 @@ def test_runtime_close_disables_gemini_adapter_before_async_cleanup(fakes, monke
     monkeypatch.setattr(
         runtime.group_sender_concurrency,
         "terminate",
-        lambda: calls.append("group"),
+        lambda **kwargs: calls.append("group"),
     )
 
     async def blocking_issue_terminate():
@@ -196,6 +209,7 @@ def test_stream_close_runs_in_correct_scope_across_tasks(monkeypatch, active):
 
 
 def test_runtime_adapter_follows_successful_group_install_and_toggles(fakes, monkeypatch):
+    force_legacy_group_backend(monkeypatch)
     installed = []
 
     def group_install(module):

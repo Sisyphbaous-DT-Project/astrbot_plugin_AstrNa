@@ -461,13 +461,17 @@ async function bootstrap() {
           if (!current) continue;
           const enabled = Boolean(nextFeature.enabled);
           current.details = nextFeature.details || {};
+          current.capability = nextFeature.capability || null;
           if (Array.isArray(nextFeature.settings)) {
             current.settings = nextFeature.settings;
           }
           if (!pending.has(nextFeature.key)) applyEnabled(nextFeature.key, enabled);
           if (overlaySession && overlaySession.key === nextFeature.key) {
             if (overlaySession.kind === "detail") {
-              overlaySession.api.updateDetails(current.details);
+              overlaySession.api.updateDetails(
+                current.details,
+                current.capability,
+              );
             } else {
               overlaySession.api.refresh(current.settings);
             }

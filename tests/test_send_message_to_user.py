@@ -14,6 +14,7 @@ from astrna.modules.send_message_to_user import (
     mark_wrapper_active,
     mark_wrapper_inactive,
 )
+from astrna.utils import host_compat
 
 
 class DummyLLMResponse:
@@ -79,7 +80,31 @@ class DummyEvent:
 
 
 class CronMessageEvent(DummyEvent):
-    pass
+    """旧版定时任务合成事件的替身：平台名固定为 cron。"""
+
+    def get_platform_name(self):
+        return "cron"
+
+
+class WakeupTestEvent(DummyEvent):
+    """新版 AgentWakeupEvent 的替身：保留真实平台名，用 source 表示来源。"""
+
+    event_kind = "agent_wakeup"
+
+    def __init__(self, source="background_task", *, action_type=None):
+        super().__init__(action_type=action_type)
+        self.source = source
+        self.source_id = "task-1"
+
+    def get_platform_name(self):
+        return "aiocqhttp"
+
+
+@pytest.fixture
+def without_wakeup_event_class(monkeypatch):
+    """模拟宿主类无法导入，让来源判定走鸭子类型回退分支。"""
+    monkeypatch.setattr(host_compat, "get_wakeup_event_cls", lambda: None)
+    return None
 
 
 class DummyResultChain:
@@ -444,6 +469,81 @@ def test_cron_event_is_not_converted(astrbot_runner_modules, fakes):
         tool_response([{"type": "plain", "text": "定时"}]),
         event=CronMessageEvent(),
     )
+
+    [response] = asyncio.run(collect_runner_responses(runner))
+
+    assert response.tools_call_name == ["send_message_to_user"]
+    asyncio.run(runtime.terminate())
+
+
+@pytest.mark.parametrize("source", ["cron", "background_task", "plugin"])
+def test_wakeup_events_do_not_get_normal_chat_marker(
+    astrbot_runner_modules,
+    fakes,
+    without_wakeup_event_class,
+    source,
+):
+    runtime = fakes.build_runtime({"optimize_send_message_to_user": True})
+    event = WakeupTestEvent(source)
+
+    asyncio.run(collect_internal_process(astrbot_runner_modules, event))
+
+    assert event.get_extra(NORMAL_CHAT_REQUEST_MARKER) is None
+    assert event.get_extra("enable_streaming") is None
+    asyncio.run(runtime.terminate())
+
+
+@pytest.mark.parametrize("source", ["cron", "background_task", "plugin"])
+def test_wakeup_event_tool_call_is_not_converted(
+    astrbot_runner_modules,
+    fakes,
+    without_wakeup_event_class,
+    source,
+):
+    runtime = fakes.build_runtime({"optimize_send_message_to_user": True})
+    # 即使普通聊天标记已被写入，后台唤醒也不能被改写成聊天最终回复。
+    runner = build_runner(
+        tool_response([{"type": "plain", "text": "后台结果"}]),
+        event=WakeupTestEvent(source),
+    )
+
+    [response] = asyncio.run(collect_runner_responses(runner))
+
+    assert response.tools_call_name == ["send_message_to_user"]
+    asyncio.run(runtime.terminate())
+
+
+def test_send_to_user_false_event_does_not_get_normal_chat_marker(
+    astrbot_runner_modules,
+    fakes,
+):
+    runtime = fakes.build_runtime({"optimize_send_message_to_user": True})
+    event = DummyEvent()
+    event.set_extra("astrna_send_to_user", False)
+
+    asyncio.run(collect_internal_process(astrbot_runner_modules, event))
+
+    assert event.get_extra(NORMAL_CHAT_REQUEST_MARKER) is None
+    assert event.get_extra("enable_streaming") is None
+    asyncio.run(runtime.terminate())
+
+
+def test_send_to_user_false_context_is_not_converted(astrbot_runner_modules, fakes):
+    runtime = fakes.build_runtime({"optimize_send_message_to_user": True})
+    runner = build_runner(tool_response([{"type": "plain", "text": "内部结果"}]))
+    runner.run_context.context.send_to_user = False
+
+    [response] = asyncio.run(collect_runner_responses(runner))
+
+    assert response.tools_call_name == ["send_message_to_user"]
+    asyncio.run(runtime.terminate())
+
+
+def test_subagent_context_is_not_converted(astrbot_runner_modules, fakes):
+    runtime = fakes.build_runtime({"optimize_send_message_to_user": True})
+    runner = build_runner(tool_response([{"type": "plain", "text": "子代理结果"}]))
+    runner.run_context.context.is_subagent = True
+    runner.run_context.context.send_to_user = True
 
     [response] = asyncio.run(collect_runner_responses(runner))
 

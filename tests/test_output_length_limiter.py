@@ -18,6 +18,7 @@ from astrna.modules.send_message_to_user import (
     SendMessageToUserModule,
 )
 from astrna.runtime import AstrNaRuntime
+from astrna.utils import host_compat
 from astrna.utils.patching import mark_wrapper_inactive
 
 
@@ -342,6 +343,27 @@ class DummyPlatformEvent(DummyEvent):
         return self.platform_name
 
 
+class DummyWakeupEvent(DummyEvent):
+    """模拟新版 AgentWakeupEvent：真实平台名 + source 表示唤醒来源。"""
+
+    event_kind = "agent_wakeup"
+
+    def __init__(self, source="cron", umo="aiocqhttp:GroupMessage:123456"):
+        super().__init__(umo)
+        self.source = source
+        self.source_id = "wakeup-1"
+
+    def get_platform_name(self):
+        return "aiocqhttp"
+
+
+@pytest.fixture
+def without_wakeup_event_class(monkeypatch):
+    """模拟宿主类无法导入，让来源判定走鸭子类型回退分支。"""
+    monkeypatch.setattr(host_compat, "get_wakeup_event_cls", lambda: None)
+    return None
+
+
 def test_cron_events_keep_streaming_and_response_unchanged(astrbot_runner_modules):
     provider = DummyProvider("不会用到")
     runtime = build_runtime(
@@ -404,6 +426,108 @@ def test_cron_event_detection_rules():
     assert not is_cron_event(DummyEvent())
     assert not is_cron_event(BrokenPlatformEvent())
     assert not is_cron_event(None)
+
+
+@pytest.mark.parametrize("source", ["cron", "background_task", "plugin"])
+def test_wakeup_final_reply_is_still_limited(
+    astrbot_runner_modules,
+    without_wakeup_event_class,
+    source,
+):
+    provider = DummyProvider("清洗后")
+    runtime = build_runtime(
+        {
+            "output_length_limit_enabled": True,
+            "output_length_limit_provider_id": "clean",
+            "output_length_limit_max_chars": 5,
+        },
+        providers={"clean": provider},
+    )
+    event = DummyWakeupEvent(source)
+    runner = build_runner(long_response(), event=event)
+
+    asyncio.run(collect_internal_process(astrbot_runner_modules, event))
+    [actual] = asyncio.run(collect_runner_responses(runner))
+
+    # 新版唤醒事件保留真实平台名，最终回复会正常投递，不能按来源整体跳过。
+    assert event.get_extra("enable_streaming") is False
+    assert actual.completion_text == "清洗后"
+    assert len(provider.calls) == 1
+    asyncio.run(runtime.terminate())
+
+
+def test_wakeup_event_is_not_mistaken_for_legacy_cron():
+    assert not is_cron_event(DummyWakeupEvent("cron"))
+    assert not is_cron_event(DummyWakeupEvent("background_task"))
+
+
+@pytest.mark.parametrize(
+    "event_extra",
+    [
+        {"astrna_send_to_user": False},
+        {"astrna_internal_result": True},
+    ],
+    ids=["send_to_user_false", "internal_result"],
+)
+def test_internal_result_event_keeps_streaming_and_response(
+    astrbot_runner_modules,
+    event_extra,
+):
+    provider = DummyProvider("不会用到")
+    runtime = build_runtime(
+        {
+            "output_length_limit_enabled": True,
+            "output_length_limit_provider_id": "clean",
+            "output_length_limit_max_chars": 5,
+        },
+        providers={"clean": provider},
+    )
+    event = DummyEvent()
+    event.extras.update(event_extra)
+    response = long_response()
+    runner = build_runner(response, event=event)
+
+    asyncio.run(collect_internal_process(astrbot_runner_modules, event))
+    [actual] = asyncio.run(collect_runner_responses(runner))
+
+    assert event.get_extra("enable_streaming") is None
+    assert actual is response
+    assert provider.calls == []
+    asyncio.run(runtime.terminate())
+
+
+@pytest.mark.parametrize(
+    "context_attrs",
+    [
+        {"send_to_user": False},
+        {"is_subagent": True, "send_to_user": True},
+    ],
+    ids=["send_to_user_false", "subagent"],
+)
+def test_internal_runner_contexts_are_not_limited(
+    astrbot_runner_modules,
+    context_attrs,
+):
+    provider = DummyProvider("不会用到")
+    runtime = build_runtime(
+        {
+            "output_length_limit_enabled": True,
+            "output_length_limit_provider_id": "clean",
+            "output_length_limit_max_chars": 5,
+        },
+        providers={"clean": provider},
+    )
+    event = DummyEvent()
+    response = long_response()
+    runner = build_runner(response, event=event)
+    for name, value in context_attrs.items():
+        setattr(runner.run_context.context, name, value)
+
+    [actual] = asyncio.run(collect_runner_responses(runner))
+
+    assert actual is response
+    assert provider.calls == []
+    asyncio.run(runtime.terminate())
 
 
 def test_multiple_whitelist_umos_keep_streaming_and_response_unchanged(

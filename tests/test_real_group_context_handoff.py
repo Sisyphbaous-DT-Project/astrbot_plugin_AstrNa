@@ -35,11 +35,17 @@ if str(ASTRBOT_SOURCE) not in sys.path:
     sys.path.insert(0, str(ASTRBOT_SOURCE))
 
 from astrbot.builtin_stars.astrbot.group_chat_context import GroupChatContext
+from astrbot.core.agent import message as _agent_message
 from astrbot.core.agent.hooks import BaseAgentRunHooks
-from astrbot.core.agent.message import dump_messages_with_checkpoints
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
-from astrbot.core.astr_agent_run_util import run_agent
+
+try:
+    # AstrBot 4.30 起 run_agent 迁入 astr_agent_runtime，旧模块被删除。
+    from astrbot.core.astr_agent_run_util import run_agent
+except ImportError:
+    from astrbot.core.astr_agent_runtime.runner import run_agent
+
 try:
     from astrbot.core.pipeline.scheduler import PipelineScheduler
 except Exception:  # 部分测试环境缺少 fastapi 等平台依赖，按能力跳过。
@@ -51,6 +57,11 @@ from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.platform.platform_metadata import PlatformMetadata
 from astrbot.core.message.components import Image, Plain
+
+# AstrBot 4.30 用 dump_messages 取代了会回填检查点的旧序列化入口。
+dump_messages_with_checkpoints = getattr(
+    _agent_message, "dump_messages_with_checkpoints", None
+) or _agent_message.dump_messages
 
 if PipelineScheduler is None or not callable(getattr(PipelineScheduler, "execute", None)):
     pytest.skip(
@@ -186,11 +197,25 @@ def make_group_context():
     return group_context
 
 
+class _MessageConfigFactory:
+    """为 PipelineScheduler 提供按会话配置快照。
+
+    AstrBot 4.30 的 ``PipelineScheduler.execute`` 会先建立 ``MessageConfig``
+    作用域；本文件的所有阶段均为替身，不需要真实配置内容，但结构必须齐全。
+    """
+
+    def _create_message_config(self, umo):
+        return {}, frozenset()
+
+
 def make_scheduler(group_context):
     scheduler = object.__new__(PipelineScheduler)
     scheduler.ctx = SimpleNamespace(
         group_chat_context=group_context,
         astrbot_config={"platform_settings": {}},
+        plugin_manager=SimpleNamespace(
+            context=SimpleNamespace(astrbot_config_mgr=_MessageConfigFactory())
+        ),
     )
     return scheduler
 
@@ -269,6 +294,7 @@ class TriggerFlowStage:
             streaming=self.streaming,
         )
         self.anchor = runner.run_context.messages[-1]
+        prime_runner_stream(runner)
         async for _ in runner._iter_llm_responses():
             pass
         # 触发消息的原生记录晚于主模型首次请求写入。
@@ -372,6 +398,7 @@ class CompressionFlowStage:
             FakeHooks(),
             streaming=False,
         )
+        prime_runner_stream(runner)
         async for _ in runner._iter_llm_responses():
             pass
         self.runner = runner
@@ -433,6 +460,66 @@ class MemoryStore:
 
     async def put_kv_data(self, key, value):
         self.data[key] = copy.deepcopy(value)
+
+
+async def save_stage_history(event, req, runner, store):
+    """按宿主版本保存内部 Agent 历史。
+
+    AstrBot 4.30 删除了 ``InternalAgentSubStage._save_to_history``，改由
+    ``astr_agent_runtime.history.save_agent_history`` 接收提交回调。
+    """
+    from astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal import (
+        InternalAgentSubStage,
+    )
+
+    legacy = getattr(InternalAgentSubStage, "_save_to_history", None)
+    if callable(legacy):
+        stage = object.__new__(InternalAgentSubStage)
+        stage.conv_manager = store
+        await legacy(
+            stage,
+            event,
+            req,
+            runner.get_final_llm_resp(),
+            runner.run_context.messages,
+            runner.stats,
+        )
+        return
+    from astrbot.core.astr_agent_runtime.history import save_agent_history
+
+    await save_agent_history(
+        req=req,
+        llm_response=runner.get_final_llm_resp(),
+        all_messages=runner.run_context.messages,
+        runner_stats=runner.stats,
+        commit=store.update_conversation,
+    )
+
+
+def prime_runner_stream(runner):
+    """补全新版 Runner 直接迭代响应流时缺失的输出记账状态。
+
+    新宿主把 ``_message_parts`` 等状态放到 ``step()`` 内初始化；本回归需要
+    绕开平台发送直接驱动 ``_iter_llm_responses``，因此只在属性缺失时补上空值，
+    不改变旧宿主已有的初始化结果。
+    """
+    if not hasattr(runner, "_message_parts"):
+        runner._message_parts = []
+    if not hasattr(runner, "_message_indices"):
+        runner._message_indices = {}
+
+
+def assert_stopped(runner, parts):
+    """断言 Runner 已按「用户停止」收尾本轮执行。
+
+    AstrBot 4.30 起停止不再产出 ``type="aborted"`` 的响应，而是把本轮标记为
+    CANCELLED；旧宿主仍保留 aborted 响应，两条可见信号都要覆盖。
+    """
+    aborted = [part for part in parts if getattr(part, "type", None) == "aborted"]
+    if aborted:
+        assert [part.type for part in parts] == ["aborted"]
+        return
+    assert runner.was_aborted() is True
 
 
 async def execute_record(scheduler, native, event):
@@ -596,7 +683,7 @@ def test_direct_runner_exit_cleans_pre_send_subscription(mode):
         )
         if mode == "stop":
             runner.request_stop()
-            assert [part.type async for part in runner.step()] == ["aborted"]
+            assert_stopped(runner, [part async for part in runner.step()])
         elif mode == "cancel":
             entered = asyncio.Event()
 
@@ -615,11 +702,16 @@ def test_direct_runner_exit_cleans_pre_send_subscription(mode):
             with pytest.raises(asyncio.CancelledError):
                 await task
         else:
-            # 暂停在原生停止输出 yield 后关闭生成器，清理也必须同步完成。
+            # 暂停在原生停止输出后关闭生成器，清理也必须同步完成。
             runner.request_stop()
             generator = runner.step()
-            assert (await anext(generator)).type == "aborted"
+            parts = []
+            try:
+                parts.append(await anext(generator))
+            except StopAsyncIteration:
+                pass
             await generator.aclose()
+            assert_stopped(runner, parts)
         assert state.discarded
         assert module._handoff._requests == {}
         assert module._handoff._channels == {}
@@ -651,10 +743,6 @@ def test_history_only_request_has_no_current_user_anchor():
 @pytest.mark.parametrize("streaming", [False, True])
 def test_real_step_collects_during_native_context_wait_and_saves_history(streaming):
     async def run_case():
-        from astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal import (
-            InternalAgentSubStage,
-        )
-
         module = build_module()
         module.install()
         native = make_group_context()
@@ -701,14 +789,11 @@ def test_real_step_collects_during_native_context_wait_and_saves_history(streami
             history = None
 
             async def update_conversation(self, *args, **kwargs):
-                self.history = kwargs["history"]
+                self.history = kwargs["history"] if "history" in kwargs else args[0]
 
-        stage = object.__new__(InternalAgentSubStage)
-        stage.conv_manager = StoreConversation()
-        await stage._save_to_history(
-            event, req, runner.get_final_llm_resp(), runner.run_context.messages, runner.stats,
-        )
-        history = json.dumps(stage.conv_manager.history)
+        store = StoreConversation()
+        await save_stage_history(event, req, runner, store)
+        history = json.dumps(store.history)
         assert "real-current-user" in history
         assert "during-native-wait" not in history
         module.terminate()

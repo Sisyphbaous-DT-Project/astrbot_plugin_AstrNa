@@ -111,6 +111,11 @@ class AstrNa(Star):
                 self._shared_config,
                 version=self._plugin_version,
                 context=self.context,
+                capabilities={
+                    "unlock_group_sender_concurrency": (
+                        self.runtime.group_sender_concurrency_capability()
+                    ),
+                },
             )
         )
 

@@ -15,6 +15,18 @@
   二次询问退回普通回答路径；同一步可能先后扣住过场白与退回回答两段）；
 - 流式、范围不命中、没有 event、没有可用工具时整步透传。
 
+AstrBot 4.30 起 step() 改为输出 RunnerEventPayload 事件，同一门卫改为按事件
+类型判定，语义与旧版逐条对应：
+- message.completed（status=completed）承载一段普通文字：runner.done() 为
+  True 时当场放行，否则先扣住；
+- tool.started / tool.rejected 是工具决策：立即丢弃扣住的文字；
+- request.finished、message.completed 的失败/取消状态：丢弃扣住的文字；
+- request.started（provider 请求边界）本身不解扣：扣住的文字跨请求保留，等本步
+  结束再按 Runner 真实状态判定，skills_like 二次询问退回依赖这一点；
+- 一步结束仍有扣住文字、本步没放行过任何文字、runner 已完成且未中止：只放行
+  最后一段，用于 skills_like 二次询问退回空回答这一原生兜底路径；
+- 文字事件仍原样留在事件流里，只决定是否转发，不改动内容、顺序与状态。
+
 生命周期红线：重复安装只允许 `self._installed and _active_module is self`
 直接返回，严禁「自己不在链顶就重新包一层」。handoff 模块每个请求都会检查
 并重包链顶，两种写法叠加会互相套娃（实测约 600 次请求即 RecursionError）。
@@ -34,6 +46,16 @@ from ..utils.patching import (
     unwrap_inactive_wrapper,
 )
 from .output_length_limiter import get_runner_event, parse_whitelist_umos
+
+# 旧宿主（AstrBot 4.29 及更早）step() 产出的 AgentResponse 类型。
+_LEGACY_TEXT_EVENT = "llm_result"
+_LEGACY_FINISH_EVENTS = frozenset({"tool_call", "aborted", "err"})
+
+# 新版宿主（AstrBot 4.30 起）step() 产出的 RunnerEventPayload 类型。
+_TEXT_EVENT = "message.completed"
+_TOOL_DECISION_EVENTS = frozenset({"tool.started", "tool.rejected"})
+_REQUEST_EVENT = "request.finished"
+_FAILED_STATUSES = frozenset({"failed", "cancelled"})
 
 
 class ToolCallPreambleModule:
@@ -107,9 +129,12 @@ class ToolCallPreambleModule:
                         return
 
                     held: list[Any] = []
+                    released_final = False
                     async for response in agen:
                         kind = getattr(response, "type", None)
-                        if kind == "llm_result" and not _is_reasoning_response(response):
+                        if kind == _LEGACY_TEXT_EVENT and not _is_reasoning_response(
+                            response
+                        ):
                             if active_module._runner_finished(runner_self):
                                 # 无工具的最终回答：当场放行，零延迟。
                                 yield response
@@ -121,12 +146,53 @@ class ToolCallPreambleModule:
                                 _held_text_length(response),
                             )
                             continue
-                        if kind in ("tool_call", "aborted", "err"):
+                        if kind in _LEGACY_FINISH_EVENTS:
                             # 一见工具调用/中断/错误立即丢弃扣住的文字。
                             held.clear()
+                            yield response
+                            continue
+                        if kind == _TEXT_EVENT:
+                            if _payload_status(response) in _FAILED_STATUSES:
+                                # 失败或取消的文字段与原生一样整段丢弃。
+                                held.clear()
+                                yield response
+                                continue
+                            if not _has_visible_output(response):
+                                # 纯思考/空段不参与过场白判定，原样放行。
+                                yield response
+                                continue
+                            if active_module._runner_finished(runner_self):
+                                # 无工具的最终回答（含 skills_like 退回）当场放行。
+                                released_final = True
+                                yield response
+                                continue
+                            held.append(response)
+                            active_module._log(
+                                "debug",
+                                "AstrNa 扣住工具调用前的过场白（%d 字）。",
+                                _held_text_length(response),
+                            )
+                            continue
+                        if kind in _TOOL_DECISION_EVENTS:
+                            # 工具决策已产生：本步此前的文字都是过场白。
+                            held.clear()
+                            yield response
+                            continue
+                        if (
+                            kind == _REQUEST_EVENT
+                            and _payload_status(response) in _FAILED_STATUSES
+                        ):
+                            # 请求失败/取消：本步不会再有可发的最终回答。
+                            held.clear()
+                            yield response
+                            continue
                         yield response
-                    if held and active_module._runner_finished(
-                        runner_self, check_aborted=True
+                    if (
+                        held
+                        and not released_final
+                        and active_module._runner_finished(
+                            runner_self, check_aborted=True
+                        )
                     ):
                         # skills_like 二次询问退回普通回答：多段只放最后一段，
                         # 只扣住一段（退回回答为空）时保守放行，与原生行为一致。
@@ -245,12 +311,47 @@ def _response_chain(resp: Any) -> Any:
     return getattr(data, "chain", None)
 
 
+def _payload_status(payload: Any) -> str | None:
+    """读取新版事件状态（TurnStatus 枚举或同名文字），读不到返回 None。"""
+    try:
+        status = getattr(payload, "status", None)
+    except Exception:  # noqa: BLE001
+        return None
+    value = getattr(status, "value", status)
+    return value if isinstance(value, str) else None
+
+
+def _has_visible_output(payload: Any) -> bool:
+    """判断文字段是否含可见内容；纯思考段不算过场白候选。"""
+    try:
+        content = getattr(payload, "content", None)
+        if content is None:
+            return False
+        parts = list(content)
+    except Exception:  # noqa: BLE001
+        return False
+    return any(getattr(part, "type", None) != "reasoning" for part in parts)
+
+
 def _is_reasoning_response(resp: Any) -> bool:
     return getattr(_response_chain(resp), "type", None) == "reasoning"
 
 
 def _held_text_length(resp: Any) -> int:
     """只统计字数，绝不读取或记录原文。"""
+    kind = getattr(resp, "type", None)
+    if kind == _TEXT_EVENT:
+        total = 0
+        try:
+            for part in getattr(resp, "content", ()) or ():
+                if getattr(part, "type", None) != "plain":
+                    continue
+                text = getattr(part, "text", None)
+                if isinstance(text, str):
+                    total += len(text)
+        except Exception:  # noqa: BLE001
+            return 0
+        return total
     getter = getattr(_response_chain(resp), "get_plain_text", None)
     if not callable(getter):
         return 0

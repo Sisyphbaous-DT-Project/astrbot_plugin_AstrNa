@@ -150,18 +150,30 @@ class DummyProvider:
 
 
 class DummyContext:
-    def __init__(self, providers=None, *, provider_settings=None, agent_runner=None):
+    def __init__(
+        self,
+        providers=None,
+        *,
+        provider_settings=None,
+        agent_runner=None,
+        agent=None,
+    ):
         self.providers = providers or {}
         self.provider_settings = provider_settings or {}
         self.agent_runner = agent_runner
+        self.agent = agent
+        self.config_umos = []
 
     def get_provider_by_id(self, provider_id):
         return self.providers.get(provider_id)
 
     def get_config(self, umo=None):
+        self.config_umos.append(umo)
         config = {"provider_settings": self.provider_settings}
         if self.agent_runner is not None:
             config["agent_runner"] = self.agent_runner
+        if self.agent is not None:
+            config["agent"] = self.agent
         return config
 
 
@@ -330,12 +342,14 @@ def build_module(
     provider_id="compress-1",
     provider_settings=None,
     agent_runner=None,
+    agent=None,
 ):
     return GroupChatContextOptimizerModule(
         context=DummyContext(
             {provider_id: provider} if provider else {},
             provider_settings=provider_settings,
             agent_runner=agent_runner,
+            agent=agent,
         ),
         logger=DummyLogger(),
         provider_id=provider_id,
@@ -665,6 +679,153 @@ def test_compress_prompt_agent_runner_turn_settings_take_precedence_over_legacy(
     prompt = provider.calls[0]["prompt"]
     assert "history-079-user" in prompt
     assert prompt.count("history-") == 32
+
+
+def build_agent_config(max_turns, trim_turns=1):
+    """AstrBot 4.30 起主 Agent 配置位于 agent.config.compression。"""
+
+    return {
+        "runtime": "astrbot",
+        "config": {
+            "compression": {
+                "max_turns": max_turns,
+                "trim_turns": trim_turns,
+            },
+        },
+    }
+
+
+def test_compress_prompt_pretrims_main_history_by_agent_config_turn_settings(
+    astrbot_group_context_modules,
+):
+    provider = DummyProvider(valid_compressed_text())
+    module = build_module(
+        provider,
+        agent=build_agent_config(30, 15),
+    )
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_group_records(group_context, event)
+    req = DummyReq()
+    req.contexts = build_long_contexts()
+    original_contexts = list(req.contexts)
+
+    run(group_context.on_req_llm(event, req))
+
+    assert len(provider.calls) == 1
+    prompt = provider.calls[0]["prompt"]
+    assert "history-000-user" not in prompt
+    assert "history-078-user" not in prompt
+    assert "history-079-user" in prompt
+    assert "history-094-assistant" in prompt
+    assert prompt.count("history-") == 32
+    assert req.contexts == original_contexts
+    assert req.contexts is not original_contexts
+    assert len(req.contexts) == 190
+
+
+def test_compress_prompt_agent_config_limit_disabled_keeps_all_history(
+    astrbot_group_context_modules,
+):
+    provider = DummyProvider(valid_compressed_text())
+    module = build_module(
+        provider,
+        provider_settings={
+            "max_context_length": 30,
+            "dequeue_context_length": 15,
+        },
+        agent=build_agent_config(-1, 15),
+    )
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_group_records(group_context, event)
+    req = DummyReq()
+    req.contexts = build_long_contexts(turns=20)
+
+    run(group_context.on_req_llm(event, req))
+
+    prompt = provider.calls[0]["prompt"]
+    assert "history-000-user" in prompt
+    assert "history-019-assistant" in prompt
+    assert prompt.count("history-") == 40
+
+
+def test_compress_prompt_agent_config_takes_precedence_over_agent_runner_and_legacy(
+    astrbot_group_context_modules,
+):
+    provider = DummyProvider(valid_compressed_text())
+    module = build_module(
+        provider,
+        provider_settings={
+            "max_context_length": 5,
+            "dequeue_context_length": 1,
+        },
+        agent_runner=build_agent_runner_config(5, 1),
+        agent=build_agent_config(30, 15),
+    )
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_group_records(group_context, event)
+    req = DummyReq()
+    req.contexts = build_long_contexts()
+
+    run(group_context.on_req_llm(event, req))
+
+    prompt = provider.calls[0]["prompt"]
+    assert "history-079-user" in prompt
+    assert prompt.count("history-") == 32
+
+
+def test_compress_prompt_invalid_agent_config_falls_back_to_agent_runner(
+    astrbot_group_context_modules,
+):
+    provider = DummyProvider(valid_compressed_text())
+    module = build_module(
+        provider,
+        agent_runner=build_agent_runner_config(30, 15),
+        agent=build_agent_config("bad", 15),
+    )
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_group_records(group_context, event)
+    req = DummyReq()
+    req.contexts = build_long_contexts()
+
+    run(group_context.on_req_llm(event, req))
+
+    prompt = provider.calls[0]["prompt"]
+    assert "history-000-user" not in prompt
+    assert "history-079-user" in prompt
+    assert prompt.count("history-") == 32
+
+
+def test_compress_prompt_reads_config_for_current_umo(
+    astrbot_group_context_modules,
+):
+    provider = DummyProvider(valid_compressed_text())
+    module = build_module(
+        provider,
+        agent=build_agent_config(30, 15),
+    )
+    module.install()
+
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_group_records(group_context, event)
+    req = DummyReq()
+    req.contexts = build_long_contexts()
+
+    run(group_context.on_req_llm(event, req))
+
+    assert event.unified_msg_origin in module.context.config_umos
 
 
 def test_compress_prompt_invalid_agent_runner_settings_fall_back_to_legacy(
