@@ -2129,6 +2129,7 @@ def test_real_astrbot_generation_reinstall_and_outer_cancellation():
             runner = object.__new__(ToolLoopAgentRunner)
             runner._abort_signal = asyncio.Event()
             runner._pending_follow_ups = []
+            runner._steering_signal = asyncio.Event()
             runner._last_tool_name = None
             runner._last_tool_args = None
             runner._same_tool_streak = 0

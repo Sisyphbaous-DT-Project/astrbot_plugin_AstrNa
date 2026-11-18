@@ -65,6 +65,10 @@ _MAX_LANES = 512
 _SCOPED_DELIVERY_OWNERS: weakref.WeakSet[Any] = weakref.WeakSet()
 _SUBAGENT_SERVICES: weakref.WeakSet[Any] = weakref.WeakSet()
 _LIVE_WRITERS: weakref.WeakSet[Any] = weakref.WeakSet()
+_SUBAGENT_DELIVERY: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
+    "astrna_gsc430_subagent_delivery",
+    default=None,
+)
 
 
 @dataclass
@@ -577,6 +581,7 @@ class GroupSenderConcurrencySessionModule:
     _original_subagent_spawn: Any = None
     _original_subagent_send: Any = None
     _original_delivery_schedule: Any = None
+    _original_delivery_notify: Any = None
     _original_delivery_consume: Any = None
     _original_delivery_close: Any = None
 
@@ -593,6 +598,7 @@ class GroupSenderConcurrencySessionModule:
     _subagent_spawn_wrapper: Any = None
     _subagent_send_wrapper: Any = None
     _delivery_schedule_wrapper: Any = None
+    _delivery_notify_wrapper: Any = None
     _delivery_consume_wrapper: Any = None
     _delivery_close_wrapper: Any = None
     _subagent_turn_patches: list[tuple[Any, str, Any, Any]] = []
@@ -709,6 +715,7 @@ class GroupSenderConcurrencySessionModule:
             "_subagent_spawn_wrapper",
             "_subagent_send_wrapper",
             "_delivery_schedule_wrapper",
+            "_delivery_notify_wrapper",
             "_delivery_consume_wrapper",
             "_delivery_close_wrapper",
         ):
@@ -791,6 +798,7 @@ class GroupSenderConcurrencySessionModule:
             for attribute, original, wrapper in (
                 ("_wakeup_event", cls._original_wakeup_event, cls._wakeup_event_wrapper),
                 ("schedule", cls._original_delivery_schedule, cls._delivery_schedule_wrapper),
+                ("_notify", cls._original_delivery_notify, cls._delivery_notify_wrapper),
                 ("consume_wakeup", cls._original_delivery_consume, cls._delivery_consume_wrapper),
                 ("close", cls._original_delivery_close, cls._delivery_close_wrapper),
             ):
@@ -843,6 +851,7 @@ class GroupSenderConcurrencySessionModule:
         cls._original_subagent_spawn = None
         cls._original_subagent_send = None
         cls._original_delivery_schedule = None
+        cls._original_delivery_notify = None
         cls._original_delivery_consume = None
         cls._original_delivery_close = None
         cls._open_session_wrapper = None
@@ -858,6 +867,7 @@ class GroupSenderConcurrencySessionModule:
         cls._subagent_spawn_wrapper = None
         cls._subagent_send_wrapper = None
         cls._delivery_schedule_wrapper = None
+        cls._delivery_notify_wrapper = None
         cls._delivery_consume_wrapper = None
         cls._delivery_close_wrapper = None
         cls._lane_session_cls = None
@@ -885,8 +895,30 @@ class GroupSenderConcurrencySessionModule:
             if active_module is None or not is_wrapper_active(astrna_open_session):
                 return native
             try:
+                agent_input = kwargs.get("input")
+                delivery = _SUBAGENT_DELIVERY.get()
+                if agent_input is None and delivery is not None:
+                    scope, parent, caller = delivery
+                    event = getattr(caller, "event", None)
+                    sender = host_compat.event_sender_id(event)
+                    if (
+                        sender
+                        and event is not None
+                        and getattr(event, "unified_msg_origin", None) == scope.umo
+                        and getattr(native, "id", None) == parent.session_id
+                        and getattr(native, "umo", None) == scope.umo
+                    ):
+                        lane = active_module.find_lane(runtime_self, scope.umo, sender)
+                        turn = lane.active_turn if lane is not None else None
+                        if (
+                            lane is not None
+                            and lane.cid == native.id
+                            and turn is not None
+                            and not getattr(turn, "done", False)
+                        ):
+                            return lane.session
                 sender = active_module.resolve_lane_sender(
-                    runtime_self, native, umo, kwargs.get("input")
+                    runtime_self, native, umo, agent_input
                 )
                 if sender is None:
                     return native
@@ -1790,6 +1822,7 @@ class GroupSenderConcurrencySessionModule:
             "spawn": getattr(service_cls, "spawn", None),
             "send": getattr(service_cls, "send", None),
             "schedule": getattr(delivery_cls, "schedule", None),
+            "_notify": getattr(delivery_cls, "_notify", None),
             "consume_wakeup": getattr(delivery_cls, "consume_wakeup", None),
             "close": getattr(delivery_cls, "close", None),
         }
@@ -1895,6 +1928,28 @@ class GroupSenderConcurrencySessionModule:
                     )
             return originals["schedule"](delivery_self, scope)
 
+        async def astrna_notify(delivery_self: Any, scope: Any, parent: Any) -> Any:
+            active_module = module_cls._active_module
+            batch_key = getattr(delivery_self, "_astrna_gsc430_batch_key", None)
+            caller = delivery_self.callers.get(scope)
+            if (
+                active_module is None
+                or not is_wrapper_active(astrna_notify)
+                or caller is None
+                or not isinstance(batch_key, tuple)
+                or len(batch_key) != 3
+                or batch_key[:2] != (scope, parent)
+            ):
+                return await originals["_notify"](delivery_self, scope, parent)
+            token = _SUBAGENT_DELIVERY.set((scope, parent, caller))
+            try:
+                return await originals["_notify"](delivery_self, scope, parent)
+            finally:
+                try:
+                    _SUBAGENT_DELIVERY.reset(token)
+                except ValueError:
+                    pass
+
         async def astrna_consume(delivery_self: Any, scope: Any, parent: Any, history: str) -> Any:
             active_module = module_cls._active_module
             if active_module is not None and is_wrapper_active(astrna_consume):
@@ -1913,6 +1968,7 @@ class GroupSenderConcurrencySessionModule:
 
         for wrapper, original, name in (
             (astrna_schedule, originals["schedule"], "schedule"),
+            (astrna_notify, originals["_notify"], "_notify"),
             (astrna_consume, originals["consume_wakeup"], "consume_wakeup"),
             (astrna_close, originals["close"], "close"),
         ):
@@ -1920,6 +1976,7 @@ class GroupSenderConcurrencySessionModule:
             mark_wrapper_active(wrapper, original)
             setattr(delivery_cls, name, wrapper)
         module_cls._delivery_schedule_wrapper = astrna_schedule
+        module_cls._delivery_notify_wrapper = astrna_notify
         module_cls._delivery_consume_wrapper = astrna_consume
         module_cls._delivery_close_wrapper = astrna_close
         return True

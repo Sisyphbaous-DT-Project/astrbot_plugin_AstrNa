@@ -800,8 +800,9 @@ def is_cron_event(event: Any) -> bool:
     最终文字是交给插件的报告。两者的最终文字都不是聊天回复，限制字数只会损坏内容。
 
     4.30 起宿主改用 ``AgentWakeupEvent``：保留真实平台名并用 ``source`` 表示来源，
-    最终回复会正常投递，因此不能按来源整体跳过，只有这里能确认的旧版合成事件
-    仍然放行。
+    不能按来源整体跳过。4.30.0-beta.1 起官方 cron/后台唤醒不再自动投递最终回复，
+    只保留显式工具发送；是否展示由宿主的 ``emit_output`` 决定，与这里的旧版合成
+    事件识别无关。
     """
     return host_compat.is_legacy_cron_event(event)
 

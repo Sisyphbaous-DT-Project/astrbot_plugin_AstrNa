@@ -1,5 +1,13 @@
 # 更新日志
 
+## 1.8.0-beta1
+
+- 修复 AstrBot `4.30.0-beta.1` 下子代理结果无法直接返回 AstrNa 群发送者活跃通道的问题：投递按原调用者、父会话和现存 lane 精确定位，能够继续 steering，并让等待中的原生工具按宿主新逻辑转入后台；结果不再先落入公共会话排队。查不到明确活跃归属时仍保守回退原生流程。
+- 保留完整调用者身份、权限、插件集合和停止信号，不修改 conversation ID，不改变同发送者串行和共享历史提交规则；旧任务与无活跃 lane 的场景行为不变。
+- 适配 beta.1 的 Runner steering 初始化与 cron/后台唤醒投递口径。`4.30.0-alpha.1` 继续使用原有运行时行为，`4.29.4` 及更早旧宿主继续使用旧后端。
+- 不新增配置项，不改变默认值。普通更新后热重载 AstrNa 即可。
+- 验证：绑定 `4.30.0-beta.1` 与 `4.30.0-alpha.1` 均为 `1225 passed, 48 skipped`；只读导出 `4.29.4` 为 `1202 passed, 71 skipped`；默认参考环境为 `1134 passed, 19 skipped`，均 0 failed。群并发与并发工具聚焦 `102 passed`，版本契约 `10 passed`；另以真实 lane、子任务服务与 Runner 验证直接 steering、等待工具转后台、回执归属和工具单次执行。`ruff`、语法、JSON/YAML、LF 与 diff 检查通过；未做真实平台或线上模型验收。
+
 ## 1.8.0-alpha1
 
 - 适配 AstrBot `4.30.0-alpha.1` 的 `AgentSession` / `AgentTurn`、`AgentWakeupEvent`、图片和历史保存入口。旧宿主继续按能力使用原有实现。

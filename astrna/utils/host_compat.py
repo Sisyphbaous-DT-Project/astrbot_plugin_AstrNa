@@ -306,7 +306,8 @@ def is_internal_result_context(
     3. 回合执行作用域登记的内部结果标记。
 
     定时任务与插件主动唤醒只有在调用方明确登记时才按内部结果处理，不能一概
-    而论：新版定时任务最终文字会正常投递，插件主动回复也可能是给用户看的。
+    而论。AstrBot 4.30.0-beta.1 起 cron/后台唤醒由宿主关闭自动回复，只保留显式
+    工具发送；alpha.1 与插件主动唤醒仍可能向用户投递。
     """
     if resolve_send_to_user(context, event, default=None) is False:
         return True

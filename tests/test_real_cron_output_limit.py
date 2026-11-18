@@ -5,8 +5,8 @@
 
 按真实调用方式驱动（真实 Context.tool_loop_agent，普通与流式两种模式）。覆盖：
 
-1. 新版 AgentWakeupEvent（cron、background_task、plugin 三种来源）保留真实平台名，
-   最终回复会正常投递，照常限制；
+1. 新版 AgentWakeupEvent（cron、background_task、plugin 三种来源）保留真实平台名；
+   本测试只检查 Runner 最终结果的限字，是否自动外发由宿主 present_turn 决定；
 2. 显式 send_to_user=False 的执行与子代理（is_subagent=True）执行不限制，
    其最终文字不是聊天回复；
 3. 普通聊天事件照常限制，证明限制器确实处于生效状态；
@@ -343,7 +343,7 @@ def test_wakeup_agent_final_text_is_still_limited(limiter, source, stream):
         ),
     )
 
-    # 新版唤醒事件保留真实平台名，最终回复会正常投递。
+    # 这里直接检查 Runner 结果；beta.1 的 cron/后台自动外发由 emit_output 关闭。
     assert event.get_platform_name() == "aiocqhttp"
     assert provider.calls == 1
     assert response.completion_text == CLEANED_TEXT

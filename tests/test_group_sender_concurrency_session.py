@@ -1111,6 +1111,91 @@ def test_real_subagent_old_turn_keeps_complete_original_caller(module):
     run(scenario())
 
 
+def test_real_subagent_delivery_steers_existing_sender_lane(module):
+    if not _has_430_runtime():
+        pytest.skip("旧宿主没有 4.30 的子代理投递入口")
+    from unittest.mock import AsyncMock
+
+    from astrbot.core.agent.runtime import InputReceipt
+    from astrbot.core.astr_agent_runtime.main_session import MainAgentSession
+    from astrbot.core.astr_agent_runtime.runtime import AstrAgentRuntime
+    from astrbot.core.astr_agent_runtime.subagents.store import DeliveryStage
+    from astrbot.core.star.context import Context
+
+    async def scenario():
+        harness = _build_real_subagent_harness(
+            module, [("aaaa1111", "user-a", 1)]
+        )
+        ctx = Context.__new__(Context)
+        runtime = AstrAgentRuntime(ctx, agent_configs=None, subagents=None)
+        native = MainAgentSession(runtime, harness.parent.session_id, harness.scope.umo)
+        runtime._sessions[("main", native.id)] = native
+        record = SimpleNamespace(conversation_id=native.id, umo=native.umo)
+        ctx.conversation_manager = SimpleNamespace(
+            db=SimpleNamespace(
+                conversation_store=SimpleNamespace(
+                    get_metadata=AsyncMock(return_value=record)
+                )
+            )
+        )
+        harness.delivery.runtimes["astrbot"] = runtime
+        module.install()
+        try:
+            lane = module.get_lane_session(
+                runtime, native, harness.scope.umo, "user-a"
+            )
+
+            async def history():
+                return []
+
+            lane.history = history
+            offered = []
+            offered_event = asyncio.Event()
+            receipt = InputReceipt()
+            receipt.resolve(True)
+
+            class Active:
+                done = False
+                input = SimpleNamespace(event=harness.caller_a.event)
+
+                def steer(self, agent_input):
+                    offered.append(agent_input)
+                    offered_event.set()
+                    return receipt
+
+                async def result(self):
+                    lane.active_turn = None
+
+            lane.active_turn = Active()
+            module.capture_subagent_task(
+                harness.service, {"agent_id": "aaaa1111", "turn_id": 1}
+            )
+            harness.delivery.schedule(harness.scope)
+            await asyncio.wait_for(offered_event.wait(), 2)
+
+            async def committed():
+                while True:
+                    agent = harness.delivery.store.agents["aaaa1111"]
+                    if agent.current.delivery == DeliveryStage.COMMITTED:
+                        return
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(committed(), 2)
+            assert len(offered) == 1
+            assert offered[0].event is harness.caller_a.event
+            assert "aaaa1111" in offered[0].content[0].text
+            assert harness.context.queue.empty()
+            agent = harness.delivery.store.agents["aaaa1111"]
+            assert agent.current.delivery == DeliveryStage.COMMITTED
+            assert gsc._SUBAGENT_DELIVERY.get() is None
+        finally:
+            await harness.delivery.close()
+            module.terminate()
+            await runtime.close()
+
+    run(scenario())
+
+
 def test_real_subagent_duplicate_wakeup_does_not_consume_other_batch(module):
     if not _has_430_runtime():
         pytest.skip("旧宿主没有 4.30 的子代理投递入口")
