@@ -100,8 +100,8 @@ def test_js_modules_relative_imports_resolve():
 def test_fallback_catalog_keeps_all_features_read_only():
     text = (PAGES_DIR / "js" / "fallback-catalog.js").read_text(encoding="utf-8")
     keys = re.findall(r'^\s+"([a-z0-9_]+)",\s*$', text, flags=re.MULTILINE)
-    assert len(keys) == 23
-    assert len(set(keys)) == 23
+    assert len(keys) == 24
+    assert len(set(keys)) == 24
     assert "readOnly: !interactive" in text
     assert "enabled: interactive ? false : null" in text
 

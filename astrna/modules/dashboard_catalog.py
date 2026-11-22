@@ -27,6 +27,7 @@ SWITCH_KEYS: tuple[str, ...] = (
     "optimize_image_history_context",
     "optimize_tool_history_context",
     "optimize_quoted_image_input",
+    "optimize_quoted_bot_media",
     "optimize_group_chat_context",
     "optimize_image_caption",
     "optimize_send_message_to_user",
@@ -144,6 +145,21 @@ FEATURES: tuple[dict[str, Any], ...] = (
             "依赖平台能取到引用消息的图片；QQ 官方机器人可能拿不到引用附件",
             "不会去重或改动当前消息自带的直接图片",
             "支持图片准备入口时，尝试恢复下载或准备失败的嵌入引用图，并在转述前重新准备",
+        ),
+    ),
+    _feature(
+        "optimize_quoted_bot_media",
+        "优化引用 Bot 媒体归属",
+        "拆开 Bot 自发引用图片与用户直发图，并为引用语音/视频/文件标注归属。",
+        "用户引用 Bot（含插件）发出的图片、语音、视频或文件再回复时，模型常把这些附件误当成"
+        "引用者自己发送的。AstrNa 将 Bot 自发引用图片从用户直发图中拆出并就近标注为 Bot 自己发送，"
+        "同时为语音、视频和文件附件补充归属说明。",
+        (
+            "插件或 Bot 发出的图片、语音、视频、文件被引用回复后，模型常误以为是引用者自己发送的",
+        ),
+        (
+            "仅在能确认被引用消息来自 Bot 自己时生效，无法确认时不猜测",
+            "纯文本模型不插入 ImageURLPart，仅补充文本归属说明",
         ),
     ),
     _feature(

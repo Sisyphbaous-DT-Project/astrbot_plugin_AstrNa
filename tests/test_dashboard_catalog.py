@@ -22,6 +22,7 @@ EXPECTED_ORDER = [
     "optimize_image_history_context",
     "optimize_tool_history_context",
     "optimize_quoted_image_input",
+    "optimize_quoted_bot_media",
     "optimize_group_chat_context",
     "optimize_image_caption",
     "optimize_send_message_to_user",
@@ -70,7 +71,7 @@ def _walk_strings(payload):
 
 def test_switch_keys_exact_order_and_count():
     assert list(SWITCH_KEYS) == EXPECTED_ORDER
-    assert len(SWITCH_KEYS) == 23
+    assert len(SWITCH_KEYS) == 24
     assert [feature["key"] for feature in FEATURES] == EXPECTED_ORDER
 
 
@@ -118,7 +119,7 @@ def test_build_state_includes_capability_only_when_provided():
 
 def test_build_state_defaults_all_disabled():
     state = build_state({})
-    assert len(state["features"]) == 23
+    assert len(state["features"]) == 24
     assert all(feature["enabled"] is False for feature in state["features"])
     assert state["warnings"] == []
 

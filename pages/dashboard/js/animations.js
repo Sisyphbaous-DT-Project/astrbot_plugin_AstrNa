@@ -670,6 +670,36 @@ function buildReplyTarget(stage, ctx) {
   });
 }
 
+/* ---------- 8b. 优化引用 Bot 媒体归属 ---------- */
+function buildQuotedBotMedia(stage, ctx) {
+  return stateful(stage, {
+    before: "开启前：Bot 自发引用图挂在用户消息末尾，易被误认",
+    after: "开启后：引用媒体归属 Bot，用户直发图单独区分",
+  }, ctx, (svg, beforeG, afterG, { gsap }) => {
+    const bUser = box(beforeG, 28, 70, 344, 150, { stroke: COLOR.bad });
+    label(beforeG, 44, 96, "role: user", { size: 11, color: COLOR.muted });
+    const bImg = box(beforeG, 48, 114, 140, 84, { stroke: COLOR.warn, fill: "#281e12" });
+    label(beforeG, 118, 154, "Bot 引用图", { size: 12, anchor: "middle", color: COLOR.warn });
+    label(beforeG, 118, 174, "当成用户发的？", { size: 10, anchor: "middle", color: COLOR.bad });
+    const bFile = chip(beforeG, "语音/文件/视频 归属不明", 206, 144, COLOR.bad);
+
+    const aBot = box(afterG, 28, 56, 344, 96, { stroke: COLOR.ok, fill: "#102820" });
+    label(afterG, 44, 80, "Bot 自发引用媒体（独立包裹）", { size: 11, color: COLOR.ok });
+    const aTags = [
+      chip(afterG, "你自己发送的图", 44, 96, COLOR.ok),
+      chip(afterG, "语音/文件/视频归属", 190, 96, COLOR.info),
+    ];
+    const aUser = box(afterG, 28, 170, 344, 62, { stroke: COLOR.info, fill: "#102230" });
+    label(afterG, 44, 198, "当前发言人直发图片（单独留在末尾）", { size: 11, color: COLOR.info });
+    return {
+      animateBefore: () => gsap.timeline({ repeat: -1, yoyo: true })
+        .to([bImg, bFile], { opacity: 0.45, duration: 0.6 }),
+      animateAfter: () => gsap.timeline({ repeat: -1 })
+        .fromTo([aBot, ...aTags, aUser], { opacity: 0.35, y: 4 }, { opacity: 1, y: 0, stagger: 0.18, duration: 0.45 }),
+    };
+  });
+}
+
 /* ---------- 15/16. 关闭群聊唤醒（@ / 引用） ---------- */
 function buildWakeSuppression(kind) {
   const triggerLabel = kind === "at" ? "@Bot" : "引用 Bot";
@@ -1009,6 +1039,7 @@ const BUILDERS = {
   optimize_image_history_context: buildImageHistory,
   optimize_tool_history_context: buildToolHistory,
   optimize_quoted_image_input: buildQuotedImage,
+  optimize_quoted_bot_media: buildQuotedBotMedia,
   optimize_group_chat_context: buildGroupContext,
   optimize_image_caption: buildImageCaption,
   optimize_send_message_to_user: buildSendMessageToUser,

@@ -108,6 +108,12 @@
     "hint": "开启后，在提供独立图片准备入口的 AstrBot 中，记录当前 Reply.chain 嵌入图片的来源与下载路径，对下载失败、临时文件失效或内容不可解码的图片尝试通过 OneBot get_msg / get_image / get_file 回取。只选择确认失败的图片追加到 req.image_urls，恢复后先完成原生格式转换和缩放，再交给转述或视觉模型，不重复追加成功图片，不回填超出上游数量限制的图片。仅回复 ID 的远程图片失败时不再次回取；回取结果无法可靠匹配时不猜测。第三方自建请求仍可补齐当前引用图片，并注入不写入历史的临时说明；已转述的请求不重新追加原图。旧版保留请求阶段兜底，只按引用字符串去重。兼容 NapCat / aiocqhttp 的 bot.call_action；不恢复历史图片、不展开群友合并转发内部图片，不改 req.prompt、req.contexts 或 conversation.history。可能增加本轮图片 token。默认关闭。",
     "default": false
   },
+  "optimize_quoted_bot_media": {
+    "type": "bool",
+    "description": "优化引用 Bot 媒体归属",
+    "hint": "开启后，当用户引用 Bot 自己（含插件）发出的图片、语音、视频或文件时，AstrNa 会将引用图片从 req.image_urls 中拆出并紧跟引用块标注为 Bot 自己发送，同时为被引用的语音、视频和文件附件补充归属说明，并补全缺失的引用发送者标记，避免模型把 Bot 自己发出的媒体误认为引用者发送。未识别出自发来源时不猜测；纯文本模型不会额外插入 ImageURLPart，仅补充文本说明。默认关闭。",
+    "default": false
+  },
   "optimize_group_chat_context": {
     "type": "bool",
     "description": "群聊上下文优化",
