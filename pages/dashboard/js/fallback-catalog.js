@@ -87,14 +87,6 @@ const FEATURES = [
     ["依赖平台能读取引用消息附件", "支持准备入口时尝试恢复失败的嵌入引用图，转述前重新准备"],
   ),
   feature(
-    "optimize_quoted_bot_media",
-    "优化引用 Bot 媒体归属",
-    "拆开 Bot 自发引用图片与用户直发图，并为引用语音/视频/文件标注归属。",
-    "引用 Bot 或插件发出的图片、语音、视频、文件时，就近标明是 Bot 自己发送的，避免误判为引用者所发。",
-    ["插件或 Bot 发出的媒体被引用回复后，模型常认成引用者发的"],
-    ["仅在确认被引用消息来自 Bot 自己时生效，不猜测", "纯文本模型只补充文本归属说明"],
-  ),
-  feature(
     "optimize_group_chat_context",
     "群聊上下文优化",
     "用小模型筛选相关群聊原文并生成简短摘要，并补充触发后的新增群消息。",
@@ -159,10 +151,10 @@ const FEATURES = [
   feature(
     "optimize_reply_target_history",
     "优化回复历史标记",
-    "明确当前发言人、引用发送者和 Bot 原回复对象。",
-    "临时回复指向说明帮助模型在多人接话和引用中分清真正要回复的人。",
-    ["群聊经常出现多人引用和追问时"],
-    ["QQ 官方机器人缺少可靠引用发送者身份"],
+    "明确当前发言人、引用发送者和 Bot 原回复对象，并可选开启引用媒体增强。",
+    "临时回复指向说明帮助模型在多人接话和引用中分清真正要回复的人；开启「引用媒体增强」后可拆离 Bot 自发引用图、标注引用媒体归属并追踪原生 QQ 官方 Bot 出站来源。",
+    ["群聊经常出现多人引用和追问时", "插件或 Bot 发出的媒体被引用回复后，模型常认成引用者发的"],
+    ["QQ 官方机器人缺少普通群友的可靠引用发送者身份", "可在「功能设置」中开启「引用媒体增强」"],
   ),
   feature(
     "disable_group_at_bot_wake",
@@ -351,6 +343,14 @@ const FALLBACK_SETTINGS = {
       "除 x-opencode-session 外，再用同一个会话 id 多写一个自定义头名，供其他上游识别。",
       "session-header-extra",
       { notes: ["仅允许字母、数字和连字符，最长 64 字符；不能覆盖鉴权或请求控制头；留空表示不加"], state: { value: null } }),
+  ],
+  optimize_reply_target_history: [
+    setting("reply_target_media_enhance", "bool", "引用媒体增强",
+      "将 Bot 自发引用图片从用户直发图中拆出并就近标注归属，为引用语音/视频/文件补充归属说明并补全缺失发送者，同时追踪原生 qq_official 出站来源供媒体归属与文本回复指向共用。",
+      "reply-target-media-enhance",
+      { notes: ["仅在能确认被引用消息来自 Bot 自己时生效，无法确认时不猜测",
+        "纯文本模型不插入 ImageURLPart，仅补充文本归属说明",
+        "同步追踪原生 qq_official / qq_official_webhook 出站消息 ID"], state: { value: null } }),
   ],
   issue_assistant_enabled: [
     setting("issue_assistant_devkit_enabled", "bool", "开发工具箱",

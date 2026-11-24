@@ -314,6 +314,20 @@ SETTINGS: tuple[dict[str, Any], ...] = (
         "session-header-extra",
         notes=("仅允许字母、数字和连字符，最长 64 字符；不能覆盖鉴权或请求控制头；留空表示不加",),
     ),
+    # 优化回复历史标记（1）
+    _setting(
+        "reply_target_media_enhance",
+        "optimize_reply_target_history",
+        CONTROL_BOOL,
+        "引用媒体增强",
+        "将 Bot 自发引用图片从用户直发图中拆出并就近标注归属，为引用语音/视频/文件补充归属说明并补全缺失发送者，同时追踪原生 qq_official 出站来源供媒体归属与文本回复指向共用。",
+        "reply-target-media-enhance",
+        notes=(
+            "仅在能确认被引用消息来自 Bot 自己时生效，无法确认时不猜测",
+            "纯文本模型不插入 ImageURLPart，仅补充文本归属说明",
+            "同步追踪原生 qq_official / qq_official_webhook 出站消息 ID",
+        ),
+    ),
     # Issue 助手（3）
     _setting(
         "issue_assistant_devkit_enabled",

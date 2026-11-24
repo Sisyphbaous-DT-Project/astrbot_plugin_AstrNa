@@ -27,7 +27,6 @@ SWITCH_KEYS: tuple[str, ...] = (
     "optimize_image_history_context",
     "optimize_tool_history_context",
     "optimize_quoted_image_input",
-    "optimize_quoted_bot_media",
     "optimize_group_chat_context",
     "optimize_image_caption",
     "optimize_send_message_to_user",
@@ -148,21 +147,6 @@ FEATURES: tuple[dict[str, Any], ...] = (
         ),
     ),
     _feature(
-        "optimize_quoted_bot_media",
-        "优化引用 Bot 媒体归属",
-        "拆开 Bot 自发引用图片与用户直发图，并为引用语音/视频/文件标注归属。",
-        "用户引用 Bot（含插件）发出的图片、语音、视频或文件再回复时，模型常把这些附件误当成"
-        "引用者自己发送的。AstrNa 将 Bot 自发引用图片从用户直发图中拆出并就近标注为 Bot 自己发送，"
-        "同时为语音、视频和文件附件补充归属说明。",
-        (
-            "插件或 Bot 发出的图片、语音、视频、文件被引用回复后，模型常误以为是引用者自己发送的",
-        ),
-        (
-            "仅在能确认被引用消息来自 Bot 自己时生效，无法确认时不猜测",
-            "纯文本模型不插入 ImageURLPart，仅补充文本归属说明",
-        ),
-    ),
-    _feature(
         "optimize_group_chat_context",
         "群聊上下文优化",
         "在 AstrBot 群聊上下文感知启用时，用小模型筛选相关群聊原文并生成简短摘要，并补充触发后的新增群消息。",
@@ -267,11 +251,19 @@ FEATURES: tuple[dict[str, Any], ...] = (
     _feature(
         "optimize_reply_target_history",
         "优化回复历史标记",
-        "临时注入中文回复指向说明，帮助模型区分当前发言人和被引用回复对象。",
+        "临时注入中文回复指向说明，帮助模型区分当前发言人和被引用回复对象，并可选开启引用媒体增强。",
         "用户引用别人的消息再让 Bot 回复时，模型容易把“当前发言人”“引用消息发送者”和"
-        "“Bot 原回复对象”混成一个人。AstrNa 注入临时说明明确三者关系。",
-        ("群聊中经常有引用、接话、追问等多人交互时",),
-        ("QQ 官方机器人的引用消息缺少可靠发送者身份，该平台不支持此消歧",),
+        "“Bot 原回复对象”混成一个人。AstrNa 注入临时说明明确三者关系；在「功能设置」中开启"
+        "「引用媒体增强」后，还会将 Bot 自发引用图片从用户直发图中拆出、标注引用语音/视频/文件归属，"
+        "并追踪原生 QQ 官方 Bot 出站来源供回复指向与媒体归属共用。",
+        (
+            "群聊中经常有引用、接话、追问等多人交互时",
+            "插件或 Bot 发出的图片、语音、视频、文件被引用回复后，模型常误以为是引用者自己发送的",
+        ),
+        (
+            "QQ 官方机器人缺少普通群友的可靠引用发送者身份，不支持他人之间的多人回复指向消歧",
+            "「引用媒体增强」子项可在「功能设置」中开启，用于识别 Bot 自发引用媒体并追踪原生 QQ 官方 Bot 出站消息",
+        ),
     ),
     _feature(
         "disable_group_at_bot_wake",
@@ -416,6 +408,12 @@ def _build_details(key: str, config: Mapping[str, Any]) -> dict[str, Any]:
             "all_groups": _truthy_flag(config, "hide_tool_call_preamble_all_groups"),
             "all_private": _truthy_flag(config, "hide_tool_call_preamble_all_private"),
             "umo_count": _list_count(config, "hide_tool_call_preamble_umos"),
+        }
+    if key == "optimize_reply_target_history":
+        return {
+            "reply_target_media_enhance": _truthy_flag(
+                config, "reply_target_media_enhance"
+            ),
         }
     if key == "disable_group_at_bot_wake":
         return {

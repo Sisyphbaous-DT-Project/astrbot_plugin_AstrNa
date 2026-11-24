@@ -85,7 +85,7 @@ class QuotedBotMediaModule:
         self._install_qq_official_send_patch()
         module_cls._active_module = self
         self._installed = True
-        self._log("info", "AstrNa 已启用优化引用 Bot 媒体归属。")
+        self._log("info", "AstrNa 已启用引用媒体增强。")
         return True
 
     def terminate(self) -> None:

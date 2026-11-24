@@ -108,12 +108,6 @@
     "hint": "开启后，在提供独立图片准备入口的 AstrBot 中，记录当前 Reply.chain 嵌入图片的来源与下载路径，对下载失败、临时文件失效或内容不可解码的图片尝试通过 OneBot get_msg / get_image / get_file 回取。只选择确认失败的图片追加到 req.image_urls，恢复后先完成原生格式转换和缩放，再交给转述或视觉模型，不重复追加成功图片，不回填超出上游数量限制的图片。仅回复 ID 的远程图片失败时不再次回取；回取结果无法可靠匹配时不猜测。第三方自建请求仍可补齐当前引用图片，并注入不写入历史的临时说明；已转述的请求不重新追加原图。旧版保留请求阶段兜底，只按引用字符串去重。兼容 NapCat / aiocqhttp 的 bot.call_action；不恢复历史图片、不展开群友合并转发内部图片，不改 req.prompt、req.contexts 或 conversation.history。可能增加本轮图片 token。默认关闭。",
     "default": false
   },
-  "optimize_quoted_bot_media": {
-    "type": "bool",
-    "description": "优化引用 Bot 媒体归属",
-    "hint": "开启后，当用户引用 Bot 自己（含插件）发出的图片、语音、视频或文件时，AstrNa 会将引用图片从 req.image_urls 中拆出并紧跟引用块标注为 Bot 自己发送，同时为被引用的语音、视频和文件附件补充归属说明，并补全缺失的引用发送者标记，避免模型把 Bot 自己发出的媒体误认为引用者发送。未识别出自发来源时不猜测；纯文本模型不会额外插入 ImageURLPart，仅补充文本说明。默认关闭。",
-    "default": false
-  },
   "optimize_group_chat_context": {
     "type": "bool",
     "description": "群聊上下文优化",
@@ -282,8 +276,18 @@
   "optimize_reply_target_history": {
     "type": "bool",
     "description": "优化回复历史标记",
-    "hint": "开启后，AstrNa 会在本轮请求里临时注入中文回复指向说明，明确当前发言人、被引用消息发送者，以及被引用 Bot 回复原本回复给谁，帮助模型区分群聊里的回复对象。QQ 官方 Bot 平台的引用消息缺少可靠的被引用消息发送者信息，AstrNa 无法安全判断引用关系，因此该功能不兼容 QQ 官方 Bot 的引用回复指向优化。AstrNa 也会在发给模型前临时清理旧历史里的内部标记，并移除模型误输出的内部标记，避免污染真实发送内容和后续历史。真实发送到聊天平台的消息不会改变；旧历史不会被批量迁移，只做本轮请求内清理。默认关闭。",
+    "hint": "开启后，AstrNa 会在本轮请求里临时注入中文回复指向说明，明确当前发言人、被引用消息发送者，以及被引用 Bot 回复原本回复给谁，帮助模型区分群聊里的回复对象。QQ 官方 Bot 平台的引用消息缺少普通群友的可靠发送者信息，AstrNa 无法安全判断他人之间的引用关系；如需识别原生 QQ 官方 Bot 自己发出的引用消息与媒体，可开启下方「引用媒体增强」子项。AstrNa 也会在发给模型前临时清理旧历史里的内部标记，并移除模型误输出的内部标记，避免污染真实发送内容和后续历史。真实发送到聊天平台的消息不会改变；旧历史不会被批量迁移，只做本轮请求内清理。默认关闭。",
     "default": false
+  },
+  "reply_target_media_enhance": {
+    "type": "bool",
+    "description": "引用媒体增强",
+    "hint": "开启后，当用户引用 Bot 自己（含插件）发出的图片、语音、视频或文件时，AstrNa 会将引用图片从 req.image_urls 拆出并紧跟引用块标注为 Bot 自己发送，为被引用的语音、视频和文件附件补充归属说明，并补全缺失的引用发送者标记；同时对原生 qq_official / qq_official_webhook 追踪 Bot 出站消息 ID，使引用媒体归属和文本回复指向说明都能识别原生 QQ 官方 Bot 自发消息。未识别出自发来源时不猜测；纯文本模型不会额外插入 ImageURLPart，仅补充文本说明。默认关闭。",
+    "default": false,
+    "collapsed": true,
+    "condition": {
+      "optimize_reply_target_history": true
+    }
   },
   "disable_group_at_bot_wake": {
     "type": "bool",

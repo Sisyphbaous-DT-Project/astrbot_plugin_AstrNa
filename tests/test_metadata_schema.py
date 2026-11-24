@@ -42,7 +42,6 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "optimize_image_history_context",
         "optimize_tool_history_context",
         "optimize_quoted_image_input",
-        "optimize_quoted_bot_media",
         "optimize_group_chat_context",
         "group_chat_context_compress_provider_id",
         "optimize_image_caption",
@@ -63,6 +62,7 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "provider_session_headers_user_agent",
         "provider_session_headers_extra_name",
         "optimize_reply_target_history",
+        "reply_target_media_enhance",
         "disable_group_at_bot_wake",
         "disable_group_at_bot_wake_all_groups",
         "disable_group_at_bot_wake_group_ids",
@@ -166,9 +166,6 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
     assert "get_image" in schema["optimize_quoted_image_input"]["hint"]
     assert "不展开群友合并转发内部图片" in schema["optimize_quoted_image_input"]["hint"]
     assert "默认关闭" in schema["optimize_quoted_image_input"]["hint"]
-    assert schema["optimize_quoted_bot_media"]["type"] == "bool"
-    assert schema["optimize_quoted_bot_media"]["description"] == "优化引用 Bot 媒体归属"
-    assert schema["optimize_quoted_bot_media"]["default"] is False
     assert schema["optimize_group_chat_context"]["type"] == "bool"
     assert schema["optimize_group_chat_context"]["description"] == "群聊上下文优化"
     assert schema["optimize_group_chat_context"]["default"] is False
@@ -311,6 +308,13 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         == "优化回复历史标记"
     )
     assert schema["optimize_reply_target_history"]["default"] is False
+    assert schema["reply_target_media_enhance"]["type"] == "bool"
+    assert schema["reply_target_media_enhance"]["description"] == "引用媒体增强"
+    assert schema["reply_target_media_enhance"]["default"] is False
+    assert schema["reply_target_media_enhance"]["collapsed"] is True
+    assert schema["reply_target_media_enhance"]["condition"] == {
+        "optimize_reply_target_history": True,
+    }
     assert schema["disable_group_at_bot_wake"]["type"] == "bool"
     assert schema["disable_group_at_bot_wake"]["default"] is False
     assert "@Bot" in schema["disable_group_at_bot_wake"]["hint"]

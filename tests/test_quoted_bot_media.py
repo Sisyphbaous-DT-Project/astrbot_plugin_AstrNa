@@ -48,11 +48,19 @@ def _reply(*, reply_id="", sender_id=None, sender_nickname=None, message_str="",
     )()
 
 
-def _event(*, self_id="bot123", platform="aiocqhttp", message=(), raw_message=None):
+def _event(
+    *,
+    self_id="bot123",
+    platform="aiocqhttp",
+    sender_id="user123",
+    sender_nickname="群友A",
+    message=(),
+    raw_message=None,
+):
     msg_obj = SimpleNamespace(
         self_id=self_id,
         group_id="group456",
-        sender=SimpleNamespace(user_id="user123", nickname="群友A"),
+        sender=SimpleNamespace(user_id=sender_id, nickname=sender_nickname),
         message=list(message),
         raw_message=raw_message,
     )
@@ -60,6 +68,10 @@ def _event(*, self_id="bot123", platform="aiocqhttp", message=(), raw_message=No
         unified_msg_origin=f"{platform}:GroupMessage:group456",
         message_obj=msg_obj,
         get_self_id=lambda: self_id,
+        get_sender_id=lambda: sender_id,
+        get_sender_name=lambda: sender_nickname,
+        get_group_id=lambda: "group456",
+        get_message_type=lambda: "GroupMessage",
         get_platform_name=lambda: platform,
     )
 
@@ -101,24 +113,37 @@ def _reset_patch():
 
 
 def test_quoted_bot_image_separation_idempotency_and_non_self(fakes):
-    # 关闭开关时不改请求。
-    off_runtime = fakes.build_runtime({})
-    try:
-        ev = _event(message=[_reply(sender_id="bot123", sender_nickname="佩卡", chain=[_comp("Image")])])
-        req = _req(
-            image_urls=["/tmp/q.png"],
-            extra_parts=[
-                _TextPart("<Quoted Message>\n(佩卡): [Image]\n</Quoted Message>"),
-                _TextPart("[Image 1 in quoted message: original path /orig/q.png]"),
-            ],
-        )
-        run(off_runtime.sanitize_request(ev, req))
-        assert req.image_urls == ["/tmp/q.png"]
-        assert _img_urls(req.extra_user_content_parts) == []
-    finally:
-        run(off_runtime.terminate())
+    # 主开关或子开关未同时开启时不改请求，且不挂载 self_quote_detector。
+    for disabled_cfg in (
+        {},
+        {"optimize_reply_target_history": True, "reply_target_media_enhance": False},
+        {"optimize_reply_target_history": False, "reply_target_media_enhance": True},
+    ):
+        off_runtime = fakes.build_runtime(disabled_cfg)
+        try:
+            assert off_runtime.reply_target_history.self_quote_detector is None
+            ev = _event(
+                message=[
+                    _reply(sender_id="bot123", sender_nickname="佩卡", chain=[_comp("Image")])
+                ]
+            )
+            req = _req(
+                image_urls=["/tmp/q.png"],
+                extra_parts=[
+                    _TextPart("<Quoted Message>\n(佩卡): [Image]\n</Quoted Message>"),
+                    _TextPart("[Image 1 in quoted message: original path /orig/q.png]"),
+                ],
+            )
+            run(off_runtime.sanitize_request(ev, req))
+            assert req.image_urls == ["/tmp/q.png"]
+            assert _img_urls(req.extra_user_content_parts) == []
+            assert off_runtime.reply_target_history.self_quote_detector is None
+        finally:
+            run(off_runtime.terminate())
 
-    runtime = fakes.build_runtime({"optimize_quoted_bot_media": True})
+    runtime = fakes.build_runtime(
+        {"optimize_reply_target_history": True, "reply_target_media_enhance": True}
+    )
     try:
         # 1) 纯引用 Bot 图：拆出 req.image_urls 并就近包裹（非临时块），重复调用幂等。
         ev = _event(message=[_reply(sender_id="bot123", sender_nickname="佩卡", chain=[_comp("Image")])])
@@ -200,7 +225,9 @@ def test_quoted_bot_image_separation_idempotency_and_non_self(fakes):
 
 
 def test_quoted_bot_attachments_and_text_only_guard(fakes):
-    runtime = fakes.build_runtime({"optimize_quoted_bot_media": True})
+    runtime = fakes.build_runtime(
+        {"optimize_reply_target_history": True, "reply_target_media_enhance": True}
+    )
     try:
         # 语音、文件、视频附件紧跟补充归属说明。
         ev = _event(
@@ -278,11 +305,20 @@ def test_qq_official_v2_and_native_qq_official_tracking(fakes, monkeypatch):
 
     orig_fn = FakeQQOfficialEvent._send_with_markdown_fallback
     kv_store = fakes.KVStore()
-    runtime = fakes.build_runtime({"optimize_quoted_bot_media": False}, kv_store=kv_store)
+    runtime = fakes.build_runtime(
+        {"optimize_reply_target_history": False, "reply_target_media_enhance": False},
+        kv_store=kv_store,
+    )
     try:
         assert FakeQQOfficialEvent._send_with_markdown_fallback is orig_fn
-        runtime.update_dashboard_switch("optimize_quoted_bot_media", True)
+        # 主开关关闭时预先开启子项：配置保留，但不提前挂载出站追踪补丁。
+        runtime.update_dashboard_setting("reply_target_media_enhance", True)
+        assert FakeQQOfficialEvent._send_with_markdown_fallback is orig_fn
+        assert runtime.reply_target_history.self_quote_detector is None
+        # 开启主开关后立即热安装出站追踪并接通文本回复指向识别。
+        runtime.update_dashboard_switch("optimize_reply_target_history", True)
         assert FakeQQOfficialEvent._send_with_markdown_fallback is not orig_fn
+        assert runtime.reply_target_history.self_quote_detector is not None
 
         ref_idx = "REFIDX_" + "A" * 120
         guild_id = "ROBOT1.0_" + "B" * 90
@@ -300,11 +336,24 @@ def test_qq_official_v2_and_native_qq_official_tracking(fakes, monkeypatch):
                 "hi",
             )
         )
+        # 关闭子项后立即热卸载补丁并断开来源识别；再重新开启恢复。
+        runtime.update_dashboard_setting("reply_target_media_enhance", False)
+        assert FakeQQOfficialEvent._send_with_markdown_fallback is orig_fn
+        assert runtime.reply_target_history.self_quote_detector is None
+        runtime.update_dashboard_setting("reply_target_media_enhance", True)
+        assert FakeQQOfficialEvent._send_with_markdown_fallback is not orig_fn
+        # 关闭主开关也会立即卸载补丁。
+        runtime.update_dashboard_switch("optimize_reply_target_history", False)
+        assert FakeQQOfficialEvent._send_with_markdown_fallback is orig_fn
+        assert runtime.reply_target_history.self_quote_detector is None
     finally:
         run(runtime.terminate())
     assert FakeQQOfficialEvent._send_with_markdown_fallback is orig_fn
 
-    restarted = fakes.build_runtime({"optimize_quoted_bot_media": True}, kv_store=kv_store)
+    restarted = fakes.build_runtime(
+        {"optimize_reply_target_history": True, "reply_target_media_enhance": True},
+        kv_store=kv_store,
+    )
     try:
         # qq_official_v2 缺昵称补全 + 原生 qq_official 群聊 ref_msg_idx / 频道 id 命中 + 未记录不猜测。
         cases = [
@@ -352,6 +401,85 @@ def test_qq_official_v2_and_native_qq_official_tracking(fakes, monkeypatch):
             else:
                 assert req.image_urls == ["/tmp/q.png"]
                 assert "(你自己)" not in req.extra_user_content_parts[0].text
+
+        # 子项开启时，父开关的文本回复指向说明也应识别原生 qq_official 自发引用并关联原接收者。
+        prev_ev = _event(
+            self_id="qq_official",
+            platform="qq_official",
+            sender_id="user_b",
+            sender_nickname="群友B",
+        )
+        prev_req = _req()
+        run(
+            restarted.reply_target_history.remember_reply_target(
+                prev_ev,
+                prev_req,
+                SimpleNamespace(role="assistant", content="今晚八点开黑"),
+                {"scope": "group", "user": {"user_id": "user_b", "nickname": "群友B"}},
+            )
+        )
+        text_quote = _reply(message_str="今晚八点开黑")
+        text_quote_ev = _event(
+            self_id="qq_official",
+            platform="qq_official",
+            sender_id="user_a",
+            sender_nickname="群友A",
+            raw_message=SimpleNamespace(
+                raw_data={"message_scene": {"ext": [f"ref_msg_idx={ref_idx}"]}}
+            ),
+            message=[text_quote],
+        )
+        text_req = _req(
+            extra_parts=[_TextPart("<Quoted Message>\n今晚八点开黑\n</Quoted Message>")]
+        )
+        run(
+            restarted.reply_target_history._append_reply_direction_hint(
+                text_quote_ev, text_req, text_quote
+            )
+        )
+        hint_texts = _texts(text_req.extra_user_content_parts)
+        assert any("当前发言人引用了一条你之前发送的消息。" in t for t in hint_texts)
+        assert any("被引用的这条消息是你之前回复给群友B" in t for t in hint_texts)
+
+        # 未命中的原生 qq_official 引用不得猜测为 Bot 自发。
+        unknown_quote = _reply(message_str="今晚八点开黑")
+        unknown_ev = _event(
+            self_id="qq_official",
+            platform="qq_official",
+            sender_id="user_a",
+            sender_nickname="群友A",
+            raw_message=SimpleNamespace(
+                raw_data={"message_scene": {"ext": ["ref_msg_idx=UNKNOWN"]}}
+            ),
+            message=[unknown_quote],
+        )
+        unknown_req = _req(
+            extra_parts=[_TextPart("<Quoted Message>\n今晚八点开黑\n</Quoted Message>")]
+        )
+        run(
+            restarted.reply_target_history._append_reply_direction_hint(
+                unknown_ev, unknown_req, unknown_quote
+            )
+        )
+        assert not any(
+            "当前发言人引用了一条你之前发送的消息。" in t
+            for t in _texts(unknown_req.extra_user_content_parts)
+        )
+
+        # 仅开主开关、关闭子项时，文本回复指向说明不追踪原生 qq_official 自发来源。
+        restarted.update_dashboard_setting("reply_target_media_enhance", False)
+        parent_only_req = _req(
+            extra_parts=[_TextPart("<Quoted Message>\n今晚八点开黑\n</Quoted Message>")]
+        )
+        run(
+            restarted.reply_target_history._append_reply_direction_hint(
+                text_quote_ev, parent_only_req, text_quote
+            )
+        )
+        assert not any(
+            "当前发言人引用了一条你之前发送的消息。" in t
+            for t in _texts(parent_only_req.extra_user_content_parts)
+        )
     finally:
         run(restarted.terminate())
 
@@ -393,7 +521,11 @@ def test_real_prepare_assemble_and_history_cleanup(tmp_path, fakes):
     PILImage.new("RGB", (8, 8), color=(0, 0, 255)).save(direct_file)
 
     runtime = fakes.build_runtime(
-        {"optimize_quoted_bot_media": True, "optimize_image_history_context": True}
+        {
+            "optimize_reply_target_history": True,
+            "reply_target_media_enhance": True,
+            "optimize_image_history_context": True,
+        }
     )
     try:
         ev = _event(

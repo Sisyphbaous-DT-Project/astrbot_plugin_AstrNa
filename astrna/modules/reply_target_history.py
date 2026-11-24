@@ -78,10 +78,12 @@ class ReplyTargetHistoryModule:
         logger: Any,
         kv_store: Any | None = None,
         semantic_enabled: bool = False,
+        self_quote_detector: Any | None = None,
     ):
         self.logger = logger
         self.kv_store = kv_store
         self.semantic_enabled = semantic_enabled
+        self.self_quote_detector = self_quote_detector
         self._installed = False
         self._state_loaded = kv_store is None
         self._state_cache: dict[str, Any] = {"sessions": {}}
@@ -111,6 +113,21 @@ class ReplyTargetHistoryModule:
 
     def set_semantic_enabled(self, enabled: bool) -> None:
         self.semantic_enabled = enabled
+
+    def set_self_quote_detector(self, detector: Any | None) -> None:
+        self.self_quote_detector = detector
+
+    async def _is_quote_from_self(self, event: Any, quote: Any) -> bool:
+        if is_quote_from_self(event, quote):
+            return True
+        detector = self.self_quote_detector
+        if not callable(detector):
+            return False
+        try:
+            return bool(await detector(event, quote))
+        except Exception as exc:  # noqa: BLE001
+            self._log("debug", "AstrNa 检查引用消息自发来源失败：%s", exc)
+            return False
 
     def terminate(self) -> None:
         module_cls = type(self)
@@ -378,8 +395,9 @@ class ReplyTargetHistoryModule:
         req: Any,
         quote: Any,
     ) -> None:
+        quote_from_self = await self._is_quote_from_self(event, quote)
         quoted_reply_target = None
-        if is_quote_from_self(event, quote):
+        if quote_from_self:
             quoted_text = normalize_match_text(
                 getattr(quote, "message_str", None)
                 or extract_last_quoted_message_text(req),
@@ -389,9 +407,15 @@ class ReplyTargetHistoryModule:
                 req,
                 quote,
                 quoted_text,
+                quote_from_self=True,
             )
 
-        hint = build_reply_direction_hint(event, quote, quoted_reply_target)
+        hint = build_reply_direction_hint(
+            event,
+            quote,
+            quoted_reply_target,
+            quote_from_self=quote_from_self,
+        )
         if hint:
             append_temp_text_part(req, hint)
 
@@ -752,8 +776,15 @@ class ReplyTargetHistoryModule:
         req: Any,
         quote: Any,
         quoted_text: str,
+        *,
+        quote_from_self: bool | None = None,
     ) -> dict[str, Any] | None:
-        if not is_quote_from_self(event, quote):
+        is_self = (
+            is_quote_from_self(event, quote)
+            if quote_from_self is None
+            else bool(quote_from_self)
+        )
+        if not is_self:
             return None
 
         quote_body = normalize_quoted_message_text(
@@ -870,10 +901,22 @@ def build_reply_direction_hint(
     event: Any,
     quote: Any,
     quoted_reply_target: dict[str, Any] | None = None,
+    *,
+    quote_from_self: bool | None = None,
 ) -> str:
     current_user = build_event_user_metadata(event)
     quoted_sender = build_quoted_sender_metadata(quote)
-    if not current_user and not quoted_sender and not quoted_reply_target:
+    is_self = (
+        is_quote_from_self(event, quote)
+        if quote_from_self is None
+        else bool(quote_from_self)
+    )
+    if (
+        not current_user
+        and not quoted_sender
+        and not quoted_reply_target
+        and not is_self
+    ):
         return ""
 
     current_user_text = format_user_description(current_user, "当前发言人")
@@ -886,11 +929,10 @@ def build_reply_direction_hint(
     lines = ["AstrNa 回复指向说明："]
     if current_user_text:
         lines.append(f"当前发言人是{current_user_text}。")
-    if quoted_sender_text:
-        if is_quote_from_self(event, quote):
-            lines.append("当前发言人引用了一条你之前发送的消息。")
-        else:
-            lines.append(f"当前发言人引用了一条由{quoted_sender_text}发送的消息。")
+    if is_self:
+        lines.append("当前发言人引用了一条你之前发送的消息。")
+    elif quoted_sender_text:
+        lines.append(f"当前发言人引用了一条由{quoted_sender_text}发送的消息。")
 
     if quoted_reply_target and reply_target_text:
         lines.append(f"被引用的这条消息是你之前回复给{reply_target_text}的。")

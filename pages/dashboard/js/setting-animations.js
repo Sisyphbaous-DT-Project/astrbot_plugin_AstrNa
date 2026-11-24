@@ -742,6 +742,117 @@ function buildSessionHeaderExtra(stage, ctx) {
   });
 }
 
+/* ---------- 优化回复历史标记 ---------- */
+
+function miniPhoto(parent, x, y, w, h, { bg = "#123f5a", stroke = COLOR.info, sun = COLOR.warn, peak = "#2e7a4a" } = {}) {
+  const g = el("g", {});
+  box(g, x, y, w, h, bg, { rx: 3, stroke });
+  g.appendChild(el("circle", { cx: x + w * 0.3, cy: y + h * 0.32, r: Math.max(2, w * 0.09), fill: sun }));
+  g.appendChild(el("polygon", {
+    points: `${x + w * 0.12},${y + h * 0.85} ${x + w * 0.42},${y + h * 0.45} ${x + w * 0.6},${y + h * 0.68} ${x + w * 0.78},${y + h * 0.5} ${x + w * 0.9},${y + h * 0.85}`,
+    fill: peak,
+  }));
+  parent.appendChild(g);
+  return g;
+}
+
+function buildReplyTargetMediaEnhance(stage, ctx) {
+  return scene(stage, ctx, (g, value) => {
+    const on = Boolean(value);
+    const { offParts, onParts } = binaryPaths(g, {
+      offLabel: "关闭：引用图与用户图混在末尾，易认错发送者",
+      onLabel: "开启：拆开归属并标注，qq_official 同步识别",
+      value: on,
+      drawOff: (off) => {
+        // 左侧输入：Bot 引用媒体 + 群友直发图
+        box(off, 20, 44, 106, 26, "#2a2314", { rx: 4, stroke: COLOR.warn });
+        miniPhoto(off, 25, 48, 20, 18, { bg: "#3a2e16", stroke: COLOR.warn, peak: "#9c7a2f" });
+        label(off, 50, 60, "Bot 图/附件", { size: 9, color: COLOR.warn });
+
+        box(off, 20, 76, 106, 26, "#12344d", { rx: 4, stroke: COLOR.info });
+        miniPhoto(off, 25, 80, 20, 18, { bg: "#123f5a", stroke: COLOR.info, peak: "#2e7a4a" });
+        label(off, 50, 92, "群友直发图", { size: 9, color: COLOR.info });
+
+        // 汇入同一个用户消息框
+        const offArrows = el("g", {});
+        arrow(offArrows, 128, 57, 162, 68, COLOR.bad);
+        arrow(offArrows, 128, 89, 162, 78, COLOR.bad);
+        off.appendChild(offArrows);
+
+        box(off, 174, 44, 210, 58, "#341c1c", { stroke: COLOR.bad });
+        label(off, 184, 59, "发给模型：同一条用户消息", { size: 9, color: COLOR.gray });
+        miniPhoto(off, 184, 68, 24, 20, { bg: "#3a2e16", stroke: COLOR.warn, peak: "#9c7a2f" });
+        label(off, 216, 82, "+", { size: 11, color: COLOR.gray, anchor: "middle" });
+        miniPhoto(off, 224, 68, 24, 20, { bg: "#123f5a", stroke: COLOR.info, peak: "#2e7a4a" });
+        const warnTitle = label(off, 258, 78, "混在一起 ?", { size: 10, color: COLOR.bad, bold: true });
+        const warnSub = label(off, 258, 93, "容易当成群友发的", { size: 9, color: COLOR.warn });
+        return { flows: [offArrows], warn: [warnTitle, warnSub] };
+      },
+      drawOn: (onG) => {
+        // 左侧输入 + qq_official 来源追踪标记
+        box(onG, 20, 142, 106, 26, "#142f22", { rx: 4, stroke: COLOR.ok });
+        miniPhoto(onG, 25, 146, 20, 18, { bg: "#1a3b2a", stroke: COLOR.ok, peak: "#3d9c63" });
+        label(onG, 50, 158, "Bot 图/附件", { size: 9, color: COLOR.ok });
+
+        box(onG, 20, 174, 106, 26, "#12344d", { rx: 4, stroke: COLOR.info });
+        miniPhoto(onG, 25, 178, 20, 18, { bg: "#123f5a", stroke: COLOR.info, peak: "#2e7a4a" });
+        label(onG, 50, 190, "群友直发图", { size: 9, color: COLOR.info });
+
+        const tracker = el("g", {});
+        box(tracker, 20, 206, 106, 20, "#201633", { rx: 4, stroke: COLOR.purple });
+        label(tracker, 73, 219, "qq_official 追踪 √", { size: 8.5, color: COLOR.purple, anchor: "middle" });
+        onG.appendChild(tracker);
+
+        // 两条独立分流箭头（包在 <g> 里，让箭杆与箭头同步位移和淡入）
+        const flowBot = el("g", {});
+        arrow(flowBot, 128, 155, 162, 160, COLOR.ok);
+        onG.appendChild(flowBot);
+
+        const flowUser = el("g", {});
+        arrow(flowUser, 128, 187, 162, 204, COLOR.info);
+        onG.appendChild(flowUser);
+
+        // 右侧上槽：Bot 自发引用媒体独立包裹
+        const botSlot = el("g", {});
+        box(botSlot, 174, 142, 210, 39, "#102a20", { stroke: COLOR.ok });
+        miniPhoto(botSlot, 182, 151, 24, 20, { bg: "#1a3b2a", stroke: COLOR.ok, peak: "#3d9c63" });
+        label(botSlot, 214, 158, "[你自己] Bot 自发引用", { size: 10, color: COLOR.ok, bold: true });
+        label(botSlot, 214, 173, "图拆出包裹 · 音/视/文标归属", { size: 9, color: COLOR.ink });
+        onG.appendChild(botSlot);
+
+        // 右侧下槽：群友直发图单独留在末尾
+        const userSlot = el("g", {});
+        box(userSlot, 174, 187, 210, 39, "#102334", { stroke: COLOR.info });
+        miniPhoto(userSlot, 182, 196, 24, 20, { bg: "#123f5a", stroke: COLOR.info, peak: "#2e7a4a" });
+        label(userSlot, 214, 203, "当前发言人直发图片", { size: 10, color: COLOR.info, bold: true });
+        label(userSlot, 214, 218, "留在消息末尾 · 互不混淆 √", { size: 9, color: COLOR.ok });
+        onG.appendChild(userSlot);
+
+        return { flowBot, flowUser, botSlot, userSlot, tracker };
+      },
+    });
+
+    // 上下路径分隔虚线
+    g.appendChild(el("line", {
+      x1: 20, y1: 114, x2: 384, y2: 114,
+      stroke: "#1f4f4f", "stroke-width": 1, "stroke-dasharray": "4 4",
+    }));
+
+    return {
+      caption: on
+        ? "开启：Bot 自发引用图从末尾拆出并标注归属，语音/视频/文件补齐归属，原生 qq_official 追踪自发来源供回复指向与媒体共用"
+        : "关闭：仅运行原有文本回复指向说明，引用图与用户图混在末尾，也不挂载原生 qq_official 出站追踪",
+      animate: on
+        ? () => ctx.gsap.timeline({ repeat: -1, repeatDelay: 0.9 })
+          .fromTo([onParts.flowBot, onParts.botSlot], { opacity: 0.35, x: -5 }, { opacity: 1, x: 0, duration: 0.45 })
+          .fromTo([onParts.flowUser, onParts.userSlot], { opacity: 0.35, x: -5 }, { opacity: 1, x: 0, duration: 0.45 }, "-=0.15")
+          .to(onParts.tracker, { opacity: 0.45, duration: 0.35, yoyo: true, repeat: 1 }, "-=0.2")
+        : () => ctx.gsap.timeline({ repeat: -1, yoyo: true })
+          .to([...offParts.flows, ...offParts.warn], { opacity: 0.4, duration: 0.65 }),
+    };
+  });
+}
+
 function buildIssueToken(stage, ctx) {
   return scene(stage, ctx, (g, value) => {
     const configured = Boolean(value);
@@ -795,6 +906,7 @@ const BUILDERS = {
   "parallel-tool-allowlist": buildParallelToolAllowlist,
   "session-header-ua": buildSessionHeaderUa,
   "session-header-extra": buildSessionHeaderExtra,
+  "reply-target-media-enhance": buildReplyTargetMediaEnhance,
   "issue-devkit": buildIssueDevkit,
   "issue-notify-umo": buildIssueNotify,
   "issue-github-token": buildIssueToken,
