@@ -13,6 +13,7 @@ from urllib.parse import unquote, urlparse
 
 from ..utils.patching import (
     is_wrapper_active,
+    is_wrapper_in_chain,
     mark_wrapper_active,
     mark_wrapper_inactive,
     same_callable,
@@ -159,7 +160,9 @@ class QuotedImageInputModule:
         module_cls = type(self)
         if module_cls._prepare_targets:
             installed = all(
-                same_callable(getattr(target.owner, target.attribute, None), target.wrapper)
+                is_wrapper_in_chain(
+                    getattr(target.owner, target.attribute, None), target.wrapper
+                )
                 for target in module_cls._prepare_targets + module_cls._collect_targets
             )
             if installed and module_cls._active_module is not None:

@@ -34,6 +34,7 @@ from .modules.output_length_limiter import (
 )
 from .modules.parallel_tool_use import ParallelToolUseModule
 from .modules.provider_session_headers import ProviderSessionHeadersModule
+from .modules.quoted_bot_media import QuotedBotMediaModule
 from .modules.quoted_image_input import QuotedImageInputModule
 from .modules.reply_target_history import ReplyTargetHistoryModule
 from .modules.send_message_to_user import SendMessageToUserModule
@@ -75,6 +76,7 @@ DEFAULT_CONFIG = {
     "provider_session_headers_user_agent": True,
     "provider_session_headers_extra_name": "",
     "optimize_reply_target_history": False,
+    "reply_target_media_enhance": False,
     "disable_group_at_bot_wake": False,
     "disable_group_at_bot_wake_all_groups": False,
     "disable_group_at_bot_wake_group_ids": [],
@@ -136,6 +138,7 @@ _TOOL_CALL_PREAMBLE_SETTING_KEYS = frozenset(
         "hide_tool_call_preamble_umos",
     }
 )
+_REPLY_TARGET_SETTING_KEYS = frozenset({"reply_target_media_enhance"})
 
 
 class AstrNaRuntime:
@@ -172,6 +175,11 @@ class AstrNaRuntime:
         self.image_history_context = ImageHistoryContextModule(logger=logger)
         self.tool_history_context = ToolHistoryContextModule(logger=logger)
         self.quoted_image_input = QuotedImageInputModule(logger=logger)
+        self.quoted_bot_media = QuotedBotMediaModule(
+            logger=logger,
+            kv_store=kv_store,
+            context=context,
+        )
         self.image_caption = ImageCaptionModule(logger=logger)
         self.send_message_to_user = SendMessageToUserModule(logger=logger)
         self.output_length_limiter = OutputLengthLimiterModule(
@@ -280,6 +288,7 @@ class AstrNaRuntime:
             self.deepseek_v4_400.install()
         self._configure_image_caption()
         self._configure_quoted_image_input()
+        self._configure_quoted_bot_media()
         if self.config.get("optimize_send_message_to_user", False):
             self.send_message_to_user.install()
         if self.config.get("output_length_limit_enabled", False):
@@ -315,6 +324,9 @@ class AstrNaRuntime:
             self._configure_provider_session_headers()
         elif key == "optimize_quoted_image_input":
             self._configure_quoted_image_input()
+        elif key == "optimize_reply_target_history":
+            self.reply_target_history.set_semantic_enabled(value)
+            self._configure_quoted_bot_media()
         elif key == "optimize_image_caption":
             self._configure_image_caption()
         elif key == "unlock_group_sender_concurrency":
@@ -345,6 +357,22 @@ class AstrNaRuntime:
             self.quoted_image_input.install()
         else:
             self.quoted_image_input.terminate()
+
+    def _configure_quoted_bot_media(self) -> None:
+        if getattr(self, "_closed", False):
+            return
+        enabled = bool(
+            self.config.get("optimize_reply_target_history", False)
+            and self.config.get("reply_target_media_enhance", False)
+        )
+        if enabled:
+            self.reply_target_history.set_self_quote_detector(
+                self.quoted_bot_media.is_quote_from_self_async
+            )
+            self.quoted_bot_media.install()
+        else:
+            self.reply_target_history.set_self_quote_detector(None)
+            self.quoted_bot_media.terminate()
 
     def _install_group_sender_concurrency(self) -> bool:
         """按宿主能力选择新版 AgentSession 后端或旧版包装后端。
@@ -448,6 +476,7 @@ class AstrNaRuntime:
         - 群聊压缩模型：调用现有 configure()；
         - 输出限制四项：统一调用 OutputLengthLimiterModule.configure()；
         - 过场白范围三项：统一调用 ToolCallPreambleModule.configure()；
+        - 引用媒体增强：热同步 QuotedBotMediaModule 与回复指向的原生 qq_official 来源识别；
         - 群唤醒范围与内置指令允许列表：重建共享 WakingCheck 链；
         - Issue 助手三项：调用现有配置同步入口（Token/UMO 不进日志）。
         """
@@ -504,6 +533,8 @@ class AstrNaRuntime:
             self._configure_provider_session_headers()
         elif key in _TOOL_CALL_PREAMBLE_SETTING_KEYS:
             self._configure_tool_call_preamble()
+        elif key in _REPLY_TARGET_SETTING_KEYS:
+            self._configure_quoted_bot_media()
         # 身份元数据四项只写配置，下一次 LLM 请求由 sanitize_request 读取。
 
     async def sanitize_request(self, event: Any, req: Any) -> None:
@@ -568,6 +599,14 @@ class AstrNaRuntime:
         self._configure_quoted_image_input()
         if self.config.get("optimize_quoted_image_input", False):
             await self.quoted_image_input.optimize(event, req)
+            if not self._is_lifecycle_current(lifecycle_token):
+                return
+
+        self._configure_quoted_bot_media()
+        if self.config.get("optimize_reply_target_history", False) and self.config.get(
+            "reply_target_media_enhance", False
+        ):
+            await self.quoted_bot_media.optimize(event, req)
             if not self._is_lifecycle_current(lifecycle_token):
                 return
 
@@ -1033,6 +1072,9 @@ class AstrNaRuntime:
         # 过场白门卫必须在第一个 await 前停用，避免卸载后继续扣住文字。
         self.tool_call_preamble.terminate()
         self.quoted_image_input.terminate()
+        self.reply_target_history.set_self_quote_detector(None)
+        self.reply_target_history.terminate()
+        self.quoted_bot_media.terminate()
         # 群聊优化必须在首个 await 前停用，避免卸载期间继续收集新增消息。
         self.group_chat_context_optimizer.terminate()
         self.gemini_request_headers.terminate()
@@ -1047,7 +1089,6 @@ class AstrNaRuntime:
         self.send_message_to_user.terminate()
         self.output_length_limiter.terminate()
         self.group_identity_tools.terminate()
-        self.reply_target_history.terminate()
         self.deepseek_v4_400.terminate()
         self.auto_cache_cleanup.terminate()
         self._request_activity_events.clear()

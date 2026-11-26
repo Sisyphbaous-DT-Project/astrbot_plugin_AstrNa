@@ -47,6 +47,7 @@ EXPECTED_SETTING_ORDER = [
     "parallel_tool_use_allowlist",
     "provider_session_headers_user_agent",
     "provider_session_headers_extra_name",
+    "reply_target_media_enhance",
     "issue_assistant_devkit_enabled",
     "issue_assistant_target_umo",
     "issue_assistant_github_token",
@@ -63,6 +64,7 @@ EXPECTED_PARENTS = {
     "custom_builtin_commands_enabled": 1,
     "parallel_tool_use_enabled": 1,
     "provider_session_headers_enabled": 2,
+    "optimize_reply_target_history": 1,
     "issue_assistant_enabled": 3,
 }
 
@@ -89,6 +91,7 @@ EXPECTED_ANIMATIONS = {
     "parallel_tool_use_allowlist": "parallel-tool-allowlist",
     "provider_session_headers_user_agent": "session-header-ua",
     "provider_session_headers_extra_name": "session-header-extra",
+    "reply_target_media_enhance": "reply-target-media-enhance",
     "issue_assistant_devkit_enabled": "issue-devkit",
     "issue_assistant_target_umo": "issue-notify-umo",
     "issue_assistant_github_token": "issue-github-token",
@@ -220,12 +223,10 @@ def _run(coro):
 
 def test_settings_registry_exact_order_count_and_parents():
     assert list(SETTING_KEYS) == EXPECTED_SETTING_ORDER
-    assert len(SETTINGS) == 25
     parents = {}
     for item in SETTINGS:
         parents[item["parent"]] = parents.get(item["parent"], 0) + 1
     assert parents == EXPECTED_PARENTS
-    assert len(EXPECTED_PARENTS) == 11
 
 
 def test_settings_registry_copy_complete():
@@ -244,15 +245,7 @@ def test_settings_registry_copy_complete():
             "secret",
             "text",
         }
-    assert len({item["animation"] for item in SETTINGS}) == 25
-
-
-def test_settings_animation_ids_match_frontend_registry():
-    # 前端动画注册表与后端目录必须一一对应（静态一致性由 JS 侧测试复核）。
-    assert set(EXPECTED_ANIMATIONS.values()) == {
-        item["animation"] for item in SETTINGS
-    }
-
+    assert len({item["animation"] for item in SETTINGS}) == len(SETTINGS)
 
 # ---------------------------------------------------------------------------
 # 状态构建

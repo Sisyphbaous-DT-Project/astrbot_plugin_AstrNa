@@ -7,6 +7,7 @@ import inspect
 import json
 import re
 import weakref
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from functools import wraps
 from typing import Any
@@ -21,7 +22,9 @@ from ..utils.patching import (
 
 from .identity_metadata import (
     format_metadata_json,
+    is_quoted_message_from_self,
     sanitize_optional_metadata_value,
+    sanitize_optional_sender_id,
 )
 
 
@@ -34,6 +37,7 @@ ASTRNA_MARKER_PATTERN = re.compile(
     flags=re.DOTALL,
 )
 _REQUEST_EVENT_ATTR = "_astrna_reply_target_event_ref"
+_STATE_LOCK_ATTR = "_astrna_reply_target_history_state_lock"
 # AstrBot 4.30 起历史保存迁到 astr_agent_runtime.history，session 以
 # from-import 另行绑定同一函数。
 _SAVE_HISTORY_MODULES = (
@@ -78,14 +82,16 @@ class ReplyTargetHistoryModule:
         logger: Any,
         kv_store: Any | None = None,
         semantic_enabled: bool = False,
+        self_quote_detector: Any | None = None,
     ):
         self.logger = logger
         self.kv_store = kv_store
         self.semantic_enabled = semantic_enabled
+        self.self_quote_detector = self_quote_detector
         self._installed = False
+        self._generation = object()
         self._state_loaded = kv_store is None
         self._state_cache: dict[str, Any] = {"sessions": {}}
-        self._state_lock = asyncio.Lock()
 
     def install(self) -> bool:
         self.set_semantic_enabled(self.semantic_enabled)
@@ -110,16 +116,47 @@ class ReplyTargetHistoryModule:
         return True
 
     def set_semantic_enabled(self, enabled: bool) -> None:
+        if self.semantic_enabled != enabled:
+            self._generation = object()
         self.semantic_enabled = enabled
 
+    def set_self_quote_detector(self, detector: Any | None) -> None:
+        if not same_callable(self.self_quote_detector, detector):
+            self._generation = object()
+        self.self_quote_detector = detector
+
+    async def _is_quote_from_self(self, event: Any, quote: Any) -> bool:
+        if is_quote_from_self(event, quote):
+            return True
+        detector = self.self_quote_detector
+        if not callable(detector):
+            return False
+        try:
+            return bool(await detector(event, quote))
+        except Exception as exc:  # noqa: BLE001
+            self._log("debug", "AstrNa 检查引用消息自发来源失败：%s", exc)
+            return False
+
     def terminate(self) -> None:
+        self._generation = object()
         module_cls = type(self)
         if self._installed and module_cls._active_module is self:
             module_cls.restore_patch()
         self._installed = False
 
+    def _is_current(self, token: object) -> bool:
+        return (
+            self._installed
+            and type(self)._active_module is self
+            and self._generation is token
+        )
+
     @classmethod
     def restore_patch(cls) -> None:
+        active_module = cls._active_module
+        if active_module is not None:
+            active_module._generation = object()
+            active_module._installed = False
         mark_wrapper_inactive(cls._save_history_wrapper)
         mark_wrapper_inactive(cls._response_wrapper)
         mark_wrapper_inactive(cls._response_stream_wrapper)
@@ -332,12 +369,14 @@ class ReplyTargetHistoryModule:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> Any:
+        token = self._generation
+        semantic_enabled = self.semantic_enabled
         event = args[0] if args else kwargs.get("event")
         req = args[1] if len(args) > 1 else kwargs.get("req")
 
         result = await original_process_quote_message(*args, **kwargs)
 
-        if not self.semantic_enabled:
+        if not semantic_enabled or not self._is_current(token):
             return result
 
         quote = find_reply_component(event)
@@ -355,14 +394,16 @@ class ReplyTargetHistoryModule:
         kwargs: dict[str, Any],
     ) -> Any:
         """AstrBot 4.30 的引用消息入口：补回复指向并记录本轮事件。"""
+        token = self._generation
+        semantic_enabled = self.semantic_enabled
         event, req = parse_append_quoted_call(signature, args, kwargs)
         result = await original_append_quoted_content(*args, **kwargs)
-        if event is None or req is None:
+        if event is None or req is None or not self._is_current(token):
             return result
 
         # 历史保存入口拿不到事件，这里把本轮来源挂到请求上供其读取。
         remember_request_event(req, event)
-        if not self.semantic_enabled:
+        if not semantic_enabled:
             return result
 
         quote = find_reply_component(event)
@@ -378,8 +419,14 @@ class ReplyTargetHistoryModule:
         req: Any,
         quote: Any,
     ) -> None:
+        token = self._generation
+        if not self.semantic_enabled or not self._is_current(token):
+            return
+        quote_from_self = await self._is_quote_from_self(event, quote)
+        if not self.semantic_enabled or not self._is_current(token):
+            return
         quoted_reply_target = None
-        if is_quote_from_self(event, quote):
+        if quote_from_self:
             quoted_text = normalize_match_text(
                 getattr(quote, "message_str", None)
                 or extract_last_quoted_message_text(req),
@@ -389,10 +436,18 @@ class ReplyTargetHistoryModule:
                 req,
                 quote,
                 quoted_text,
+                quote_from_self=True,
             )
+            if not self.semantic_enabled or not self._is_current(token):
+                return
 
-        hint = build_reply_direction_hint(event, quote, quoted_reply_target)
-        if hint:
+        hint = build_reply_direction_hint(
+            event,
+            quote,
+            quoted_reply_target,
+            quote_from_self=quote_from_self,
+        )
+        if hint and self.semantic_enabled and self._is_current(token):
             append_temp_text_part(req, hint)
 
     def _install_save_history_patch(self) -> bool:
@@ -720,6 +775,9 @@ class ReplyTargetHistoryModule:
         message: Any,
         metadata: dict[str, Any],
     ) -> None:
+        token = self._generation
+        if not self._is_current(token):
+            return
         session_key = get_reply_target_session_key(event, req)
         if not session_key:
             return
@@ -728,8 +786,12 @@ class ReplyTargetHistoryModule:
         if not text:
             return
 
-        async with self._state_lock:
-            await self._ensure_state_loaded_locked()
+        async with get_shared_reply_target_state_lock():
+            if not self._is_current(token):
+                return
+            loaded = await self._ensure_state_loaded_locked()
+            if not loaded or not self._is_current(token):
+                return
             sessions = self._state_cache.setdefault("sessions", {})
             if not isinstance(sessions, dict):
                 sessions = {}
@@ -744,6 +806,8 @@ class ReplyTargetHistoryModule:
             entries.append({"hash": text_hash, "metadata": public_metadata})
             sessions[session_key] = entries[-MAX_REPLY_TARGET_INDEX_PER_SESSION:]
             trim_reply_target_sessions(sessions)
+            if not self._is_current(token):
+                return
             await self._persist_state_locked()
 
     async def find_quoted_reply_target_metadata(
@@ -752,8 +816,15 @@ class ReplyTargetHistoryModule:
         req: Any,
         quote: Any,
         quoted_text: str,
+        *,
+        quote_from_self: bool | None = None,
     ) -> dict[str, Any] | None:
-        if not is_quote_from_self(event, quote):
+        is_self = (
+            is_quote_from_self(event, quote)
+            if quote_from_self is None
+            else bool(quote_from_self)
+        )
+        if not is_self:
             return None
 
         quote_body = normalize_quoted_message_text(
@@ -780,7 +851,7 @@ class ReplyTargetHistoryModule:
             return None
 
         await self._ensure_state_loaded()
-        async with self._state_lock:
+        async with get_shared_reply_target_state_lock():
             sessions = self._state_cache.get("sessions")
             if not isinstance(sessions, dict):
                 return None
@@ -798,28 +869,28 @@ class ReplyTargetHistoryModule:
         return unique_matches[0] if len(unique_matches) == 1 else None
 
     async def _ensure_state_loaded(self) -> None:
-        async with self._state_lock:
+        async with get_shared_reply_target_state_lock():
             await self._ensure_state_loaded_locked()
 
-    async def _ensure_state_loaded_locked(self) -> None:
+    async def _ensure_state_loaded_locked(self) -> bool:
         if self._state_loaded:
-            return
+            return True
         getter = getattr(self.kv_store, "get_kv_data", None)
         if not callable(getter):
             self._state_loaded = True
-            return
+            return True
         try:
             state = await getter(REPLY_TARGET_HISTORY_STATE_KEY, {"sessions": {}})
         except Exception as exc:  # noqa: BLE001
             self._log("debug", "AstrNa 读取回复目标索引失败：%s", exc)
-            self._state_loaded = True
-            return
+            return False
         if isinstance(state, dict) and isinstance(state.get("sessions"), dict):
-            self._state_cache = state
+            self._state_cache = deepcopy(state)
         self._state_loaded = True
+        return True
 
     async def _persist_state(self) -> None:
-        async with self._state_lock:
+        async with get_shared_reply_target_state_lock():
             await self._persist_state_locked()
 
     async def _persist_state_locked(self) -> None:
@@ -835,6 +906,16 @@ class ReplyTargetHistoryModule:
         logger_method = getattr(self.logger, level, None)
         if callable(logger_method):
             logger_method(message, *args)
+
+
+def get_shared_reply_target_state_lock() -> asyncio.Lock:
+    """让同一事件循环内的新旧模块实例共用索引读写锁。"""
+    loop = asyncio.get_running_loop()
+    lock = getattr(loop, _STATE_LOCK_ATTR, None)
+    if lock is None:
+        lock = asyncio.Lock()
+        setattr(loop, _STATE_LOCK_ATTR, lock)
+    return lock
 
 
 def build_reply_target_metadata(event: Any) -> dict[str, Any]:
@@ -870,10 +951,22 @@ def build_reply_direction_hint(
     event: Any,
     quote: Any,
     quoted_reply_target: dict[str, Any] | None = None,
+    *,
+    quote_from_self: bool | None = None,
 ) -> str:
     current_user = build_event_user_metadata(event)
     quoted_sender = build_quoted_sender_metadata(quote)
-    if not current_user and not quoted_sender and not quoted_reply_target:
+    is_self = (
+        is_quote_from_self(event, quote)
+        if quote_from_self is None
+        else bool(quote_from_self)
+    )
+    if (
+        not current_user
+        and not quoted_sender
+        and not quoted_reply_target
+        and not is_self
+    ):
         return ""
 
     current_user_text = format_user_description(current_user, "当前发言人")
@@ -886,11 +979,10 @@ def build_reply_direction_hint(
     lines = ["AstrNa 回复指向说明："]
     if current_user_text:
         lines.append(f"当前发言人是{current_user_text}。")
-    if quoted_sender_text:
-        if is_quote_from_self(event, quote):
-            lines.append("当前发言人引用了一条你之前发送的消息。")
-        else:
-            lines.append(f"当前发言人引用了一条由{quoted_sender_text}发送的消息。")
+    if is_self:
+        lines.append("当前发言人引用了一条你之前发送的消息。")
+    elif quoted_sender_text:
+        lines.append(f"当前发言人引用了一条由{quoted_sender_text}发送的消息。")
 
     if quoted_reply_target and reply_target_text:
         lines.append(f"被引用的这条消息是你之前回复给{reply_target_text}的。")
@@ -915,7 +1007,9 @@ def build_quoted_sender_metadata(quote: Any) -> dict[str, str]:
         return {}
 
     metadata: dict[str, str] = {}
-    put_optional(metadata, "user_id", getattr(quote, "sender_id", None))
+    sender_id = sanitize_optional_sender_id(getattr(quote, "sender_id", None))
+    if sender_id:
+        metadata["user_id"] = sender_id
     put_optional(metadata, "nickname", getattr(quote, "sender_nickname", None))
     return metadata
 
@@ -959,7 +1053,7 @@ def build_quoted_sender_marker(quote: Any) -> str:
     if quote is None:
         return ""
 
-    sender_id = sanitize_optional_metadata_value(getattr(quote, "sender_id", None))
+    sender_id = sanitize_optional_sender_id(getattr(quote, "sender_id", None))
     nickname = sanitize_optional_metadata_value(
         getattr(quote, "sender_nickname", None)
     )
@@ -987,26 +1081,7 @@ def build_quoted_reply_target_marker(metadata: dict[str, Any] | None) -> str:
 
 
 def is_quote_from_self(event: Any, quote: Any) -> bool:
-    if quote is None:
-        return False
-
-    quote_sender_id = sanitize_optional_metadata_value(
-        getattr(quote, "sender_id", None)
-    )
-    if not quote_sender_id:
-        return False
-
-    self_id = sanitize_optional_metadata_value(
-        safe_call(getattr(event, "get_self_id", None))
-    )
-    if not self_id:
-        self_id = sanitize_optional_metadata_value(
-            getattr(getattr(event, "message_obj", None), "self_id", None)
-        )
-    if not self_id:
-        return False
-
-    return quote_sender_id == self_id
+    return is_quoted_message_from_self(event, quote)
 
 
 def detect_reply_scope(event: Any) -> str:

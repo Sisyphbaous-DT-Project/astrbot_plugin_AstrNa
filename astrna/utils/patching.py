@@ -86,6 +86,24 @@ def is_wrapper_active(wrapper: Any) -> bool:
     return state is None or state.active
 
 
+def is_wrapper_in_chain(func: Any, wrapper: Any) -> bool:
+    """检查已登记的包装链，避免把仍在内层的有效包装误判为被替换。"""
+    seen: set[tuple[int, int]] = set()
+    while callable(func):
+        target, owner = _split_callable(func)
+        identity = (id(target), id(owner) if owner is not None else 0)
+        if identity in seen:
+            return False
+        seen.add(identity)
+        if same_callable(func, wrapper):
+            return is_wrapper_active(wrapper)
+        state = _get_wrapper_state(func)
+        if state is None:
+            return False
+        func = state.original
+    return False
+
+
 def unwrap_inactive_wrapper(func: Any) -> Any:
     seen: set[tuple[int, int]] = set()
     while callable(func):

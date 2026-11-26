@@ -26,6 +26,7 @@ export const SETTING_ANIMATION_IDS = [
   "parallel-tool-allowlist",
   "session-header-ua",
   "session-header-extra",
+  "reply-target-media-enhance",
   "issue-devkit",
   "issue-notify-umo",
   "issue-github-token",

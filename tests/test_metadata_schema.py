@@ -62,6 +62,7 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         "provider_session_headers_user_agent",
         "provider_session_headers_extra_name",
         "optimize_reply_target_history",
+        "reply_target_media_enhance",
         "disable_group_at_bot_wake",
         "disable_group_at_bot_wake_all_groups",
         "disable_group_at_bot_wake_group_ids",
@@ -307,6 +308,13 @@ def test_config_schema_is_valid_json_and_has_expected_defaults():
         == "优化回复历史标记"
     )
     assert schema["optimize_reply_target_history"]["default"] is False
+    assert schema["reply_target_media_enhance"]["type"] == "bool"
+    assert schema["reply_target_media_enhance"]["description"] == "引用媒体增强"
+    assert schema["reply_target_media_enhance"]["default"] is False
+    assert schema["reply_target_media_enhance"]["collapsed"] is True
+    assert schema["reply_target_media_enhance"]["condition"] == {
+        "optimize_reply_target_history": True,
+    }
     assert schema["disable_group_at_bot_wake"]["type"] == "bool"
     assert schema["disable_group_at_bot_wake"]["default"] is False
     assert "@Bot" in schema["disable_group_at_bot_wake"]["hint"]

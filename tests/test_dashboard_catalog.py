@@ -121,6 +121,15 @@ def test_build_state_defaults_all_disabled():
     assert len(state["features"]) == 23
     assert all(feature["enabled"] is False for feature in state["features"])
     assert state["warnings"] == []
+    reply_target = next(
+        item
+        for item in state["features"]
+        if item["key"] == "optimize_reply_target_history"
+    )
+    assert reply_target["details"] == {"reply_target_media_enhance": False}
+    assert [item["key"] for item in reply_target["settings"]] == [
+        "reply_target_media_enhance",
+    ]
 
 
 def test_build_state_version_defaults_to_unknown():

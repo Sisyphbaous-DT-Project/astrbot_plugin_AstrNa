@@ -26,6 +26,7 @@ EXPECTED_PARENTS_WITH_SETTINGS = {
     "custom_builtin_commands_enabled",
     "parallel_tool_use_enabled",
     "provider_session_headers_enabled",
+    "optimize_reply_target_history",
     "issue_assistant_enabled",
 }
 
@@ -46,7 +47,7 @@ def test_setting_animation_ids_match_backend_registry():
       const {{ SETTING_ANIMATION_IDS }} = await import(moduleUrl);
       const backend = {backend};
       assert.deepEqual(SETTING_ANIMATION_IDS, backend);
-      assert.equal(new Set(SETTING_ANIMATION_IDS).size, 25);
+      assert.equal(new Set(SETTING_ANIMATION_IDS).size, backend.length);
     """
     subprocess.run(
         ["node", "--input-type=module", "--eval", script],
@@ -184,7 +185,7 @@ def test_fallback_catalog_keeps_all_settings_readonly():
     for parent in EXPECTED_PARENTS_WITH_SETTINGS:
         assert f"{parent}: [" in text, parent
     # 全部静态子配置条目
-    assert text.count("    setting(") == 25
+    assert text.count("    setting(") == 26
     # 状态未知时不能伪装成真实值
     assert "value: null" in text
     assert "configured: null" in text
