@@ -498,6 +498,31 @@ def sanitize_optional_metadata_value(value: Any) -> str | None:
     return sanitized or None
 
 
+def sanitize_optional_sender_id(value: Any) -> str | None:
+    sanitized = sanitize_optional_metadata_value(value)
+    return None if sanitized in {None, "0"} else sanitized
+
+
+def is_quoted_message_from_self(event: Any, quote: Any) -> bool:
+    if quote is None:
+        return False
+    quote_sender_id = sanitize_optional_sender_id(getattr(quote, "sender_id", None))
+    if not quote_sender_id:
+        return False
+
+    getter = getattr(event, "get_self_id", None)
+    try:
+        raw_self_id = getter() if callable(getter) else None
+    except Exception:  # noqa: BLE001
+        raw_self_id = None
+    self_id = sanitize_optional_sender_id(raw_self_id)
+    if not self_id:
+        self_id = sanitize_optional_sender_id(
+            getattr(getattr(event, "message_obj", None), "self_id", None)
+        )
+    return bool(self_id and quote_sender_id == self_id)
+
+
 def format_metadata_json(metadata: dict[str, Any]) -> str:
     return json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
 

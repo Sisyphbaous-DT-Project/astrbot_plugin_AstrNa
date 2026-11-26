@@ -47,7 +47,7 @@ def test_setting_animation_ids_match_backend_registry():
       const {{ SETTING_ANIMATION_IDS }} = await import(moduleUrl);
       const backend = {backend};
       assert.deepEqual(SETTING_ANIMATION_IDS, backend);
-      assert.equal(new Set(SETTING_ANIMATION_IDS).size, 26);
+      assert.equal(new Set(SETTING_ANIMATION_IDS).size, backend.length);
     """
     subprocess.run(
         ["node", "--input-type=module", "--eval", script],

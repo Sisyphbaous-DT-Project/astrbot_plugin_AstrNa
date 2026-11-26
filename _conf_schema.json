@@ -282,7 +282,7 @@
   "reply_target_media_enhance": {
     "type": "bool",
     "description": "引用媒体增强",
-    "hint": "开启后，当用户引用 Bot 自己（含插件）发出的图片、语音、视频或文件时，AstrNa 会将引用图片从 req.image_urls 拆出并紧跟引用块标注为 Bot 自己发送，为被引用的语音、视频和文件附件补充归属说明，并补全缺失的引用发送者标记；同时对原生 qq_official / qq_official_webhook 追踪 Bot 出站消息 ID，使引用媒体归属和文本回复指向说明都能识别原生 QQ 官方 Bot 自发消息。未识别出自发来源时不猜测；纯文本模型不会额外插入 ImageURLPart，仅补充文本说明。默认关闭。",
+    "hint": "开启后，当用户引用 Bot 自己（含插件）发出的图片、语音、视频或文件时，AstrNa 会将准备阶段已确认来源的引用图片从 req.image_urls 拆出并紧跟引用块标注为 Bot 自己发送，其他插件追加或来源不明的图片保持原位；为被引用的语音、视频和文件附件补充归属说明，并补全缺失的引用发送者标记。同时对原生 qq_official / qq_official_webhook 按平台实例隔离追踪 Bot 出站消息 ID，使引用媒体归属和文本回复指向说明都能识别对应账号的 Bot 自发消息。未识别出自发来源时不猜测；纯文本模型不会额外插入 ImageURLPart，仅补充文本说明。默认关闭。",
     "default": false,
     "collapsed": true,
     "condition": {

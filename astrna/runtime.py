@@ -1073,6 +1073,7 @@ class AstrNaRuntime:
         self.tool_call_preamble.terminate()
         self.quoted_image_input.terminate()
         self.reply_target_history.set_self_quote_detector(None)
+        self.reply_target_history.terminate()
         self.quoted_bot_media.terminate()
         # 群聊优化必须在首个 await 前停用，避免卸载期间继续收集新增消息。
         self.group_chat_context_optimizer.terminate()
@@ -1088,7 +1089,6 @@ class AstrNaRuntime:
         self.send_message_to_user.terminate()
         self.output_length_limiter.terminate()
         self.group_identity_tools.terminate()
-        self.reply_target_history.terminate()
         self.deepseek_v4_400.terminate()
         self.auto_cache_cleanup.terminate()
         self._request_activity_events.clear()

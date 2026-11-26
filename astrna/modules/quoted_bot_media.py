@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
-from dataclasses import replace
+from collections import Counter
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
 from typing import Any
 
 from ..utils.patching import (
@@ -15,7 +18,19 @@ from ..utils.patching import (
 )
 from .identity_metadata import (
     FallbackTextPart,
+    is_quoted_message_from_self,
     sanitize_optional_metadata_value,
+    sanitize_optional_sender_id,
+)
+from .quoted_image_input import (
+    _NEW_PREPARE_ENTRY_MODULES,
+    _collect_entry_target,
+    _load_astr_main_agent,
+    _load_internal_stage_module,
+    _load_owner_module,
+    _prepared_result_path,
+    collect_image_refs_from_chain,
+    image_ref_key,
 )
 
 
@@ -23,9 +38,14 @@ QQ_OFFICIAL_SELF_SENT_IDS_STATE_KEY = "qq_official_self_sent_ids_v1"
 MAX_QQ_OFFICIAL_SENT_IDS = 2000
 QQ_OFFICIAL_SENT_ID_TTL_SECONDS = 7 * 86400
 QQ_OFFICIAL_PLATFORMS = frozenset({"qq_official", "qq_official_webhook"})
+_QQ_OFFICIAL_PLATFORM_SCOPE: ContextVar[str | None] = ContextVar(
+    "astrna_qq_official_platform_scope", default=None
+)
+_QQ_OFFICIAL_IDS_LOCK_ATTR = "_astrna_quoted_bot_media_ids_lock"
+_CONFIRMED_QUOTED_IMAGE_KEYS_ATTR = "_astrna_quoted_bot_media_image_keys"
+_AMBIGUOUS_QUOTED_IMAGE_KEYS_ATTR = "_astrna_quoted_bot_media_ambiguous_image_keys"
 
 QUOTED_IMAGE_NOTICE_PATTERN = re.compile(r"^\[Image (\d+) in quoted message:")
-IMAGE_NOTICE_PATTERN = re.compile(r"^\[Image (\d+)(?: in quoted message)?:")
 QUOTED_IMAGE_SKIPPED_NOTICE_PATTERN = re.compile(
     r"^\[Image Attachment in quoted message:.*; not included in this request\]$"
 )
@@ -54,12 +74,26 @@ _QUOTED_ATTACHMENT_RULES = (
 )
 
 
+@dataclass
+class _PrepareTarget:
+    owner: Any
+    attribute: str
+    original: Any
+    wrapper: Any = None
+
+
 class QuotedBotMediaModule:
     """明确引用 Bot 自发图片/语音/视频/文件的归属，避免模型误判为引用者发送。"""
 
     _qq_official_event_cls: type | None = None
     _original_qq_official_send: Any = None
     _qq_official_send_wrapper: Any = None
+    _original_qq_official_post_send: Any = None
+    _qq_official_post_send_wrapper: Any = None
+    _qq_official_adapter_cls: type | None = None
+    _original_qq_official_session_send: Any = None
+    _qq_official_session_send_wrapper: Any = None
+    _prepare_targets: list[_PrepareTarget] = []
     _active_module: QuotedBotMediaModule | None = None
 
     def __init__(
@@ -72,31 +106,48 @@ class QuotedBotMediaModule:
         self.kv_store = kv_store
         self.context = context
         self._installed = False
+        self._generation = object()
         self._qq_official_sent_ids: dict[str, float] = {}
         self._qq_official_ids_loaded = kv_store is None
-        self._qq_official_ids_lock = asyncio.Lock()
 
     def install(self) -> bool:
         module_cls = type(self)
-        if self._installed and module_cls._active_module is self:
-            self._install_qq_official_send_patch()
-            return True
-
+        was_installed = self._installed and module_cls._active_module is self
         self._install_qq_official_send_patch()
+        self._install_prepare_patch()
         module_cls._active_module = self
         self._installed = True
-        self._log("info", "AstrNa 已启用引用媒体增强。")
+        if not was_installed:
+            self._log("info", "AstrNa 已启用引用媒体增强。")
         return True
 
     def terminate(self) -> None:
+        self._generation = object()
         module_cls = type(self)
         if self._installed and module_cls._active_module is self:
             module_cls.restore_patch()
         self._installed = False
 
+    def _is_current(self, token: object) -> bool:
+        return (
+            self._installed
+            and type(self)._active_module is self
+            and self._generation is token
+        )
+
     @classmethod
     def restore_patch(cls) -> None:
-        mark_wrapper_inactive(cls._qq_official_send_wrapper)
+        active_module = cls._active_module
+        if active_module is not None:
+            active_module._generation = object()
+            active_module._installed = False
+        for wrapper in (
+            cls._qq_official_send_wrapper,
+            cls._qq_official_post_send_wrapper,
+            cls._qq_official_session_send_wrapper,
+        ):
+            mark_wrapper_inactive(wrapper)
+
         if (
             cls._qq_official_event_cls is not None
             and cls._original_qq_official_send is not None
@@ -110,9 +161,46 @@ class QuotedBotMediaModule:
                 cls._qq_official_event_cls._send_with_markdown_fallback = staticmethod(
                     unwrap_inactive_wrapper(cls._original_qq_official_send)
                 )
+        if (
+            cls._qq_official_event_cls is not None
+            and cls._original_qq_official_post_send is not None
+        ):
+            current = getattr(cls._qq_official_event_cls, "_post_send", None)
+            if same_callable(current, cls._qq_official_post_send_wrapper):
+                cls._qq_official_event_cls._post_send = unwrap_inactive_wrapper(
+                    cls._original_qq_official_post_send
+                )
+        if (
+            cls._qq_official_adapter_cls is not None
+            and cls._original_qq_official_session_send is not None
+        ):
+            current = getattr(
+                cls._qq_official_adapter_cls, "_send_by_session_common", None
+            )
+            if same_callable(current, cls._qq_official_session_send_wrapper):
+                cls._qq_official_adapter_cls._send_by_session_common = (
+                    unwrap_inactive_wrapper(cls._original_qq_official_session_send)
+                )
+
+        for target in cls._prepare_targets:
+            mark_wrapper_inactive(target.wrapper)
+            current = getattr(target.owner, target.attribute, None)
+            if same_callable(current, target.wrapper):
+                setattr(
+                    target.owner,
+                    target.attribute,
+                    unwrap_inactive_wrapper(target.original),
+                )
+        cls._prepare_targets = []
+
         cls._qq_official_event_cls = None
         cls._original_qq_official_send = None
         cls._qq_official_send_wrapper = None
+        cls._original_qq_official_post_send = None
+        cls._qq_official_post_send_wrapper = None
+        cls._qq_official_adapter_cls = None
+        cls._original_qq_official_session_send = None
+        cls._qq_official_session_send_wrapper = None
         cls._active_module = None
 
     def _install_qq_official_send_patch(self) -> bool:
@@ -133,9 +221,13 @@ class QuotedBotMediaModule:
             return False
 
         module_cls = type(self)
+        qq_adapter_cls = load_qq_official_adapter_cls()
         if (
             module_cls._qq_official_event_cls is not None
             and module_cls._qq_official_event_cls is not qq_event_cls
+        ) or (
+            module_cls._qq_official_adapter_cls is not None
+            and module_cls._qq_official_adapter_cls is not qq_adapter_cls
         ):
             module_cls.restore_patch()
 
@@ -149,11 +241,14 @@ class QuotedBotMediaModule:
                 active_module = module_cls._active_module
                 if not is_wrapper_active(astrna_qq_official_send):
                     active_module = None
-                if active_module is not None:
+                platform_id = _QQ_OFFICIAL_PLATFORM_SCOPE.get()
+                if active_module is not None and platform_id:
                     sent_ids = extract_qq_official_sent_ids(result)
                     if sent_ids:
                         try:
-                            await active_module.remember_qq_official_sent_ids(sent_ids)
+                            await active_module.remember_qq_official_sent_ids(
+                                sent_ids, platform_id=platform_id
+                            )
                         except Exception as exc:  # noqa: BLE001
                             active_module._log(
                                 "debug",
@@ -169,13 +264,127 @@ class QuotedBotMediaModule:
             qq_event_cls._send_with_markdown_fallback = staticmethod(
                 astrna_qq_official_send
             )
-            self._log("debug", "AstrNa 已挂载原生 qq_official 出站消息 ID 追踪。")
 
+        original_post_send = getattr(qq_event_cls, "_post_send", None)
+        if (
+            callable(original_post_send)
+            and module_cls._original_qq_official_post_send is None
+        ):
+            module_cls._original_qq_official_post_send = original_post_send
+
+            async def astrna_qq_official_post_send(event: Any, *args: Any, **kwargs: Any):
+                scope_token = _QQ_OFFICIAL_PLATFORM_SCOPE.set(
+                    get_qq_official_platform_id(event)
+                )
+                try:
+                    return await original_post_send(event, *args, **kwargs)
+                finally:
+                    _QQ_OFFICIAL_PLATFORM_SCOPE.reset(scope_token)
+
+            mark_wrapper_active(astrna_qq_official_post_send, original_post_send)
+            module_cls._qq_official_post_send_wrapper = astrna_qq_official_post_send
+            qq_event_cls._post_send = astrna_qq_official_post_send
+
+        if qq_adapter_cls is not None:
+            original_session_send = getattr(
+                qq_adapter_cls, "_send_by_session_common", None
+            )
+            if (
+                callable(original_session_send)
+                and module_cls._original_qq_official_session_send is None
+            ):
+                module_cls._qq_official_adapter_cls = qq_adapter_cls
+                module_cls._original_qq_official_session_send = original_session_send
+
+                async def astrna_qq_official_session_send(
+                    adapter: Any, *args: Any, **kwargs: Any
+                ):
+                    scope_token = _QQ_OFFICIAL_PLATFORM_SCOPE.set(
+                        get_qq_official_platform_id(adapter)
+                    )
+                    try:
+                        return await original_session_send(adapter, *args, **kwargs)
+                    finally:
+                        _QQ_OFFICIAL_PLATFORM_SCOPE.reset(scope_token)
+
+                mark_wrapper_active(
+                    astrna_qq_official_session_send, original_session_send
+                )
+                module_cls._qq_official_session_send_wrapper = (
+                    astrna_qq_official_session_send
+                )
+                qq_adapter_cls._send_by_session_common = (
+                    astrna_qq_official_session_send
+                )
+
+        self._log("debug", "AstrNa 已挂载原生 qq_official 出站消息 ID 追踪。")
         return True
+
+    def _install_prepare_patch(self) -> bool:
+        module_cls = type(self)
+        if module_cls._prepare_targets:
+            return True
+
+        targets: list[_PrepareTarget] = []
+        for owner in (_load_astr_main_agent(), _load_internal_stage_module()):
+            _collect_entry_target(owner, "prepare_request_images", targets)
+        for module_path in _NEW_PREPARE_ENTRY_MODULES:
+            _collect_entry_target(
+                _load_owner_module(module_path), "prepare_request_images", targets
+            )
+        for target in targets:
+            target.wrapper = self._build_prepare_wrapper(target.original)
+            setattr(target.owner, target.attribute, target.wrapper)
+        module_cls._prepare_targets = targets
+        return bool(targets)
+
+    def _build_prepare_wrapper(self, original_prepare: Any) -> Any:
+        module_cls = type(self)
+
+        async def astrna_prepare_quoted_bot_media(
+            req: Any, event: Any, *args: Any, **kwargs: Any
+        ) -> Any:
+            active_module = module_cls._active_module
+            token = active_module._generation if active_module else None
+            if active_module is None or not is_wrapper_active(
+                astrna_prepare_quoted_bot_media
+            ):
+                return await original_prepare(req, event, *args, **kwargs)
+            raw_image_refs = list(getattr(req, "image_urls", None) or [])
+            direct_event_refs = collect_image_refs_from_chain(
+                getattr(getattr(event, "message_obj", None), "message", None)
+            )
+            result = await original_prepare(req, event, *args, **kwargs)
+            prepared = kwargs.get("prepared")
+            quoted_refs = kwargs.get("quoted_refs")
+            quote_image_ref = kwargs.get("quote_image_ref")
+            if (
+                not active_module._is_current(token)
+                or not isinstance(prepared, dict)
+                or (not quoted_refs and not quote_image_ref)
+            ):
+                return result
+
+            confirmed_paths, ambiguous_paths = resolve_quoted_image_source_paths(
+                raw_image_refs,
+                direct_event_refs,
+                prepared,
+                quoted_refs,
+                quote_image_ref,
+            )
+            record_confirmed_quoted_image_refs(
+                req, confirmed_paths, ambiguous_refs=ambiguous_paths
+            )
+            return result
+
+        astrna_prepare_quoted_bot_media._astrna_quoted_bot_media_patch = True
+        mark_wrapper_active(astrna_prepare_quoted_bot_media, original_prepare)
+        return astrna_prepare_quoted_bot_media
 
     async def optimize(self, event: Any, req: Any) -> bool:
         """在 LLM 请求阶段识别并标注机器人自发的引用图片、语音、视频和文件。"""
-        if event is None or req is None:
+        token = self._generation
+        if event is None or req is None or not self._is_current(token):
             return False
 
         quote = find_reply_component(event)
@@ -190,6 +399,8 @@ class QuotedBotMediaModule:
                 platform_name,
             )
             return False
+        if not self._is_current(token):
+            return False
 
         parts = getattr(req, "extra_user_content_parts", None)
         if not isinstance(parts, list):
@@ -199,7 +410,7 @@ class QuotedBotMediaModule:
             except Exception:  # noqa: BLE001
                 return False
 
-        quoted_indices = find_quoted_image_url_indices(event, req, quote)
+        quoted_indices = find_quoted_image_url_indices(req)
         has_any_attachment_notice = any(
             find_last_part_with_prefix(parts, prefix) is not None
             for prefix, _ in _QUOTED_ATTACHMENT_RULES
@@ -239,26 +450,26 @@ class QuotedBotMediaModule:
                 for index, url in enumerate(image_urls)
                 if index in quoted_index_set
             ]
-            direct_urls = [
+            remaining_urls = [
                 url
                 for index, url in enumerate(image_urls)
                 if index not in quoted_index_set
             ]
             if quoted_urls:
                 try:
-                    req.image_urls = direct_urls
+                    req.image_urls = remaining_urls
                 except Exception:  # noqa: BLE001
                     quoted_urls = []
             if quoted_urls:
                 event_direct_count = count_direct_event_images(event)
                 direct_failed = (
-                    event_direct_count > len(direct_urls)
+                    event_direct_count > len(remaining_urls)
                     or has_direct_skipped_image_notice(parts)
                 )
                 wrapped_parts = [
                     create_persistent_text_part(
                         build_quoted_self_image_start_text(
-                            len(direct_urls),
+                            len(remaining_urls),
                             direct_failed=direct_failed,
                         )
                     ),
@@ -271,15 +482,17 @@ class QuotedBotMediaModule:
                 changed = True
                 self._log(
                     "debug",
-                    "AstrNa 已拆离并标注 Bot 自发引用图片 %d 张，剩余用户直发图片 %d 张，direct_failed=%s，filled_sender=%s，platform=%s。",
+                    "AstrNa 已拆离并标注 Bot 自发引用图片 %d 张，消息末尾保留图片 %d 张，direct_failed=%s，filled_sender=%s，platform=%s。",
                     len(quoted_urls),
-                    len(direct_urls),
+                    len(remaining_urls),
                     direct_failed,
                     filled_sender,
                     platform_name,
                 )
-        elif has_quoted_image and not has_part_containing(
-            parts, QUOTED_SELF_IMAGE_TEXT_ONLY_NOTE
+        elif (
+            has_quoted_image
+            and not has_ambiguous_quoted_image(req)
+            and not has_part_containing(parts, QUOTED_SELF_IMAGE_TEXT_ONLY_NOTE)
         ):
             quoted_msg_index = find_last_quoted_message_part_index(parts)
             insert_at = quoted_msg_index + 1 if quoted_msg_index is not None else 0
@@ -346,25 +559,39 @@ class QuotedBotMediaModule:
         return True
 
     async def is_quote_from_self_async(self, event: Any, quote: Any) -> bool:
+        token = self._generation
+        if not self._is_current(token):
+            return False
         if is_quote_from_self(event, quote):
             return True
-        return await self.is_qq_official_quote_from_self(event, quote)
+        matched = await self.is_qq_official_quote_from_self(event, quote)
+        return matched and self._is_current(token)
 
     async def is_qq_official_quote_from_self(self, event: Any, quote: Any) -> bool:
-        if quote is None or not is_qq_official_event(event):
+        token = self._generation
+        if (
+            not self._is_current(token)
+            or quote is None
+            or not is_qq_official_event(event)
+        ):
             return False
-        if sanitize_optional_metadata_value(getattr(quote, "sender_id", None)):
+        if sanitize_optional_sender_id(getattr(quote, "sender_id", None)):
             return False
+        platform_id = get_qq_official_platform_id(event)
         candidate_ids = extract_qq_official_quoted_ref_ids(event, quote)
-        if not candidate_ids:
+        if not platform_id or not candidate_ids:
             return False
 
         now = time.time()
-        async with self._qq_official_ids_lock:
+        async with get_shared_qq_official_ids_lock():
             await self._ensure_qq_official_ids_loaded_locked(now)
+            if not self._is_current(token):
+                return False
             prune_qq_official_sent_ids(self._qq_official_sent_ids, now)
             matched = any(
-                ref_id in self._qq_official_sent_ids for ref_id in candidate_ids
+                scoped_id in self._qq_official_sent_ids
+                for ref_id in candidate_ids
+                if (scoped_id := build_qq_official_scoped_id(platform_id, ref_id))
             )
             tracked_count = len(self._qq_official_sent_ids)
         self._log(
@@ -374,22 +601,30 @@ class QuotedBotMediaModule:
             len(candidate_ids),
             tracked_count,
         )
-        return matched
+        return matched and self._is_current(token)
 
     async def remember_qq_official_sent_ids(
         self,
         sent_ids: list[str],
         *,
+        platform_id: str | None = None,
         now: float | None = None,
     ) -> None:
+        token = self._generation
         cleaned_ids = [
-            value for raw in sent_ids if (value := normalize_qq_official_id(raw))
+            value
+            for raw in sent_ids
+            if (value := build_qq_official_scoped_id(platform_id, raw))
         ]
-        if not cleaned_ids:
+        if not cleaned_ids or not self._is_current(token):
             return
         timestamp = time.time() if now is None else float(now)
-        async with self._qq_official_ids_lock:
+        async with get_shared_qq_official_ids_lock():
+            if not self._is_current(token):
+                return
             loaded = await self._ensure_qq_official_ids_loaded_locked(timestamp)
+            if not self._is_current(token):
+                return
             prune_qq_official_sent_ids(self._qq_official_sent_ids, timestamp)
             for item in cleaned_ids:
                 self._qq_official_sent_ids.pop(item, None)
@@ -397,6 +632,8 @@ class QuotedBotMediaModule:
             prune_qq_official_sent_ids(self._qq_official_sent_ids, timestamp)
             tracked_count = len(self._qq_official_sent_ids)
             if loaded:
+                if not self._is_current(token):
+                    return
                 await self._persist_qq_official_ids_locked()
         if loaded:
             self._log(
@@ -429,7 +666,7 @@ class QuotedBotMediaModule:
         if isinstance(state, dict) and isinstance(state.get("ids"), dict):
             for raw_id, raw_ts in state["ids"].items():
                 key = normalize_qq_official_id(raw_id)
-                if not key:
+                if not key or not is_qq_official_scoped_id(key):
                     continue
                 try:
                     ts = float(raw_ts)
@@ -474,27 +711,67 @@ def load_qq_official_event_cls() -> type | None:
     return QQOfficialMessageEvent
 
 
-def is_quote_from_self(event: Any, quote: Any) -> bool:
-    if quote is None:
-        return False
-
-    quote_sender_id = sanitize_optional_metadata_value(
-        getattr(quote, "sender_id", None)
-    )
-    if not quote_sender_id:
-        return False
-
-    self_id = sanitize_optional_metadata_value(
-        safe_call(getattr(event, "get_self_id", None))
-    )
-    if not self_id:
-        self_id = sanitize_optional_metadata_value(
-            getattr(getattr(event, "message_obj", None), "self_id", None)
+def load_qq_official_adapter_cls() -> type | None:
+    try:
+        from astrbot.core.platform.sources.qqofficial.qqofficial_platform_adapter import (
+            QQOfficialPlatformAdapter,
         )
-    if not self_id:
-        return False
+    except Exception:  # noqa: BLE001
+        return None
+    return QQOfficialPlatformAdapter
 
-    return quote_sender_id == self_id
+
+def get_qq_official_platform_id(event_or_adapter: Any) -> str | None:
+    platform_id = sanitize_optional_metadata_value(
+        safe_call(getattr(event_or_adapter, "get_platform_id", None))
+    )
+    if platform_id:
+        return platform_id
+    metadata = safe_call(getattr(event_or_adapter, "meta", None))
+    if metadata is None:
+        metadata = getattr(event_or_adapter, "platform_meta", None)
+    platform_id = sanitize_optional_metadata_value(getattr(metadata, "id", None))
+    if platform_id:
+        return platform_id
+    config = getattr(event_or_adapter, "config", None)
+    if isinstance(config, dict):
+        return sanitize_optional_metadata_value(config.get("id"))
+    return None
+
+
+def build_qq_official_scoped_id(platform_id: Any, message_id: Any) -> str | None:
+    platform = sanitize_optional_metadata_value(platform_id)
+    normalized_id = normalize_qq_official_id(message_id)
+    if not platform or not normalized_id:
+        return None
+    return json.dumps(
+        [platform, normalized_id], ensure_ascii=False, separators=(",", ":")
+    )
+
+
+def is_qq_official_scoped_id(value: str) -> bool:
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return False
+    return (
+        isinstance(parsed, list)
+        and len(parsed) == 2
+        and all(isinstance(item, str) and item for item in parsed)
+    )
+
+
+def get_shared_qq_official_ids_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = getattr(loop, _QQ_OFFICIAL_IDS_LOCK_ATTR, None)
+    if lock is None:
+        lock = asyncio.Lock()
+        setattr(loop, _QQ_OFFICIAL_IDS_LOCK_ATTR, lock)
+    return lock
+
+
+def is_quote_from_self(event: Any, quote: Any) -> bool:
+    return is_quoted_message_from_self(event, quote)
 
 
 def get_event_platform_name(event: Any) -> str:
@@ -672,42 +949,115 @@ def count_direct_event_images(event: Any) -> int:
     )
 
 
-def find_quoted_image_url_indices(event: Any, req: Any, quote: Any) -> list[int]:
+def resolve_quoted_image_source_paths(
+    raw_image_refs: list[Any],
+    direct_event_refs: list[str],
+    prepared: dict[str, Any],
+    quoted_refs: Any,
+    quote_image_ref: Any,
+) -> tuple[set[str], set[str]]:
+    quoted_values = list(quoted_refs or ())
+    if quote_image_ref:
+        quoted_values.append(quote_image_ref)
+    quoted_keys = {
+        image_ref_key(ref)
+        for ref in quoted_values
+        if isinstance(ref, str) and ref.strip()
+    }
+    if not quoted_keys:
+        return set(), set()
+
+    raw_keys = [
+        image_ref_key(ref)
+        for ref in raw_image_refs
+        if isinstance(ref, str) and ref.strip()
+    ]
+    raw_counts = Counter(raw_keys)
+    direct_event_keys = {
+        image_ref_key(ref)
+        for ref in direct_event_refs
+        if isinstance(ref, str) and ref.strip()
+    }
+    direct_keys = (set(raw_counts) - quoted_keys) | (
+        direct_event_keys - quoted_keys
+    )
+    ambiguous_source_keys = quoted_keys & (
+        {key for key, count in raw_counts.items() if count > 1}
+        | direct_event_keys
+    )
+
+    entries: dict[int, dict[str, Any]] = {}
+    for key, value in prepared.items():
+        if not isinstance(value, dict):
+            continue
+        path = _prepared_result_path(value)
+        if not path:
+            continue
+        entry = entries.setdefault(
+            id(value), {"value": value, "path": path, "keys": set()}
+        )
+        entry["keys"].add(image_ref_key(key))
+        entry["keys"].add(image_ref_key(path))
+
+    confirmed_paths: set[str] = set()
+    ambiguous_paths: set[str] = set()
+    direct_paths: set[str] = set()
+    for entry in entries.values():
+        path = entry["path"]
+        source_keys = entry["keys"]
+        if source_keys & direct_keys:
+            direct_paths.add(path)
+        if entry["value"].get("quoted") is not True:
+            continue
+        if source_keys & ambiguous_source_keys:
+            ambiguous_paths.add(path)
+        else:
+            confirmed_paths.add(path)
+
+    ambiguous_paths |= confirmed_paths & direct_paths
+    confirmed_paths -= ambiguous_paths | direct_paths
+    return confirmed_paths, ambiguous_paths
+
+
+def record_confirmed_quoted_image_refs(
+    req: Any, refs: Any, *, ambiguous_refs: Any = ()
+) -> None:
+    keys = {
+        image_ref_key(ref)
+        for ref in refs
+        if isinstance(ref, str) and ref.strip()
+    }
+    ambiguous_keys = {
+        image_ref_key(ref)
+        for ref in ambiguous_refs
+        if isinstance(ref, str) and ref.strip()
+    }
+    setattr(req, _CONFIRMED_QUOTED_IMAGE_KEYS_ATTR, keys)
+    setattr(req, _AMBIGUOUS_QUOTED_IMAGE_KEYS_ATTR, ambiguous_keys)
+
+
+def find_quoted_image_url_indices(req: Any) -> list[int]:
     image_urls = getattr(req, "image_urls", None)
-    if not isinstance(image_urls, list) or not image_urls:
+    confirmed_keys = getattr(req, _CONFIRMED_QUOTED_IMAGE_KEYS_ATTR, None)
+    ambiguous_keys = getattr(req, _AMBIGUOUS_QUOTED_IMAGE_KEYS_ATTR, set())
+    if (
+        not isinstance(image_urls, list)
+        or not image_urls
+        or not isinstance(confirmed_keys, (set, frozenset))
+    ):
         return []
+    return [
+        index
+        for index, url in enumerate(image_urls)
+        if isinstance(url, str)
+        and image_ref_key(url) in confirmed_keys
+        and image_ref_key(url) not in ambiguous_keys
+    ]
 
-    parts = getattr(req, "extra_user_content_parts", None) or []
-    existing_extra_images = sum(1 for part in parts if is_image_url_part(part))
 
-    quoted_indices: list[int] = []
-    max_noticed_index = 0
-    for part in parts:
-        text = get_part_text(part)
-        if not text:
-            continue
-        stripped = text.strip()
-        quoted_match = QUOTED_IMAGE_NOTICE_PATTERN.match(stripped)
-        if quoted_match:
-            visual_index = int(quoted_match.group(1))
-            max_noticed_index = max(max_noticed_index, visual_index)
-            url_index = visual_index - 1 - existing_extra_images
-            if 0 <= url_index < len(image_urls) and url_index not in quoted_indices:
-                quoted_indices.append(url_index)
-            continue
-        any_match = IMAGE_NOTICE_PATTERN.match(stripped)
-        if any_match:
-            max_noticed_index = max(max_noticed_index, int(any_match.group(1)))
-
-    if count_direct_event_images(event) == 0 and reply_has_image(quote):
-        if max_noticed_index == 0:
-            return list(range(len(image_urls)))
-        noticed_url_count = max(0, max_noticed_index - existing_extra_images)
-        for index in range(noticed_url_count, len(image_urls)):
-            if index not in quoted_indices:
-                quoted_indices.append(index)
-
-    return sorted(quoted_indices)
+def has_ambiguous_quoted_image(req: Any) -> bool:
+    # 转述会清空视觉列表，但不会消除同一来源兼有直发和引用身份的事实。
+    return bool(getattr(req, _AMBIGUOUS_QUOTED_IMAGE_KEYS_ATTR, set()))
 
 
 def has_direct_skipped_image_notice(parts: list[Any]) -> bool:
@@ -719,11 +1069,11 @@ def has_direct_skipped_image_notice(parts: list[Any]) -> bool:
 
 
 def build_quoted_self_image_start_text(
-    direct_image_count: int,
+    remaining_image_count: int,
     *,
     direct_failed: bool = False,
 ) -> str:
-    if direct_image_count <= 0:
+    if remaining_image_count <= 0:
         if direct_failed:
             return f"{QUOTED_SELF_IMAGE_START_PREFIX}，不是当前发言人发送的]"
         return (
@@ -732,7 +1082,7 @@ def build_quoted_self_image_start_text(
         )
     return (
         f"{QUOTED_SELF_IMAGE_START_PREFIX}，不是当前发言人发送的；"
-        f"当前发言人本次有 {direct_image_count} 张图片附在消息末尾]"
+        f"其余 {remaining_image_count} 张图片保留在消息末尾，来源以各自说明为准]"
     )
 
 
@@ -754,12 +1104,6 @@ def find_last_part_with_prefix(parts: list[Any], prefix: str) -> int | None:
         if text and text.strip().startswith(prefix):
             return index
     return None
-
-
-def is_image_url_part(part: Any) -> bool:
-    if isinstance(part, dict):
-        return str(part.get("type", "")) == "image_url"
-    return str(getattr(part, "type", "")) == "image_url"
 
 
 def get_part_text(part: Any) -> str | None:

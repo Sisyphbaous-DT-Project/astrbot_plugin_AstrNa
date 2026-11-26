@@ -223,12 +223,10 @@ def _run(coro):
 
 def test_settings_registry_exact_order_count_and_parents():
     assert list(SETTING_KEYS) == EXPECTED_SETTING_ORDER
-    assert len(SETTINGS) == 26
     parents = {}
     for item in SETTINGS:
         parents[item["parent"]] = parents.get(item["parent"], 0) + 1
     assert parents == EXPECTED_PARENTS
-    assert len(EXPECTED_PARENTS) == 12
 
 
 def test_settings_registry_copy_complete():
@@ -247,15 +245,7 @@ def test_settings_registry_copy_complete():
             "secret",
             "text",
         }
-    assert len({item["animation"] for item in SETTINGS}) == 26
-
-
-def test_settings_animation_ids_match_frontend_registry():
-    # 前端动画注册表与后端目录必须一一对应（静态一致性由 JS 侧测试复核）。
-    assert set(EXPECTED_ANIMATIONS.values()) == {
-        item["animation"] for item in SETTINGS
-    }
-
+    assert len({item["animation"] for item in SETTINGS}) == len(SETTINGS)
 
 # ---------------------------------------------------------------------------
 # 状态构建

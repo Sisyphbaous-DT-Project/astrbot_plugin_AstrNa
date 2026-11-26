@@ -22,7 +22,8 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def test_reply_target_state_first_load_is_serialized():
+@pytest.mark.parametrize("reload_during_read", [False, True])
+def test_reply_target_state_first_load_is_serialized(reload_during_read):
     class DelayedSnapshotKV:
         def __init__(self):
             self.data = {
@@ -45,6 +46,7 @@ def test_reply_target_state_first_load_is_serialized():
     async def exercise():
         kv_store = DelayedSnapshotKV()
         module = ReplyTargetHistoryModule(DummyLogger(), kv_store)
+        module.install()
         first_event = DummyEvent()
         first_event.unified_msg_origin = "umo:a"
         second_event = DummyEvent()
@@ -62,6 +64,10 @@ def test_reply_target_state_first_load_is_serialized():
             ),
         )
         await kv_store.get_started.wait()
+        if reload_during_read:
+            module.terminate()
+            module = ReplyTargetHistoryModule(DummyLogger(), kv_store)
+            module.install()
         second = asyncio.create_task(
             module.remember_reply_target(
                 second_event,
@@ -71,10 +77,40 @@ def test_reply_target_state_first_load_is_serialized():
             ),
         )
         kv_store.release_get.set()
-        await asyncio.gather(first, second)
-        return kv_store.data["reply_target_history_state_v2"]["sessions"]
+        try:
+            await asyncio.gather(first, second)
+            return kv_store.data["reply_target_history_state_v2"]["sessions"]
+        finally:
+            module.terminate()
 
-    assert set(run(exercise())) == {"old", "umo:a#conv", "umo:b#conv"}
+    expected = {"old", "umo:b#conv"}
+    if not reload_during_read:
+        expected.add("umo:a#conv")
+    assert set(run(exercise())) == expected
+
+
+def test_reply_target_read_failure_preserves_saved_index(fakes):
+    kv = fakes.KVStore(
+        {"reply_target_history_state_v2": {"sessions": {"old": []}}},
+        fail_get=True,
+    )
+    module = ReplyTargetHistoryModule(DummyLogger(), kv)
+    module.install()
+    req = SimpleNamespace(conversation=SimpleNamespace(cid="conv"))
+    try:
+        run(module.remember_reply_target(
+            DummyEvent(), req, SimpleNamespace(content="暂时读不到索引"), {"scope": "group"}
+        ))
+        assert kv.data["reply_target_history_state_v2"]["sessions"] == {"old": []}
+        kv.fail_get = False
+        run(module.remember_reply_target(
+            DummyEvent(), req, SimpleNamespace(content="恢复后的回复"), {"scope": "group"}
+        ))
+        assert set(kv.data["reply_target_history_state_v2"]["sessions"]) == {
+            "old", "aiocqhttp:GroupMessage:group456#conv",
+        }
+    finally:
+        module.terminate()
 
 
 class DummyLogger:
@@ -849,6 +885,96 @@ def test_quote_sender_marker_skips_missing_sender(astr_main_agent):
     run(astr_main_agent._process_quote_message(event, req, "", DummyContext()))
 
     assert "当前发言人引用了一条" not in req.extra_user_content_parts[-1].text
+
+
+@pytest.mark.parametrize("change", ["disable", "reenable", "detector"])
+def test_reply_direction_hint_stops_when_semantic_disabled_during_wait(
+    astr_main_agent, change
+):
+    module = ReplyTargetHistoryModule(logger=DummyLogger(), semantic_enabled=True)
+    module.install()
+    quote = Reply(sender_id="quoted-user", sender_nickname="Quoted Nick")
+    event = DummyEvent()
+    req = DummyRequest()
+
+    async def exercise():
+        gate = asyncio.Event()
+
+        async def detector(event, quote):
+            await gate.wait()
+            return False
+
+        module.set_self_quote_detector(detector)
+        task = asyncio.create_task(
+            module._append_reply_direction_hint(event, req, quote)
+        )
+        try:
+            await asyncio.sleep(0)
+            if change == "detector":
+                module.set_self_quote_detector(None)
+            else:
+                module.set_semantic_enabled(False)
+                if change == "reenable":
+                    module.set_semantic_enabled(True)
+            gate.set()
+            await task
+        finally:
+            module.terminate()
+
+    run(exercise())
+    assert req.extra_user_content_parts == []
+
+
+@pytest.mark.parametrize("change", ["reenable", "reinstall"])
+def test_reply_hint_does_not_restart_after_native_quote_wait(
+    astr_main_agent, monkeypatch, change
+):
+    async def exercise():
+        started, release = asyncio.Event(), asyncio.Event()
+        original = astr_main_agent._process_quote_message
+
+        async def delayed_native(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(astr_main_agent, "_process_quote_message", delayed_native)
+        module = ReplyTargetHistoryModule(DummyLogger(), semantic_enabled=True)
+        module.install()
+        event = DummyEvent()
+        event.message_obj.message = [Reply(sender_id="other", message_str="引用")]
+        req = DummyRequest()
+        pending = asyncio.create_task(
+            astr_main_agent._process_quote_message(event, req, "", DummyContext())
+        )
+        try:
+            await started.wait()
+            if change == "reinstall":
+                module.terminate()
+                module.install()
+            else:
+                module.set_semantic_enabled(False)
+                module.set_semantic_enabled(True)
+            release.set()
+            await pending
+            assert not any(
+                "AstrNa 回复指向说明" in getattr(part, "text", "")
+                for part in req.extra_user_content_parts
+            )
+            fresh = DummyRequest()
+            await astr_main_agent._process_quote_message(
+                event, fresh, "", DummyContext()
+            )
+            assert any(
+                "AstrNa 回复指向说明" in getattr(part, "text", "")
+                for part in fresh.extra_user_content_parts
+            )
+        finally:
+            release.set()
+            await pending
+            module.terminate()
+
+    run(exercise())
 
 
 def test_quote_marker_sanitizes_values(astr_main_agent):

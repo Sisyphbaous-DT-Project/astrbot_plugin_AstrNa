@@ -397,10 +397,10 @@ AstrNa 也会清理旧历史里的内部标记，并移除模型误输出的内�
 
 当用户引用 Bot 自己（含插件）发出的图片、语音、视频或文件再回复时，由于插件发出的媒体往往不进入对话历史，且图片统一挂在当前轮 `role: user` 末尾，多模态模型常会把这些附件误当成当前发言人自己发送的。开启该子项后，AstrNa 会在确认被引用消息来自 Bot 自己时：
 
-- **引用图片**：主模型支持视觉输入时，把属于引用消息的图片从 `req.image_urls` 拆出，改以 `ImageURLPart` 紧跟 `<Quoted Message>` 放入 `req.extra_user_content_parts`，并用简短的归属说明前后包裹，标明是 Bot 自己发送的图片以及当前发言人本次直发的图片数量；用户直发图留在 `req.image_urls` 末尾。纯文本模型不插入 `ImageURLPart`，仅补充文本归属说明。
+- **引用图片**：主模型支持视觉输入时，把准备阶段已确认属于引用消息的图片从 `req.image_urls` 拆出，改以 `ImageURLPart` 紧跟 `<Quoted Message>` 放入 `req.extra_user_content_parts`，并用简短的归属说明前后包裹，标明是 Bot 自己发送的图片；其余图片保留在原位，不按位置猜测发送者。同图兼有引用和直发来源时，不拆图，也不补充排他归属说明；即使图片随后转成文字，这项歧义保护仍保留。纯文本模型不插入 `ImageURLPart`，仅在来源无歧义时补充文本归属说明。
 - **引用语音 / 文件 / 视频**：紧跟核心生成的 `[Audio/File/Video Attachment in quoted message: ...]` 附件标记补充归属说明，不改原路径格式。
 - **缺失发送者的 `<Quoted Message>`**：缺少发送者昵称时，自动补上 `(你自己): ` 前缀。
-- **原生 QQ 官方 Bot 来源追踪**：对缺少 `Reply.sender_id` 的原生 `qq_official` / `qq_official_webhook`，追踪 Bot 出站消息的 `id` 与 `ext_info.ref_idx` 到插件 KV，使引用媒体归属和本功能的文本回复指向说明都能识别 Bot 自发消息；未识别时不猜测。
+- **原生 QQ 官方 Bot 来源追踪**：对缺少 `Reply.sender_id` 或该值为默认 `0` 的原生 `qq_official` / `qq_official_webhook`，按平台实例 `platform_id` 隔离记录 Bot 出站消息的 `id` 与 `ext_info.ref_idx` 到插件 KV，使引用媒体归属和本功能的文本回复指向说明都能识别对应账号的 Bot 自发消息；未识别、账号不明或旧实例已失效时不猜测、不写回。
 
 QQ 官方 Bot 平台的引用消息仍缺少普通群友的可靠发送者信息，AstrNa 无法安全判断他人之间的引用关系，因此普通多人引用指向消歧建议在 NapCat / aiocqhttp 等提供完整引用发送者信息的平台使用；仅需要识别原生 QQ 官方 Bot 自发消息与媒体时，可同时开启「引用媒体增强」。
 

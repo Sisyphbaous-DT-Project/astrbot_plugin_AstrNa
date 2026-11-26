@@ -132,6 +132,7 @@ def test_terminate_invalidates_runtime_before_async_cleanup():
 
             assert runtime._closed is True
             assert terminated_modules == ["group_wake", "builtin"]
+            assert runtime.reply_target_history._installed is False
 
             release.set()
             await task
