@@ -40,6 +40,7 @@ except Exception:  # pragma: no cover - 极简测试环境无 AstrBot Runner
         pass
 
 from ..utils.host_compat import load_class
+from ..utils.host_tools import is_host_runtime_tool
 from ..utils.patching import (
     is_wrapper_active,
     mark_wrapper_active,
@@ -998,7 +999,7 @@ async def _validate_target(binding: _ExecutionBinding, tool_name: str) -> str | 
     manager = binding.tool_manager
     if manager is None:
         return "错误：当前运行环境未提供工具管理器，无法完成权限复核。"
-    if _tool_name_is_ambiguous(manager, tool_name):
+    if _tool_name_is_ambiguous(manager, tool_name, binding.tool_set):
         return f"错误：工具名 `{tool_name}` 同时属于多个工具，无法安全确认执行对象。"
     is_builtin = _is_builtin_tool_instance(manager, tool, tool_name)
     if not is_builtin:
@@ -1310,26 +1311,30 @@ def _tool_is_active(tool: Any) -> bool:
 
 
 def _is_builtin_tool_instance(manager: Any, tool: Any, name: str) -> bool:
-    """只把管理器缓存的真实内置对象视为内置工具。
-
-    AstrBot 的 ``is_builtin_tool(name)`` 只按名称判断。插件工具若与内置工具
-    同名，当前 ToolSet 中实际执行的仍可能是插件对象；此时必须继续走插件
-    权限复核，不能仅凭名字跳过。
-    """
-    try:
-        if not bool(manager.is_builtin_tool(name)):
-            return False
-        builtin = manager.get_builtin_tool(name)
-    except Exception:  # noqa: BLE001 - 无法核对对象身份时按非内置工具收紧处理
+    """先保留插件登记身份，再识别旧内置对象或新版运行时精确类。"""
+    tool_type = type(tool)
+    if (
+        tool_type.__name__ == "_PermissionGuardedTool"
+        and tool_type.__module__ == "astrbot.core.provider.func_tool_manager"
+    ):
         return False
     raw = _unwrap_tool(tool)
-    return tool is builtin or raw is builtin
+    try:
+        if bool(manager.is_builtin_tool(name)):
+            builtin = manager.get_builtin_tool(name)
+            return tool is builtin or raw is builtin
+    except Exception:  # noqa: BLE001 - beta2 已移除旧注册表
+        pass
+    # 插件可以直接登记宿主工具类；精确类相同不代表运行时组装来源。
+    func_list = getattr(manager, "func_list", None)
+    if isinstance(func_list, list) and any(
+        raw is _unwrap_tool(registered) for registered in func_list
+    ):
+        return False
+    return is_host_runtime_tool(raw)
 
 
-def ambiguous_tool_names(
-    manager: Any,
-    builtin_tools: list[Any] | tuple[Any, ...] | None = None,
-) -> set[str]:
+def ambiguous_tool_names(manager: Any) -> set[str]:
     """返回注册表中对应多个实际对象的工具名。"""
     identities: dict[str, set[int]] = {}
     func_list = getattr(manager, "func_list", None)
@@ -1338,16 +1343,14 @@ def ambiguous_tool_names(
         if isinstance(name, str) and name:
             identities.setdefault(name, set()).add(id(_unwrap_tool(tool)))
 
-    if builtin_tools is None:
-        iterator = getattr(manager, "iter_builtin_tools", None)
-        if callable(iterator):
-            try:
-                loaded = iterator()
-            except Exception:  # noqa: BLE001
-                loaded = []
-            builtin_tools = loaded if isinstance(loaded, list) else []
-        else:
-            builtin_tools = []
+    builtin_tools = []
+    iterator = getattr(manager, "iter_builtin_tools", None)
+    if callable(iterator):
+        try:
+            loaded = iterator()
+        except Exception:  # noqa: BLE001
+            loaded = []
+        builtin_tools = loaded if isinstance(loaded, list) else []
     for tool in builtin_tools:
         name = getattr(tool, "name", None)
         if isinstance(name, str) and name:
@@ -1355,9 +1358,15 @@ def ambiguous_tool_names(
     return {name for name, object_ids in identities.items() if len(object_ids) > 1}
 
 
-def _tool_name_is_ambiguous(manager: Any, name: str) -> bool:
-    """只核对当前目标名，避免每个子调用都枚举全部内置工具。"""
+def _tool_name_is_ambiguous(manager: Any, name: str, tool_set: Any) -> bool:
+    """核对登记对象与本轮真实工具，不把未组装的模板计为冲突。"""
     object_ids: set[int] = set()
+    current_tools = getattr(tool_set, "tools", ())
+    if isinstance(current_tools, dict):
+        current_tools = current_tools.values()
+    for tool in current_tools:
+        if getattr(tool, "name", None) == name:
+            object_ids.add(id(_unwrap_tool(tool)))
     func_list = getattr(manager, "func_list", None)
     for tool in list(func_list) if isinstance(func_list, list) else []:
         if getattr(tool, "name", None) == name:
@@ -1365,7 +1374,7 @@ def _tool_name_is_ambiguous(manager: Any, name: str) -> bool:
     try:
         if bool(manager.is_builtin_tool(name)):
             object_ids.add(id(_unwrap_tool(manager.get_builtin_tool(name))))
-    except Exception:  # noqa: BLE001 - 无法读取内置对象时不凭名字制造歧义结论
+    except Exception:  # noqa: BLE001 - beta2 已移除旧注册表
         pass
     return len(object_ids) > 1
 

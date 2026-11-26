@@ -208,6 +208,18 @@ class _MessageConfigFactory:
         return {}, frozenset()
 
 
+def make_run_context(event):
+    async def get_locale(*_args, **_kwargs):
+        return "zh-CN"
+
+    return ContextWrapper(
+        context=SimpleNamespace(
+            event=event,
+            context=SimpleNamespace(get_locale=get_locale),
+        )
+    )
+
+
 def make_scheduler(group_context):
     scheduler = object.__new__(PipelineScheduler)
     scheduler.ctx = SimpleNamespace(
@@ -768,7 +780,7 @@ def test_real_step_collects_during_native_context_wait_and_saves_history(streami
 
         provider.provider_config["max_context_tokens"] = 1
         await runner.reset(
-            provider, req, ContextWrapper(context=SimpleNamespace(event=event)),
+            provider, req, make_run_context(event),
             object(), FakeHooks(),
             streaming=streaming, custom_compressor=GateCompressor(),
         )
@@ -1035,7 +1047,7 @@ def test_fallback_keeps_first_freeze_and_excludes_later_messages(streaming):
         fallback.provider_config["id"] = "fallback"
         runner = ToolLoopAgentRunner()
         await runner.reset(
-            first, req, ContextWrapper(context=SimpleNamespace(event=event)),
+            first, req, make_run_context(event),
             object(), FakeHooks(), streaming=streaming, fallback_providers=[fallback],
         )
         async for _ in run_agent(runner):
@@ -1079,7 +1091,7 @@ def test_empty_output_retry_keeps_first_freeze(streaming):
         provider = RetryProvider()
         runner = ToolLoopAgentRunner()
         await runner.reset(
-            provider, req, ContextWrapper(context=SimpleNamespace(event=event)),
+            provider, req, make_run_context(event),
             object(), FakeHooks(), streaming=streaming,
         )
         runner.EMPTY_OUTPUT_RETRY_WAIT_MIN_S = 0
@@ -1141,7 +1153,7 @@ def test_tool_rounds_do_not_collect_after_first_send(skills_like):
 
         provider, runner = ToolProvider(), ToolLoopAgentRunner()
         await runner.reset(
-            provider, req, ContextWrapper(context=SimpleNamespace(event=event)),
+            provider, req, make_run_context(event),
             ToolExecutor(), FakeHooks(),
             tool_schema_mode="skills_like" if skills_like else "full",
         )
@@ -1178,7 +1190,7 @@ def test_group_concurrency_anchor_and_other_parts_survive_handoff():
         await native.on_req_llm(event, req)
         provider, runner = RecordingProvider(), ToolLoopAgentRunner()
         await runner.reset(
-            provider, req, ContextWrapper(context=SimpleNamespace(event=event)),
+            provider, req, make_run_context(event),
             object(), FakeHooks(),
         )
         concurrency.capture_turn_anchor(event, runner)

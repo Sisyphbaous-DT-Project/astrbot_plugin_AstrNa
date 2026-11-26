@@ -172,6 +172,11 @@ class FakeAgentContext:
     def __init__(self, event):
         self.event = event
 
+        async def get_locale(*_args, **_kwargs):
+            return "zh-CN"
+
+        self.context = SimpleNamespace(get_locale=get_locale)
+
 
 class FakeLimiterContext:
     def __init__(self, cleaning_provider):

@@ -216,6 +216,7 @@ def test_sender_stop_settles_only_own_subagent_input(module, tmp_path, wait_for_
         runtime = SimpleNamespace(open_session=lambda *a, **k: asyncio.sleep(0, result=child), close=child.close)
         service = SubAgentService(SubAgentStore(db), {"astrbot": runtime})
         ctx = Context.__new__(Context)
+        ctx._db = db
         def caller(event):
             return SubAgentContext(context=ctx, event=event, agent_session=h.parent,
                                    subagent_scope=h.scope, delegable_tools=ToolSet(), send_to_user=False,
@@ -1128,6 +1129,9 @@ def test_real_subagent_delivery_steers_existing_sender_lane(module):
         )
         ctx = Context.__new__(Context)
         runtime = AstrAgentRuntime(ctx, agent_configs=None, subagents=None)
+        runtime.subagents = SimpleNamespace(
+            store=SimpleNamespace(find_native_conversation=lambda *_args: None)
+        )
         native = MainAgentSession(runtime, harness.parent.session_id, harness.scope.umo)
         runtime._sessions[("main", native.id)] = native
         record = SimpleNamespace(conversation_id=native.id, umo=native.umo)
@@ -1316,9 +1320,13 @@ def test_real_cancelled_turn_cannot_restore_history_after_reset(tmp_path):
                 def set_result(self, *_args):
                     return None
 
+            async def get_locale(*_args, **_kwargs):
+                return "zh-CN"
+
             context = SimpleNamespace(
                 conversation_manager=manager,
                 get_config=lambda **_kwargs: {"agent": {"runtime": "astrbot"}},
+                get_locale=get_locale,
             )
             await ConversationCommands(context).reset(Event())
             assert (await store.read(cid)).entries == []

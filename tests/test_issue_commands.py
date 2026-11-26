@@ -135,6 +135,7 @@ from astrbot.core.star.filter.command_group import CommandGroupFilter
 from astrbot.core.star.star_handler import star_handlers_registry
 
 OPS = ["latest", "draft", "ignore", "analyze", "edit", "submit", "cancel"]
+TEST_CONFIG = {"platform_settings": {}}
 
 # 以包形式加载 main.py，让装饰器真实注册到 AstrBot registry。
 pkg = types.ModuleType("astrna_entry")
@@ -225,7 +226,7 @@ for text in inputs:
     event = FakeEvent(text)
     matched = []
     for name, cmd_filter in executable.items():
-        if cmd_filter.filter(event, None):
+        if cmd_filter.filter(event, TEST_CONFIG):
             matched.append(name)
     assert len(matched) == 1, (text, sorted(matched))
     if text.startswith("astrna issue "):
@@ -236,10 +237,10 @@ for text in inputs:
 
 # 两种 edit 写法都把多词补充内容解析为同一个 GreedyStr。
 event_grouped = FakeEvent("astrna issue edit 补充 多词 内容")
-assert executable["issue_edit_group_command"].filter(event_grouped, None)
+assert executable["issue_edit_group_command"].filter(event_grouped, TEST_CONFIG)
 note_grouped = event_grouped.extras["parsed_params"]["note"]
 event_compat = FakeEvent("astrna_issue_edit 补充 多词 内容")
-assert executable["issue_edit"].filter(event_compat, None)
+assert executable["issue_edit"].filter(event_compat, TEST_CONFIG)
 note_compat = event_compat.extras["parsed_params"]["note"]
 assert note_grouped == "补充 多词 内容", note_grouped
 assert note_compat == note_grouped, note_compat
@@ -247,7 +248,7 @@ assert note_compat == note_grouped, note_compat
 
 def group_tree(group_filter, text):
     try:
-        group_filter.filter(FakeEvent(text), None)
+        group_filter.filter(FakeEvent(text), TEST_CONFIG)
     except ValueError as exc:
         return str(exc)
     raise AssertionError("裸组名未触发帮助树")

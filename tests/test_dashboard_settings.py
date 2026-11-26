@@ -2,6 +2,7 @@
 
 import asyncio
 import builtins
+import os
 import sys
 from importlib.machinery import ModuleSpec
 from types import ModuleType, SimpleNamespace
@@ -387,6 +388,39 @@ def test_tool_multi_catalog_groups_sources_permissions_and_blocked_items():
     assert tools["mystery"]["selectable"] is False
     assert tools["removed_tool"]["source_type"] == "stale"
     assert setting["state"]["value"] == config["parallel_tool_use_allowlist"]
+
+
+def test_beta2_runtime_tool_catalog_covers_all_assembly_families():
+    if not os.environ.get("ASTRBOT_SOURCE_PATH"):
+        pytest.skip("未绑定 AstrBot 源码")
+    from astrbot.core.provider.func_tool_manager import FunctionToolManager
+
+    manager = FunctionToolManager()
+    if hasattr(manager, "iter_builtin_tools"):
+        pytest.skip("当前宿主仍使用旧内置工具注册表")
+
+    selected = [
+        "astrbot_file_read_tool",
+        "web_search_tavily",
+        "astr_kb_search",
+        "get_group_message_history",
+    ]
+    setting = build_feature_settings(
+        {"parallel_tool_use_allowlist": selected},
+        "parallel_tool_use_enabled",
+        FakeToolContext(manager),
+    )[0]
+    tools = {
+        tool["name"]: tool
+        for group in setting["groups"]
+        for tool in group["tools"]
+    }
+
+    assert set(selected) <= set(tools)
+    for name in selected:
+        assert tools[name]["source_type"] == "builtin"
+        assert tools[name]["permission"] == "builtin"
+        assert tools[name]["selectable"] is True
 
 
 def test_tool_multi_transaction_accepts_real_options_and_existing_stale_only(fakes):

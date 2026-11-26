@@ -358,6 +358,65 @@ def test_builtin_tool_uses_its_own_permission_path():
     assert manager.permission_checks == []
 
 
+def _beta2_runtime_file_tool():
+    if not os.environ.get("ASTRBOT_SOURCE_PATH"):
+        pytest.skip("未绑定 AstrBot 源码")
+    try:
+        from astrbot.core.astr_agent_runtime.tools.computer_tools.fs import FileReadTool
+    except ModuleNotFoundError as exc:
+        if exc.name and exc.name.startswith("astrbot.core.astr_agent_runtime"):
+            pytest.skip("当前宿主没有 beta2 运行时工具模块")
+        raise
+    from astrbot.core.provider.func_tool_manager import FunctionToolManager
+
+    manager = FunctionToolManager()
+    if hasattr(manager, "iter_builtin_tools"):
+        pytest.skip("当前宿主仍使用旧内置工具注册表")
+    return manager, FileReadTool()
+
+
+def test_beta2_runtime_tool_does_not_use_plugin_permission_table():
+    manager, tool = _beta2_runtime_file_tool()
+    permission_checks = []
+
+    def deny_plugin_permission(name, context):
+        permission_checks.append(name)
+        return "permission denied"
+
+    manager._check_tool_permission = deny_plugin_permission
+    binding, context, executor, _hooks, _manager = build_binding(
+        [tool], manager=manager
+    )
+    executor.outputs = {tool.name: [text_result("ok")]}
+
+    payload = result_payload(
+        call_bound(binding, context, make_batch((tool.name, {})))
+    )
+
+    assert payload["results"][0]["ok"] is True
+    assert permission_checks == []
+    assert [name for name, _args in executor.calls] == [tool.name]
+
+
+def test_beta2_runtime_and_plugin_name_collision_is_rejected():
+    manager, runtime_tool = _beta2_runtime_file_tool()
+    plugin_tool = fake_tool(runtime_tool.name)
+    manager.func_list.append(plugin_tool)
+    manager._check_tool_permission = lambda name, context: None
+    binding, context, executor, _hooks, _manager = build_binding(
+        [runtime_tool], manager=manager
+    )
+    executor.outputs = {runtime_tool.name: [text_result("must not execute")]}
+
+    payload = result_payload(
+        call_bound(binding, context, make_batch((runtime_tool.name, {})))
+    )
+
+    assert payload["results"][0]["ok"] is False
+    assert "多个工具" in payload["results"][0]["result"]
+    assert executor.calls == []
+
+
 def test_plugin_tool_with_builtin_name_is_treated_as_ambiguous():
     builtin = fake_tool("shared_name")
     plugin = fake_tool("shared_name")

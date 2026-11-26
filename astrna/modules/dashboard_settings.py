@@ -37,6 +37,7 @@ from .forward_nodes import (
     FORWARD_NODE_HARD_LIMIT_DEFAULT,
     FORWARD_NODE_MAX_LENGTH_DEFAULT,
 )
+from ..utils.host_tools import iter_host_builtin_tools
 from .parallel_tool_use import ambiguous_tool_names, blocked_tool_reason
 from .provider_session_headers import ProviderSessionHeadersModule
 
@@ -624,14 +625,7 @@ def _permission_for_tool(
 
 
 def _iter_builtin_catalog_tools(manager: Any) -> list[Any]:
-    iterator = getattr(manager, "iter_builtin_tools", None)
-    if not callable(iterator):
-        return []
-    try:
-        tools = iterator()
-    except Exception:  # noqa: BLE001
-        return []
-    return list(tools) if isinstance(tools, list) else []
+    return iter_host_builtin_tools(manager)
 
 
 def _catalog_tools(manager: Any, builtin_tools: list[Any]) -> list[Any]:
@@ -676,9 +670,8 @@ def _build_tool_groups(
     known_names: set[str] = set()
     builtin_tools = _iter_builtin_catalog_tools(manager)
     builtin_ids = {id(tool) for tool in builtin_tools}
-    ambiguous_names = (
-        ambiguous_tool_names(manager, builtin_tools) if manager is not None else set()
-    )
+    # 运行时模板只供目录展示；会话真正组装后的冲突由执行入口核对。
+    ambiguous_names = ambiguous_tool_names(manager) if manager is not None else set()
     permission_snapshot = _tool_permission_snapshot()
 
     for tool in _catalog_tools(manager, builtin_tools) if manager is not None else []:
