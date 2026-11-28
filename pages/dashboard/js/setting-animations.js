@@ -194,7 +194,7 @@ function buildIdentityBirthday(stage, ctx) {
     const flow = onParts.flow;
     return {
       caption: value
-        ? "开启：生日只以月日形式进入临时身份元数据，年份被剔除且不写入会话历史"
+        ? "开启：生日只以月日形式进入随消息保存的身份快照，年份被剔除"
         : "关闭：身份 JSON 不包含生日信息",
       animate: flow && value
         ? () => ctx.gsap.to(flow, { opacity: 0.25, duration: 0.5, repeat: -1, yoyo: true })

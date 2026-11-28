@@ -13,9 +13,9 @@ import pytest
 from astrna.modules.identity_metadata import (
     FallbackTextPart,
     build_identity_metadata,
-    create_text_part,
     fetch_group_member_identity,
     fetch_user_birthday,
+    is_astrna_identity_part,
     normalize_user_birthday,
     normalize_group_member_identity,
     remove_builtin_identity_lines,
@@ -24,12 +24,12 @@ from astrna.modules.identity_metadata import (
 from astrna.modules import identity_metadata as identity_metadata_module
 
 
-def assert_temp_part(part):
-    """真实 TextPart 用 _no_save 标记临时内容，FallbackTextPart 用 is_temp。"""
+def assert_persistent_part(part):
+    """身份卡随所属消息持久保存：真实 TextPart 不带 _no_save，FallbackTextPart 非临时。"""
     if identity_metadata_module.TextPart is None:
-        assert part.is_temp is True
+        assert part.is_temp is False
     else:
-        assert part._no_save is True
+        assert getattr(part, "_no_save", False) is not True
 
 
 def extract_identity_json(text):
@@ -73,7 +73,7 @@ def test_optimize_identity_metadata_replaces_builtin_user_and_group_metadata(fak
         "</system_reminder>"
     )
     part = request.extra_user_content_parts[1]
-    assert_temp_part(part)
+    assert_persistent_part(part)
     assert part.text == (
         "<system_reminder>\n"
         'AstrNa identity metadata: {"user":{"user_id":"user123","nickname":"GroupCard"},'
@@ -89,6 +89,46 @@ def test_optimize_identity_metadata_requires_builtin_identity_part(fakes):
     asyncio.run(runtime.sanitize_request(event=fakes.Event(), req=request))
 
     assert request.extra_user_content_parts == []
+
+
+def test_optimize_identity_metadata_repeat_processing_keeps_single_card(fakes):
+    runtime = fakes.build_runtime({"optimize_identity_metadata": True})
+    request = fakes.Request(contexts=[])
+    fakes.add_builtin_identity_part(request)
+    datetime_part = FallbackTextPart(text="<system_reminder>Current datetime: now</system_reminder>")
+    temp_part = FallbackTextPart(text="runtime only").mark_as_temp()
+    request.extra_user_content_parts.extend([datetime_part, temp_part])
+    event = fakes.Event()
+
+    for _ in range(3):
+        asyncio.run(runtime.sanitize_request(event=event, req=request))
+        cards = [part for part in request.extra_user_content_parts if is_astrna_identity_part(part.text)]
+        assert len(cards) == 1
+        assert extract_identity_json(cards[0].text)["user"]["nickname"] == "GroupCard"
+        assert_persistent_part(cards[0])
+        assert datetime_part in request.extra_user_content_parts
+        assert temp_part in request.extra_user_content_parts and temp_part.is_temp
+
+
+@pytest.mark.parametrize("rebuild_fails", [False, True])
+def test_identity_rebuild_replaces_card_only_after_success(fakes, monkeypatch, rebuild_fails):
+    runtime = fakes.build_runtime({"optimize_identity_metadata": True})
+    request = fakes.Request(contexts=[])
+    fakes.add_builtin_identity_part(request)
+    asyncio.run(runtime.sanitize_request(event=fakes.Event(), req=request))
+    fakes.add_builtin_identity_part(request)
+    event = fakes.Event(message_obj=fakes.MessageObj(sender=fakes.Sender(nickname="NewCard")))
+    if rebuild_fails:
+        def fail(*args, **kwargs):
+            raise RuntimeError("snapshot failed")
+        monkeypatch.setattr(identity_metadata_module, "build_identity_metadata", fail)
+        with pytest.raises(RuntimeError, match="snapshot failed"):
+            asyncio.run(runtime.sanitize_request(event=event, req=request))
+    else:
+        asyncio.run(runtime.sanitize_request(event=event, req=request))
+    cards = [part for part in request.extra_user_content_parts if is_astrna_identity_part(part.text)]
+    assert len(cards) == 1
+    assert extract_identity_json(cards[0].text)["user"]["nickname"] == ("GroupCard" if rebuild_fails else "NewCard")
 
 
 def test_optimize_identity_metadata_can_skip_group_metadata(fakes):
@@ -1165,7 +1205,9 @@ def test_remove_builtin_identity_lines_keeps_other_system_reminders():
 def load_real_astrbot_message_module():
     try:
         return importlib.import_module("astrbot.core.agent.message")
-    except ModuleNotFoundError:
+    except Exception:  # noqa: BLE001
+        # 残缺的 astrbot 安装可能抛出非 ModuleNotFoundError 的导入错误，
+        # 同样按"当前环境无可用真实宿主"处理，继续尝试显式源码路径。
         pass
 
     astrbot_source = os.environ.get("ASTRBOT_SOURCE_PATH")
@@ -1175,7 +1217,7 @@ def load_real_astrbot_message_module():
             sys.path.insert(0, str(source_path))
         try:
             return importlib.import_module("astrbot.core.agent.message")
-        except ModuleNotFoundError:
+        except Exception:  # noqa: BLE001
             pass
 
     pytest.skip(
@@ -1183,48 +1225,61 @@ def load_real_astrbot_message_module():
     )
 
 
-def test_identity_metadata_real_text_part_is_marked_no_save(monkeypatch):
-    import astrna.modules.identity_metadata as identity_metadata
-
-    message_module = load_real_astrbot_message_module()
-    monkeypatch.setattr(identity_metadata, "TextPart", message_module.TextPart)
-
-    part = create_text_part("hello")
-
-    dumped = part.model_dump_for_context()
-
-    assert dumped == {"type": "text", "text": "hello", "_no_save": True}
-
-
-def test_identity_metadata_no_save_part_is_filtered_from_saved_history(monkeypatch):
-    import astrna.modules.identity_metadata as identity_metadata
-
-    message_module = load_real_astrbot_message_module()
-    monkeypatch.setattr(identity_metadata, "TextPart", message_module.TextPart)
-    message = message_module.Message(
-        role="user",
-        content=[{"type": "text", "text": "hello"}, create_text_part("runtime only")],
-    )
-
+def dump_real_messages(message_module, messages):
     dump_with_checkpoints = getattr(
         message_module, "dump_messages_with_checkpoints", None
     )
     if callable(dump_with_checkpoints):
-        dumped = dump_with_checkpoints([message])
-    else:
-        # AstrBot 4.30 删除检查点序列化，dump_messages 同样过滤 _no_save 片段。
-        dumped = message_module.dump_messages([message])
-
-    assert dumped == [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+        return dump_with_checkpoints(messages)
+    # AstrBot 4.30 删除检查点序列化，dump_messages 同样过滤 _no_save 片段。
+    return message_module.dump_messages(messages)
 
 
-def test_identity_metadata_can_create_fallback_temp_part(monkeypatch):
-    import astrna.modules.identity_metadata as identity_metadata
-
-    monkeypatch.setattr(identity_metadata, "TextPart", None)
-
-    part = create_text_part("hello")
-
-    assert isinstance(part, FallbackTextPart)
-    assert part.text == "hello"
-    assert part.is_temp is True
+def test_full_identity_snapshots_survive_real_history_reload(monkeypatch, fakes):
+    message_module = load_real_astrbot_message_module()
+    monkeypatch.setattr(identity_metadata_module, "TextPart", message_module.TextPart)
+    bot = fakes.Bot(
+        member_info={
+            "get_group_member_info": {"role": "admin", "level": "7", "title": "守夜人"},
+            "get_group_member_list": [
+                {"user_id": "10001", "role": "owner", "nickname": "群主"},
+                {"user_id": "10002", "role": "admin", "nickname": "管理员"},
+            ],
+        },
+        stranger_info={"birthday_month": 2, "birthday_day": 17},
+    )
+    runtime = fakes.build_runtime({
+        "optimize_identity_metadata": True, "account_nickname_display": True,
+        "group_member_identity_display": True, "birthday_info_display": True,
+    })
+    messages = []
+    try:
+        for uid in ("userA", "userB"):
+            request = fakes.Request(contexts=[])
+            fakes.add_builtin_identity_part(request)
+            event = fakes.Event(bot=bot, message_obj=fakes.MessageObj(
+                sender=fakes.Sender(user_id=uid, nickname=uid, account_nickname="account-" + uid),
+            ))
+            asyncio.run(runtime.sanitize_request(event=event, req=request))
+            messages.append(message_module.Message(role="user", content=[
+                request.extra_user_content_parts[-1],
+                message_module.TextPart(text="runtime only").mark_as_temp(),
+            ]))
+        saved = dump_real_messages(message_module, messages)
+        reloaded = [message_module.Message.model_validate(item) for item in saved]
+        assert dump_real_messages(message_module, reloaded) == saved
+        for uid, message in zip(("userA", "userB"), saved):
+            assert len(message["content"]) == 1
+            metadata = extract_identity_json(message["content"][0]["text"])
+            assert metadata["user"] == {
+                "user_id": uid, "nickname": uid, "account_nickname": "account-" + uid,
+                "birthday": {"month": "2", "day": "17"},
+            }
+            assert metadata["group"]["member"] == {
+                "role": "admin", "role_name": "管理员", "level": "7", "title": "守夜人",
+            }
+            assert metadata["group"]["owner"]["user_id"] == "10001"
+            assert metadata["group"]["admins"][0]["user_id"] == "10002"
+        assert [action for action, _ in bot.calls].count("get_group_member_list") == 1
+    finally:
+        asyncio.run(runtime.terminate())

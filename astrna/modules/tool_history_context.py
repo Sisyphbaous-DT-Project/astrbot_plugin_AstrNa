@@ -311,6 +311,13 @@ def _sanitize_messages(messages: list[Any]) -> tuple[list[Any], bool]:
 
     replacements: dict[int, Any] = {}
     for indexes in groups:
+        # 旧版追问正文与持久身份卡合在工具结果里，含卡时保留整个工具组。
+        if any(
+            isinstance(content := message_value(messages[index], "content"), str)
+            and "AstrNa identity metadata:" in content
+            for index in indexes
+        ):
+            continue
         group_replacements: dict[int, Any] = {}
         group_changed = False
         for index in indexes:

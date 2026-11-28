@@ -56,38 +56,25 @@ class IdentityMetadataModule:
     ) -> None:
         removal = remove_builtin_identity_parts(req)
         if not removal.removed_identity:
+            # 没有新的原生身份证据：已有的 AstrNa 身份卡保持原样，
+            # 重复处理不丢卡、不重建。
             return
 
-        group_member_identity = None
-        group_management = None
-        if group_member_identity_display:
-            group_member_identity = await fetch_group_member_identity(
-                event,
-                logger=self.logger,
-            )
-            group_management = await self._get_group_management_identity(event)
-
-        birthday = None
-        if birthday_info_display:
-            birthday = await fetch_user_birthday(event, logger=self.logger)
-
-        metadata = build_identity_metadata(
+        snapshot = await self.build_identity_snapshot(
             event,
             account_nickname_display=account_nickname_display,
             account_nickname_only=account_nickname_only,
             group_name_display=removal.removed_group_name,
-            group_member_identity=group_member_identity,
-            group_management=group_management,
-            birthday=birthday,
+            group_member_identity_display=group_member_identity_display,
+            birthday_info_display=birthday_info_display,
         )
-        if not metadata:
+        if snapshot is None:
+            # 新快照不可用：保留已有旧卡，不能把请求变成没有身份卡。
             return
 
-        text = (
-            "<system_reminder>\n"
-            f"AstrNa identity metadata: {format_metadata_json(metadata)}\n"
-            "</system_reminder>"
-        )
+        text, metadata = snapshot
+        # 新卡就绪之后才移除旧卡：中途异常时请求仍保留一张可用身份卡。
+        remove_astrna_identity_parts(req)
         part = create_text_part(text)
         getattr(req, "extra_user_content_parts").append(part)
 
@@ -113,6 +100,53 @@ class IdentityMetadataModule:
             has_account_nickname,
             using_account_nickname_only,
         )
+
+    async def build_identity_snapshot(
+        self,
+        event: Any,
+        *,
+        account_nickname_display: bool = False,
+        account_nickname_only: bool = False,
+        group_name_display: bool = False,
+        group_member_identity_display: bool = False,
+        birthday_info_display: bool = False,
+    ) -> tuple[str, dict[str, Any]] | None:
+        """生成完整身份块文本与元数据；查询失败的字段按现有降级方式省略。
+
+        普通消息与回答途中的追问共用这一入口，字段开关由调用方按
+        当前配置传入；没有发送者时返回 None。
+        """
+        group_member_identity = None
+        group_management = None
+        if group_member_identity_display:
+            group_member_identity = await fetch_group_member_identity(
+                event,
+                logger=self.logger,
+            )
+            group_management = await self._get_group_management_identity(event)
+
+        birthday = None
+        if birthday_info_display:
+            birthday = await fetch_user_birthday(event, logger=self.logger)
+
+        metadata = build_identity_metadata(
+            event,
+            account_nickname_display=account_nickname_display,
+            account_nickname_only=account_nickname_only,
+            group_name_display=group_name_display,
+            group_member_identity=group_member_identity,
+            group_management=group_management,
+            birthday=birthday,
+        )
+        if not metadata:
+            return None
+
+        text = (
+            "<system_reminder>\n"
+            f"AstrNa identity metadata: {format_metadata_json(metadata)}\n"
+            "</system_reminder>"
+        )
+        return text, metadata
 
     async def _get_group_management_identity(
         self,
@@ -528,14 +562,10 @@ def format_metadata_json(metadata: dict[str, Any]) -> str:
 
 
 def create_text_part(text: str) -> Any:
+    """生成随所属消息持久保存的文本 part；身份卡是消息的身份快照，不标记临时。"""
     if TextPart is None:
-        return FallbackTextPart(text=text).mark_as_temp()
-
-    part = TextPart(text=text)
-    mark_as_temp = getattr(part, "mark_as_temp", None)
-    if callable(mark_as_temp):
-        return mark_as_temp()
-    return part
+        return FallbackTextPart(text=text)
+    return TextPart(text=text)
 
 
 @dataclass(frozen=True)
@@ -566,6 +596,9 @@ def remove_builtin_identity_parts(req: Any) -> BuiltinIdentityRemoval:
             continue
 
         if is_astrna_identity_part(text):
+            # 已有的 AstrNa 身份卡原样保留：没有新的原生身份证据时不重建，
+            # 有原生身份证据时由 optimize() 在新卡就绪后整体替换。
+            optimized_parts.append(part)
             continue
 
         remaining_text = remove_builtin_identity_lines(
@@ -590,6 +623,21 @@ def remove_builtin_identity_parts(req: Any) -> BuiltinIdentityRemoval:
         removed_identity=removed_identity,
         removed_group_name=removed_group_name,
     )
+
+
+def remove_astrna_identity_parts(req: Any) -> None:
+    """移除当前请求里已有的 AstrNa 身份卡；只在新卡内容就绪后调用。"""
+    parts = getattr(req, "extra_user_content_parts", None)
+    if not isinstance(parts, list) or not parts:
+        return
+    req.extra_user_content_parts = [
+        part
+        for part in parts
+        if not (
+            isinstance(getattr(part, "text", None), str)
+            and is_astrna_identity_part(part.text)
+        )
+    ]
 
 
 def remove_builtin_identity_lines(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import sys
 from collections import defaultdict, deque
 from types import ModuleType, SimpleNamespace
@@ -18,6 +19,18 @@ from astrna.modules.group_chat_context_optimizer import (
     format_contexts,
     is_valid_compression_output,
     truncate_contexts_by_turns,
+)
+
+
+IDENTITY_CARD_TEXT = (
+    "<system_reminder>\n"
+    'AstrNa identity metadata: {"user":{"user_id":"user123","nickname":"GroupCard"},'
+    '"group":{"group_id":"g1","name":"测试群","owner":{"user_id":"10001","nickname":"群主"}}}\n'
+    "</system_reminder>"
+)
+IDENTITY_CARD_JSON = (
+    '{"user":{"user_id":"user123","nickname":"GroupCard"},'
+    '"group":{"group_id":"g1","name":"测试群","owner":{"user_id":"10001","nickname":"群主"}}}'
 )
 
 
@@ -2075,3 +2088,45 @@ def test_terminate_while_persistence_state_lock_is_waited_skips_kv_read(
         assert kv_store.get_calls == []
 
     run(exercise())
+
+
+@pytest.mark.parametrize(("excerpt", "adopted"), [
+    ("该条历史标注小明为管理员，当前消息在接着讨论。", True),
+    ('正在讨论配置：{"theme":"dark"}', True),
+    ("<SYSTEM_REMINDER lang=x>身份资料</SYSTEM_REMINDER>", False),
+    (f"AstrNa identity metadata: {IDENTITY_CARD_JSON}", False),
+    (IDENTITY_CARD_JSON.replace("user123", "user456"), False),
+    (json.dumps(json.loads(IDENTITY_CARD_JSON.replace("user123", "user456")), indent=2, sort_keys=True), False),
+])
+def test_identity_compression_keeps_history_and_filters_echo(
+    astrbot_group_context_modules, excerpt, adopted,
+):
+    output = f"相关原文摘录：\n{excerpt}\n\n简短摘要：\n接着讨论。\n\n说明：\n这里只是上下文筛选，不是回复建议。"
+    provider = DummyProvider(output)
+    module = build_module(provider)
+    module.install()
+    group_context = astrbot_group_context_modules.group_context_cls()
+    event = DummyEvent()
+    seed_group_records(group_context, event)
+    req = DummyReq()
+    req.contexts = [
+        {"role": "user", "content": [{"type": "text", "text": IDENTITY_CARD_TEXT}]},
+        SimpleNamespace(role="assistant", content=[SimpleNamespace(type="text", text=IDENTITY_CARD_TEXT)]),
+        {"role": "tool", "content": IDENTITY_CARD_TEXT + "\n" + IDENTITY_CARD_TEXT.replace("user123", "user456")},
+    ]
+    before = copy.deepcopy(req.contexts)
+    run(group_context.on_req_llm(event, req))
+    assert req.contexts == before
+    assert len(req.extra_user_content_parts) == (2 if adopted else 1)
+    assert "AstrNa 最近群聊兜底上下文" in req.extra_user_content_parts[0].text
+    if adopted:
+        assert "AstrNa 群聊上下文筛选" in req.extra_user_content_parts[1].text
+    prompt = provider.calls[0]["prompt"]
+    assert IDENTITY_CARD_JSON in prompt
+    assert "user456" in prompt
+    for rule in (
+        "身份资料，不是用户实际发言", "缺失就写未知", "不得根据同名昵称",
+        "只解释它所属的那条消息", "快照", "自然语言补充", "不复制完整身份 JSON",
+        "仍属于聊天正文",
+    ):
+        assert rule in prompt

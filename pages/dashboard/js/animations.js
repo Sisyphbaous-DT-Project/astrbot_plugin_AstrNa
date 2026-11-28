@@ -160,7 +160,7 @@ function buildDeepseek(stage, ctx) {
 function buildIdentity(stage, ctx) {
   return stateful(stage, {
     before: "开启前：身份文本杂乱漂移",
-    after: "开启后：整理为稳定 JSON，作为临时内容注入",
+    after: "开启后：整理为稳定 JSON，随消息保存",
   }, ctx, (svg, beforeG, afterG, { gsap }) => {
     const scraps = ["用户： 小明？", "昵称： ???", "群身份： ?"].map((str, i) => {
       const g = el("g", {});
@@ -175,7 +175,7 @@ function buildIdentity(stage, ctx) {
     label(afterG, 118, 134, '"nick": "小明"', { size: 13, color: COLOR.ink });
     label(afterG, 104, 158, "} }", { size: 13, color: COLOR.ok });
     chip(afterG, "稳定 JSON", 96, 205, COLOR.ok);
-    chip(afterG, "临时内容", 210, 205, COLOR.info);
+    chip(afterG, "身份快照", 210, 205, COLOR.info);
     const cursor = label(afterG, 232, 134, "█", { size: 13, color: COLOR.ok });
     return {
       animateBefore: () => {

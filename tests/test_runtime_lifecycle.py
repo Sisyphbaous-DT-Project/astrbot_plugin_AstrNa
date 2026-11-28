@@ -429,3 +429,91 @@ def test_real_interleaved_install_with_handoff_does_not_stack():
         GroupChatContextHandoffModule.restore_patch()
         ToolCallPreambleModule.restore_patch()
         assert ToolLoopAgentRunner.step is native_step
+
+
+def test_dashboard_switch_syncs_identity_follow_up_immediately():
+    runtime = AstrNaRuntime(
+        context=None,
+        config={
+            "optimize_identity_metadata": True,
+            "account_nickname_display": True,
+            "account_nickname_only": True,
+            "group_member_identity_display": True,
+            "birthday_info_display": True,
+        },
+        logger=FakeLogger(),
+    )
+    calls = []
+    runtime.identity_follow_up.configure = lambda **kwargs: calls.append(
+        ("configure", kwargs)
+    )
+    runtime.identity_follow_up.install = lambda: calls.append(("install", None))
+    runtime.identity_follow_up.terminate = lambda: calls.append(("terminate", None))
+
+    runtime.update_dashboard_switch("optimize_identity_metadata", False)
+    runtime.update_dashboard_switch("optimize_identity_metadata", True)
+
+    assert [name for name, _ in calls] == [
+        "configure",
+        "terminate",
+        "configure",
+        "install",
+    ]
+    assert calls[0][1]["enabled"] is False
+    assert calls[2][1] == {
+        "enabled": True,
+        "account_nickname_display": True,
+        "account_nickname_only": True,
+        "group_member_identity_display": True,
+        "birthday_info_display": True,
+    }
+    runtime.update_dashboard_setting("birthday_info_display", False)
+    assert calls[-2][0] == "configure"
+    assert calls[-2][1]["birthday_info_display"] is False
+    assert calls[-1][0] == "install"
+    asyncio.run(runtime.terminate())
+
+
+
+def test_identity_follow_up_terminates_before_first_async_cleanup():
+    async def run_case() -> None:
+        runtime = AstrNaRuntime(context=None, config={}, logger=FakeLogger())
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        terminated = []
+
+        async def blocked_issue_terminate() -> None:
+            entered.set()
+            await release.wait()
+
+        runtime.issue_assistant.terminate = blocked_issue_terminate
+        runtime.identity_follow_up.terminate = lambda: terminated.append(
+            "identity_follow_up"
+        )
+        task = asyncio.create_task(runtime.terminate())
+        try:
+            await entered.wait()
+            assert terminated == ["identity_follow_up"]
+        finally:
+            release.set()
+            await task
+
+    asyncio.run(run_case())
+
+
+def test_runtime_installs_identity_follow_up_at_startup(monkeypatch):
+    from astrna.modules.identity_follow_up import IdentityFollowUpModule
+
+    calls = []
+    monkeypatch.setattr(
+        IdentityFollowUpModule,
+        "install",
+        lambda self: calls.append("install") or True,
+    )
+    runtime = AstrNaRuntime(
+        context=None,
+        config={"optimize_identity_metadata": True},
+        logger=FakeLogger(),
+    )
+    assert calls == ["install"]
+    asyncio.run(runtime.terminate())

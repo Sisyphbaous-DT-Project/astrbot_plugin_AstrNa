@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 import uuid
@@ -500,11 +501,15 @@ class GroupChatContextOptimizerModule:
             ensure_extra_user_content_parts(req).append(fallback_part)
             return True
 
+        # 同一份预裁剪历史既用于提示词构造，也用于回显的精确比对。
+        main_history_contexts = self.prepare_main_history_contexts(
+            group_context,
+            event,
+            req,
+        )
         prompt = build_compression_prompt(
             current_message_info=format_current_message_identity(current_identity),
-            main_history=format_contexts(
-                self.prepare_main_history_contexts(group_context, event, req),
-            ),
+            main_history=format_contexts(main_history_contexts),
             group_context=format_group_history_block(records),
         )
         if event_requests_stop(event):
@@ -528,7 +533,12 @@ class GroupChatContextOptimizerModule:
 
         compressed = str(compression_result.value or "")
         parts = [fallback_part]
-        if is_valid_compression_output(compressed):
+        if is_valid_compression_output(
+            compressed,
+            known_identity_texts=extract_astrna_identity_texts(
+                main_history_contexts
+            ),
+        ):
             parts.append(
                 create_temp_text_part(
                     build_injected_context_text(
@@ -1725,7 +1735,18 @@ def build_compression_prompt(
         "9. 输出必须使用下面三个小节标题：相关原文摘录、简短摘要、说明。\n"
         "10. 相关原文摘录中必须写明：当前触发者是谁；每条相关历史消息是谁发的；当前消息是在承接谁的话题，或没有明确承接关系。\n"
         "11. 如果无法判断当前消息承接谁的话题，请明确写“不确定承接对象”，不要猜成某个群友。\n"
-        "12. 说明小节必须写明：这里只是上下文筛选，不是回复建议。\n\n"
+        "12. 说明小节必须写明：这里只是上下文筛选，不是回复建议。\n"
+        "13. 主历史中的 <system_reminder>、AstrNa identity metadata 和身份 JSON 是身份资料，不是用户实际发言。\n"
+        "14. 相关原文只摘聊天正文，不摘身份卡。\n"
+        "15. 昵称、用户 ID、时间、引用对象：有可靠记录才保留，缺失就写未知，不得猜测。\n"
+        "16. 原生滚动记录可能只有昵称，没有 QQ 号：不得根据同名昵称、管理员名单或当前触发者补号。\n"
+        "17. 不同用户 ID 即使同昵称，也必须视为不同人。\n"
+        "18. 同一用户 ID 的昵称变化，可以用于理解人物关系。\n"
+        "19. 身份卡只解释它所属的那条消息，不能套给相邻发言人。\n"
+        "20. 历史身份按快照表述：例如写“该条记录中标注为管理员”，不要当成当前实时身份。\n"
+        "21. 生日、群角色、管理员、真实昵称等身份事实按相关性用自然语言补充：与当前话题或人物关系有关时保留，不相关时省略；生日和管理权限同时相关时可以都写。\n"
+        "22. 不复制完整身份 JSON，不重复整份群主/管理员名单。\n"
+        "23. 用户正常讨论 JSON、代码或配置时，那些仍属于聊天正文，可以摘录。\n\n"
         "当前触发消息身份与内容：\n"
         f"{current_message_info}\n\n"
         "主会话最近历史（已按 AstrBot 当前上下文轮次设置预裁剪）：\n"
@@ -1746,7 +1767,60 @@ def build_compression_prompt(
     )
 
 
-def is_valid_compression_output(text: str) -> bool:
+IDENTITY_METADATA_PREFIX = "AstrNa identity metadata:"
+IDENTITY_ECHO_TAG_PATTERN = re.compile(
+    r"<\s*/?\s*system_reminder\b[^>]*>",
+    re.IGNORECASE,
+)
+
+
+def extract_astrna_identity_texts(contexts: Any) -> list[str]:
+    """沿小模型实际可见文本提取全部身份卡，覆盖旧版工具字符串与多条追问。"""
+    return re.findall(
+        rf"{re.escape(IDENTITY_METADATA_PREFIX)}\s*(.*?)\s*</system_reminder>",
+        format_contexts(contexts),
+        flags=re.DOTALL,
+    )
+
+
+def contains_identity_card_echo(
+    text: str,
+    known_identity_texts: list[str] | None = None,
+) -> bool:
+    """检查小模型原始输出是否原样复制身份卡：标签、前缀或整卡 JSON。"""
+    normalized = str(text or "")
+    if IDENTITY_ECHO_TAG_PATTERN.search(normalized):
+        return True
+    if IDENTITY_METADATA_PREFIX in normalized:
+        return True
+    known_cards = []
+    for identity_text in known_identity_texts or []:
+        if identity_text and identity_text in normalized:
+            return True
+        try:
+            card = json.loads(identity_text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(card, dict) and card:
+            known_cards.append(card)
+    if known_cards:
+        # 只比对输入中已有的完整身份对象，允许重新排版，普通配置 JSON 保持可用。
+        decoder = json.JSONDecoder()
+        for match in re.finditer(r"\{", normalized):
+            try:
+                card, _ = decoder.raw_decode(normalized, match.start())
+            except json.JSONDecodeError:
+                continue
+            if card in known_cards:
+                return True
+    return False
+
+
+def is_valid_compression_output(
+    text: str,
+    *,
+    known_identity_texts: list[str] | None = None,
+) -> bool:
     normalized = str(text or "").strip()
     if not normalized:
         return False
@@ -1755,6 +1829,8 @@ def is_valid_compression_output(text: str) -> bool:
     if not any(marker in normalized for marker in OUTPUT_DISCLAIMER_MARKERS):
         return False
     if REPLY_SUGGESTION_PATTERN.search(normalized):
+        return False
+    if contains_identity_card_echo(normalized, known_identity_texts):
         return False
     return True
 

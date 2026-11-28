@@ -24,6 +24,7 @@ from .modules.group_sender_concurrency_session import (
 )
 from .modules.gemini_request_headers import GeminiRequestHeadersModule
 from .modules.group_wake_suppression import GroupWakeSuppressionModule
+from .modules.identity_follow_up import IdentityFollowUpModule
 from .modules.identity_metadata import IdentityMetadataModule
 from .modules.issue_assistant import IssueAssistantModule
 from .modules.long_reply_context import LongReplyContextModule
@@ -163,6 +164,11 @@ class AstrNaRuntime:
         self._request_activity_events: dict[int, tuple[object, Any]] = {}
         self.deepseek_v4_400 = DeepSeekV4400Module(logger=logger)
         self.identity_metadata = IdentityMetadataModule(logger=logger)
+        self.identity_follow_up = IdentityFollowUpModule(
+            logger=logger,
+            context=context,
+            identity_metadata=self.identity_metadata,
+        )
         self.forward_nodes = ForwardNodesModule(
             logger=logger,
             target_length=self.config["forward_node_max_length"],
@@ -306,12 +312,13 @@ class AstrNaRuntime:
         self._configure_waking_check_chain()
         self._configure_auto_cache_cleanup()
         self._configure_provider_session_headers()
+        self._configure_identity_follow_up()
 
     def update_dashboard_switch(self, key: str, value: bool) -> None:
         """同步功能控制台修改的单个布尔主开关到合并配置副本。
 
-        只接受 DEFAULT_CONFIG 中的布尔键；其余键一律拒绝。图片准备与转述等
-        请求前置包装立即同步，其余模块在下一次相关事件中读取配置。
+        只接受 DEFAULT_CONFIG 中的布尔键；其余键一律拒绝。图片准备、转述和
+        追问身份主开关立即同步，其余模块在下一次相关事件中读取配置。
         """
         if key not in DEFAULT_CONFIG:
             raise ValueError(f"未知的配置开关: {key}")
@@ -341,6 +348,42 @@ class AstrNaRuntime:
             self._configure_group_chat_context_optimizer()
         elif key == "hide_tool_call_preamble":
             self._configure_tool_call_preamble()
+        elif key == "optimize_identity_metadata":
+            self._configure_identity_follow_up()
+
+    def _identity_metadata_options(self) -> dict[str, bool]:
+        account_nickname_display = self.config.get(
+            "account_nickname_display",
+            False,
+        )
+        return {
+            "account_nickname_display": account_nickname_display,
+            "account_nickname_only": (
+                account_nickname_display
+                and self.config.get("account_nickname_only", False)
+            ),
+            "group_member_identity_display": self.config.get(
+                "group_member_identity_display",
+                False,
+            ),
+            "birthday_info_display": self.config.get(
+                "birthday_info_display",
+                False,
+            ),
+        }
+
+    def _configure_identity_follow_up(self) -> None:
+        if self._closed:
+            return
+        enabled = bool(self.config.get("optimize_identity_metadata", False))
+        self.identity_follow_up.configure(
+            enabled=enabled,
+            **self._identity_metadata_options(),
+        )
+        if enabled:
+            self.identity_follow_up.install()
+        else:
+            self.identity_follow_up.terminate()
 
     def _configure_image_caption(self) -> None:
         if self._closed:
@@ -471,7 +514,7 @@ class AstrNaRuntime:
 
         严格白名单：只接受 DASHBOARD_SETTING_KEYS 中的键；列表值写入
         副本，前端对象不会继续引用 Runtime 配置。各组同步规则：
-        - 身份元数据四项：只写配置，下一次 LLM 请求读取；
+        - 身份元数据四项：同步追问模块，普通消息在下一次 LLM 请求读取；
         - 合并转发长度：重新配置 ForwardNodesModule，无需重启插件；
         - 群聊压缩模型：调用现有 configure()；
         - 输出限制四项：统一调用 OutputLengthLimiterModule.configure()；
@@ -502,7 +545,12 @@ class AstrNaRuntime:
         else:  # pragma: no cover - 白名单键必须存在于 DEFAULT_CONFIG
             raise ValueError(f"未知的子配置: {key}")
 
-        if key in _FORWARD_LENGTH_SETTING_KEYS:
+        if key in (
+            "account_nickname_display", "account_nickname_only",
+            "group_member_identity_display", "birthday_info_display",
+        ):
+            self._configure_identity_follow_up()
+        elif key in _FORWARD_LENGTH_SETTING_KEYS:
             self.forward_nodes.configure(
                 target_length=self.config.get(
                     "forward_node_max_length", FORWARD_NODE_MAX_LENGTH_DEFAULT
@@ -535,7 +583,6 @@ class AstrNaRuntime:
             self._configure_tool_call_preamble()
         elif key in _REPLY_TARGET_SETTING_KEYS:
             self._configure_quoted_bot_media()
-        # 身份元数据四项只写配置，下一次 LLM 请求由 sanitize_request 读取。
 
     async def sanitize_request(self, event: Any, req: Any) -> None:
         lifecycle_token = self._lifecycle_token
@@ -741,27 +788,17 @@ class AstrNaRuntime:
         self._configure_waking_check_chain(lifecycle_token=lifecycle_token)
         self._configure_auto_cache_cleanup()
 
-        if self.config.get("optimize_identity_metadata", False):
-            account_nickname_display = self.config.get(
-                "account_nickname_display",
-                False,
-            )
+        identity_metadata_enabled = self.config.get(
+            "optimize_identity_metadata", False
+        )
+        # 普通身份与追问共用同一份子配置，追问独立于群发送者并发安装。
+        self._configure_identity_follow_up()
+
+        if identity_metadata_enabled:
             await self.identity_metadata.optimize(
                 event,
                 req,
-                account_nickname_display=account_nickname_display,
-                account_nickname_only=(
-                    account_nickname_display
-                    and self.config.get("account_nickname_only", False)
-                ),
-                group_member_identity_display=self.config.get(
-                    "group_member_identity_display",
-                    False,
-                ),
-                birthday_info_display=self.config.get(
-                    "birthday_info_display",
-                    False,
-                ),
+                **self._identity_metadata_options(),
             )
             if not self._is_lifecycle_current(lifecycle_token):
                 return
@@ -1078,6 +1115,8 @@ class AstrNaRuntime:
         # 群聊优化必须在首个 await 前停用，避免卸载期间继续收集新增消息。
         self.group_chat_context_optimizer.terminate()
         self.gemini_request_headers.terminate()
+        # 追问身份与全局入口同批拆除，首个 await 前失效旧代并清理登记。
+        self.identity_follow_up.terminate()
         self._terminate_group_sender_concurrency()
         await self.issue_assistant.terminate()
         self.long_reply_context.terminate()

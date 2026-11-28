@@ -139,6 +139,7 @@ class GroupSenderConcurrencyModule:
     _original_internal_register_active_runner: Any = None
     _original_internal_unregister_active_runner: Any = None
     _original_internal_try_capture_follow_up: Any = None
+    _identity_follow_up_registrar: Any = None
     _lock_wrapper: Any = None
     _process_wrapper: Any = None
     _third_party_process_wrapper: Any = None
@@ -165,6 +166,15 @@ class GroupSenderConcurrencyModule:
         self._write_locks: dict[tuple[int, str], asyncio.Lock] = {}
         self._active_runners: dict[tuple[str, str], Any] = {}
         self._commit_receipts: OrderedDict[tuple[int, str, str], str] = OrderedDict()
+
+    @classmethod
+    def set_identity_follow_up_registrar(cls, registrar: Any) -> None:
+        cls._identity_follow_up_registrar = registrar
+
+    @classmethod
+    def clear_identity_follow_up_registrar(cls, registrar: Any) -> None:
+        if same_callable(cls._identity_follow_up_registrar, registrar):
+            cls._identity_follow_up_registrar = None
 
     def install(self) -> bool:
         if self._installed and type(self)._active_module is self:
@@ -1422,6 +1432,12 @@ class GroupSenderConcurrencyModule:
         ticket = runner.follow_up(message_text=event_text_getter(event))
         if not ticket:
             return None
+        registrar = type(self)._identity_follow_up_registrar
+        if callable(registrar):
+            try:
+                registrar(ticket, runner, event)
+            except Exception as exc:  # noqa: BLE001
+                self._log("warning", "登记追问身份事件失败：%s", exc)
         follow_up_umo = format_sender_scoped_umo(sender_key)
         order_seq = allocate_order(follow_up_umo)
         monitor_task = asyncio.create_task(

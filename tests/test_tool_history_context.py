@@ -1007,8 +1007,9 @@ def test_object_messages_preserve_ids_metadata_private_flags_and_checkpoint():
     assert tool_result.content == "full result"
 
 
+@pytest.mark.parametrize("keep_follow_up", [False, True])
 def test_save_patch_is_copy_on_write_and_keeps_current_agent_loop_complete(
-    astrbot_internal_module,
+    astrbot_internal_module, keep_follow_up,
 ):
     module = ToolHistoryContextModule(logger=DummyLogger())
     assert module.install() is True
@@ -1017,9 +1018,14 @@ def test_save_patch_is_copy_on_write_and_keeps_current_agent_loop_complete(
     req = object()
     llm_response = object()
     runner_stats = object()
+    result = (
+        '<system_reminder>\nAstrNa identity metadata: {"user":{"user_id":"B"}}\n</system_reminder>\n追问正文'
+        if keep_follow_up else "full result"
+    )
     messages = [
-        Message("assistant", None, tool_calls=[{"id": "call-a"}]),
-        Message("tool", "full result", tool_call_id="call-a"),
+        Message("assistant", None, tool_calls=[{"id": "call-a"}, {"id": "call-b"}]),
+        Message("tool", result, tool_call_id="call-a"),
+        Message("tool", "second result", tool_call_id="call-b"),
         Message("assistant", "final answer"),
     ]
 
@@ -1035,9 +1041,10 @@ def test_save_patch_is_copy_on_write_and_keeps_current_agent_loop_complete(
     )
 
     saved = stage.saved[-1]
-    assert messages[1].content == "full result"
-    assert saved["all_messages"] is not messages
-    assert saved["all_messages"][1].content == TOOL_HISTORY_PLACEHOLDER
+    assert messages[1].content == result
+    assert (saved["all_messages"] is messages) == keep_follow_up
+    assert saved["all_messages"][1].content == (result if keep_follow_up else TOOL_HISTORY_PLACEHOLDER)
+    assert saved["all_messages"][2].content == ("second result" if keep_follow_up else TOOL_HISTORY_PLACEHOLDER)
     assert saved["all_messages"][1].tool_call_id == "call-a"
     assert saved["event"] is event
     assert saved["req"] is req
